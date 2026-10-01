@@ -1,51 +1,49 @@
-# Changes: slice 2 (provider adapters, cooldowns, quota, redaction)
+# Changes: slice 3 (OpenCode executor, orchestrator, Discord frontend, wiring)
 
-Branch `feat/providers-quota`. Nothing committed. Result: 366 tests pass, ruff check and format clean, `-m app --check --config config.example.yaml` OK.
+Branch `feat/discord-opencode`, nothing committed. Gate: 674 passed, 1 xfailed; `ruff check .` and `ruff format --check .` clean; `-m app --check --config config.example.yaml` OK. discord.py 2.7.1 installed fine on Python 3.14 (also pulls aiohttp, audioop-lts).
 
-## Source files
+## Modified files
+- `pyproject.toml`: added `discord.py>=2.5,<3`.
+- `app/config/models.py`: `OpenCodeConfig` extended (command, provider_map, projects, timeouts, tails, continue_prompt, `project_directory()`); new `OrchestratorConfig` on `AppConfig.orchestrator`; `ProviderConfig.base_url` rejects http:// except localhost/127.0.0.1/::1.
+- `app/config/secrets.py`: `resolve_secret` returns the stripped value.
+- `app/providers/http.py`: `request_id` truncated to 100 chars.
+- `app/runtime/interfaces.py`: new `ExecutionOutcome`, `ExecutorEventKind`, `ExecutorEvent`, `ExecutionResult` (replaced), `ExecutorHealth`, `AgentExecutor` (replaced); `ChatFrontend.on_event` (+ `NullFrontend.on_event`).
+- `app/runtime/daemon.py`: `TaskSubmission.task_id/session_id`; `orchestrator=` param and property; `start()` binds orchestrator and runs `recover_interrupted()` after migrate; `enqueue_task`; `cancel_task`; `stop()` calls `begin_shutdown()` first; `_event_loop` fans events to `frontend.on_event` with a 10 s timeout and swallows errors; cleanup closes idle sessions (`sessions_closed` field); `metrics()["running_task_id"]`.
+- `app/db/tasks.py`: `set_selection`, `attach_session`, `find_by_ref`, `list_recent`.
+- `app/db/provider_models.py`: `list_model_ids`.
+- `app/cli.py`: non-check path is `asyncio.run(_serve(config, redactor, once=...))`; runtime built inside the loop via `build_runtime`, `close_runtime` in `finally`. `--check` unchanged.
+- `config.example.yaml`: new opencode keys (defaults), `orchestrator:` section, allowlist-denies-all comment.
+- `docs/SETUP-discord-opencode.md`: removed the `git checkout feat/providers-quota` line.
 
-New:
-- `app/providers/errors.py`: `ProviderError` (message stored redacted and truncated to 300; no request/response/headers held), `MalformedResponseError` (UNKNOWN), `MissingCredentialError` (AUTH_FAILED, names env var only).
-- `app/providers/ratelimit.py`: `parse_duration`, `parse_number`, `parse_retry_after`, `parse_rate_limit_headers` (EXACT only when remaining parsed; absent headers give no record).
-- `app/providers/http.py`: `HttpProviderAdapter` base, `classify_status`, `classify_transport_error`, `apply_metadata`, `positive_int` helper, status/code maps. Key resolved from env per request, sent per-request, never stored. Transport errors are raised outside the `except` block so `__cause__` and `__context__` are both None. `health_check` and `classify_error` never raise.
-- `app/providers/openrouter.py`, `gemini.py`, `cerebras.py`, `groq.py`: adapters per spec 4.4 (all base URLs and header-dimension maps are module constants). Gemini sends `x-goog-api-key` header, paginates (max 10 pages, WARNING if truncated), `get_quota()` returns `[]` with no request.
-- `app/providers/registry.py`: `ADAPTER_TYPES`, `build_adapters`.
-- `app/quota/__init__.py`, `normalize.py` (`DIMENSION_SPECS`, `validate_record`, `normalize`), `cooldown.py` (`CooldownManager`, in-memory), `estimator.py` (`estimate_quota`, never EXACT), `state.py` (`refresh_provider`, `refresh_all`, `build_router_state`, `route_with_state`, `RouterStateError`, `ProviderObservation`).
-- `app/db/quota.py` (`QuotaSnapshotRepository`), `app/db/usage.py` (`UsageRepository`, `UsageEvent`, ...), `app/db/provider_models.py` (`ProviderModelRepository`). No schema change.
-- `app/redaction.py`: `SecretRedactor`, `RedactingFilter`, `install_redaction` (filter goes on handlers). Does not import `app.providers.*`.
-
-Modified:
-- `app/providers/base.py`: added `QuotaDimension`.
-- `app/config/models.py`: `ModelMetadataConfig`, `LimitConfig`, `CooldownConfig`; `ProviderConfig` gains `base_url`, `timeout_s`, `models`, `limits`; `AppConfig.cooldown`.
-- `app/config/secrets.py`: `collect_secret_values`.
-- `app/db/connection.py`: `transaction()` rollback failure is logged and the original exception is re-raised.
-- `app/runtime/daemon.py`: `submit_task` returns False (with WARNING) once stopped.
-- `app/router/types.py`: `NoEligibleReason.ROUTER_STATE_UNAVAILABLE`.
-- `app/cli.py`: installs redaction after `basicConfig`; adds config secrets to the redactor after `load_config`.
-- `pyproject.toml`: `httpx>=0.27,<1` (installed into `.venv`).
-- `config.example.yaml`: `cooldown:` block; commented-out gemini `limits:`/`models:` examples with placeholder text only.
-- `README.md`: updated notes per spec 3.4.
-
-## Tests
-New: `test_provider_http_common.py`, `test_provider_openrouter.py`, `test_provider_gemini.py`, `test_provider_cerebras.py`, `test_provider_groq.py`, `test_cooldown.py`, `test_quota_normalize.py`, `test_quota_repository.py`, `test_usage.py`, `test_estimator.py`, `test_router_state.py`, `test_redaction.py`, `test_db_connection.py`. Shared helpers (not collected): `tests/adapter_helpers.py`, `tests/provider_compat_cases.py`.
-Modified: `tests/conftest.py` (autouse network guard on `httpx.AsyncHTTPTransport`, `SECRET`, `secret_env()`, `json_response()`, `provider_cfg()`), `tests/test_config.py`, `tests/test_daemon.py`.
+## New files
+- `app/opencode/events.py`: pure JSON-line parser and error classification (assumptions B1-B3 documented in the docstring).
+- `app/opencode/process.py`: `kill_process_tree` (taskkill /T /F on Windows, killpg on POSIX).
+- `app/opencode/health.py`: `GET /global/health` check (B7).
+- `app/opencode/executor.py`: `OpenCodeExecutor` (argv build, bounded stdout/stderr readers, timeout/cancel/outer-cancel handling, redaction, .cmd/.bat refusal).
+- `app/orchestrator/prompt.py`: `sanitize_prompt`, `PROMPT_MAX_CHARS` (kept separate to avoid an import cycle; re-exported from `orchestrator.py`).
+- `app/orchestrator/orchestrator.py`: `Orchestrator`, `RunningTask`, `CancelResult`; handle loop, fallback by continuing the OpenCode session, unknown-outcome stop, restart recovery, shutdown, throttled progress events.
+- `app/db/sessions.py`, `app/db/attempts.py`: `SessionRepository`, `FallbackAttemptRepository`.
+- `app/bot/{auth,format,commands,backend,discord_frontend}.py`: authorization (empty lists deny), pure formatting, pure command handlers, `ControllerBackend`, thin discord.py adapter with `create_frontend`.
+- `app/runtime/wiring.py`: `Runtime`, `build_runtime`, `close_runtime` (discord imported lazily, only when `once` is False).
+- Tests: `tests/fakes/{__init__,fake_opencode,fake_executor}.py`, `test_opencode_events.py`, `test_opencode_executor.py`, `test_opencode_health.py`, `test_sessions_attempts_repo.py`, `test_orchestrator.py`, `test_bot_auth.py`, `test_bot_format.py`, `test_bot_commands.py`, `test_bot_backend.py` (extra), `test_discord_frontend.py`, `test_wiring.py`; additions to `tests/test_config.py` and `tests/test_daemon.py`.
 
 ## Tester focus
-- Secret safety: key never in `str/repr/traceback` of errors, adapter repr, caplog (DEBUG), URLs; `__cause__` and `__context__` both None on transport errors and 401 bodies that echo the key.
-- Fail-closed paths: negative or NULL paid cost raises `RouterStateError`, `route_with_state` returns `ROUTER_STATE_UNAVAILABLE`; spend never clamped.
-- Estimates: always ESTIMATED/UNKNOWN, never EXACT; missing token counts give UNKNOWN with `remaining=None`; unexpired EXACT suppresses estimate (expiry boundary `reset_at == now` counts as expired).
-- Cooldown scope: 429 is `(provider, model)`, PROVIDER_UNAVAILABLE and repeated network failures are `(provider, None)`; later `until` wins; `active(now=until)` is expired and pruned.
-- `latest()` picks the newest row first, then drops it if expired (an older row is not resurrected). This is my reading of the spec; confirm it is intended.
-- Redaction regex edge cases (`Authorization: Bearer [REDACTED]` is not doubled; quoted header dicts; `?key=` query params).
-- Test config: the `_no_real_network` autouse fixture blocks only `AsyncHTTPTransport`; adapter tests use `httpx.MockTransport`.
-- Note: `git status` shows `.pipeline/spec.md` as modified; I did not edit it.
-- Note: running `-m app --check` creates `data/agent-controller.db` (gitignored).
+- Executor on Windows: process tree kill on cancel, timeout and outer `CancelledError` (heartbeat file stops); `.cmd` refusal; oversized-line skipping (`long_line`); memory-bounded `flood`.
+- Fallback semantics in `Orchestrator._run_task`: continue-session vs. re-send original prompt vs. stop with `UNKNOWN` (tool events but no session); TIMED_OUT never replayed; EXECUTOR_UNAVAILABLE and unhealthy server never cool down a provider; usage rows all FREE (the last usage row status is `unknown_outcome` for STOP_ERRORS or timeouts).
+- Terminal-state paths: cancel while queued/running, shutdown (`DAEMON_SHUTDOWN` for running and queued), restart recovery (`INTERRUPTED_BY_RESTART`); session closed on terminal task when it has no OpenCode id.
+- Discord: auth runs before defer; replies redacted/truncated/backtick-neutralized; token never in `repr`/`vars` of `DiscordFrontend`; no test connects to Discord.
+- Judgment calls to review: the `attempt_failed` text reads "checking for another free candidate" (spec said not to promise a next one); `task_finished` event field `session_id` carries the OpenCode session id and `session_short` our session id; the `progress` SESSION event is identified by the `opencode_session_id` field; `/code session:` also adopts the session's project.
+- Known baseline: the suite has 542 pre-existing tests (not 635 as the spec said) plus 1 xfail (not 2); nothing was removed.
 
-## Commands (from repo root, Git Bash)
+## Commands
 ```
 .venv/Scripts/python -m pip install -e ".[dev]"
 .venv/Scripts/python -m pytest -q
 .venv/Scripts/python -m ruff check .
 .venv/Scripts/python -m ruff format --check .
 .venv/Scripts/python -m app --check --config config.example.yaml
+.venv/Scripts/python -m pytest -q tests/test_opencode_executor.py tests/test_orchestrator.py
 ```
+
+## Deferred (not implemented, per spec section 13)
+Approvals (T060/T061, `/approve`, `/deny`, `/attach`); start scripts T101/T102 and live end-to-end T082; OpenCode server Basic auth; visibility into OpenCode internal 429 retries (B4); slice-2 review follow-ups (snapshot max-age, 504 precedence in http.py, ratelimit header overflow clamps, partial-key redaction, `install_redaction` for later handlers, A9 Groq header scoping, probe-cost reuse, test_cli redaction-filter hygiene, slice-1 test strengthening); the strict xfail (reviewer may delete the paid-spend one); quota refresh scheduler (T044); concurrent tasks.

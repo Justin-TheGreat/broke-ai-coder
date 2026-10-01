@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.db.connection import transaction
+from app.db.sessions import AmbiguousReference
 from app.orchestrator.state_machine import (
     TERMINAL_STATUSES,
     TaskStatus,
@@ -157,5 +158,50 @@ class TaskRepository:
         rows = self._conn.execute(
             f"SELECT * FROM tasks WHERE status NOT IN ({terminal}) ORDER BY created_at, id",
             [s.value for s in TERMINAL_STATUSES],
+        ).fetchall()
+        return [_row_to_record(r) for r in rows]
+
+    def set_selection(
+        self, task_id: str, *, provider: str, model: str, now: datetime
+    ) -> TaskRecord:
+        ts = to_db(now)
+        with transaction(self._conn):
+            cur = self._conn.execute(
+                "UPDATE tasks SET selected_provider = ?, selected_model = ?, cost_class = ?,"
+                " last_event_at = ? WHERE id = ?",
+                (provider, model, CostClass.FREE.value, ts, task_id),
+            )
+            if cur.rowcount == 0:
+                raise TaskNotFound(task_id)
+        record = self.get(task_id)
+        assert record is not None
+        return record
+
+    def attach_session(self, task_id: str, session_id: str, *, now: datetime) -> TaskRecord:
+        with transaction(self._conn):
+            cur = self._conn.execute(
+                "UPDATE tasks SET session_id = ?, last_event_at = ? WHERE id = ?",
+                (session_id, to_db(now), task_id),
+            )
+            if cur.rowcount == 0:
+                raise TaskNotFound(task_id)
+        record = self.get(task_id)
+        assert record is not None
+        return record
+
+    def find_by_ref(self, ref: str) -> TaskRecord | None:
+        exact = self.get(ref)
+        if exact is not None:
+            return exact
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE id LIKE ? || '%' LIMIT 2", (ref,)
+        ).fetchall()
+        if len(rows) > 1:
+            raise AmbiguousReference(ref)
+        return _row_to_record(rows[0]) if rows else None
+
+    def list_recent(self, limit: int) -> list[TaskRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC, id LIMIT ?", (limit,)
         ).fetchall()
         return [_row_to_record(r) for r in rows]

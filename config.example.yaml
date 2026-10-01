@@ -30,12 +30,28 @@ providers:
   groq:       {enabled: true, api_key_env: GROQ_API_KEY}
 discord:
   bot_token_env: DISCORD_BOT_TOKEN
+  # Empty allowlists deny everyone: a command needs the user, guild AND channel to be listed.
   allowed_user_ids: []
   allowed_guild_ids: []
   allowed_channel_ids: []
 opencode:
   server_url: http://127.0.0.1:4096
   working_directory: /workspace
+  command: [opencode]            # e.g. ["node", "C:/path/opencode/bin/opencode"]; .cmd/.bat refused
+  # provider_map: {openrouter: openrouter, gemini: google, groq: groq}   # our id -> OpenCode id
+  # projects: {myproj: /workspace/myproj}   # extra project names for /code project:<name>
+  run_timeout_s: 1800
+  kill_grace_s: 5
+  health_timeout_s: 5
+  max_line_bytes: 1048576
+  output_tail_chars: 4000
+  stderr_tail_bytes: 4096
+  continue_prompt: "Continue the previous task from where it stopped. Do not repeat steps that already completed."
+orchestrator:
+  provider_refresh_interval_s: 300
+  progress_min_interval_s: 10
+  session_idle_close_days: 7
+  require_tool_calling: false
 database:
   path: data/agent-controller.db
   busy_timeout_ms: 5000

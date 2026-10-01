@@ -123,3 +123,90 @@ async def test_submit_rejected_after_stop(tmp_path):
     await c.start()
     await c.stop()
     assert c.submit_task(sub()) is False
+
+
+async def test_enqueue_task_returns_record_and_rejects_when_full_or_stopped(tmp_path):
+    gate = asyncio.Event()
+
+    async def handler(ctrl, s):
+        await gate.wait()
+
+    c = AgentController(cfg_for(tmp_path, task_queue_maxsize=1), task_handler=handler)
+    assert c.enqueue_task(sub()) is None  # not started
+    await c.start()
+    try:
+        rec = c.enqueue_task(sub(1))
+        assert rec is not None and rec.status == TaskStatus.QUEUED
+        await asyncio.sleep(0.05)  # worker takes the first item and blocks
+        assert c.enqueue_task(sub(2)) is not None  # fills the queue
+        assert c.enqueue_task(sub(3)) is None  # full
+        assert len(TaskRepository(c.conn).list_unfinished()) == 2
+    finally:
+        gate.set()
+        await c.stop()
+    assert c.enqueue_task(sub()) is None  # stopped
+
+
+async def test_frontend_on_event_failure_does_not_stop_event_loop(tmp_path):
+    seen = []
+
+    class Flaky:
+        async def start(self, controller):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def on_event(self, event):
+            seen.append(event.name)
+            if event.name == "first":
+                raise RuntimeError("boom")
+
+    c = AgentController(cfg_for(tmp_path), frontend=Flaky())
+    await c.start()
+    try:
+        c.emit(ControllerEvent("first", at=c._clock()))
+        c.emit(ControllerEvent("second", at=c._clock()))
+        await asyncio.wait_for(c._event_queue.join(), 5)
+        assert "second" in seen
+    finally:
+        await c.stop()
+
+
+async def test_cancel_task_without_orchestrator(tmp_path):
+    from app.orchestrator.orchestrator import CancelResult
+
+    gate = asyncio.Event()
+
+    async def handler(ctrl, s):
+        await gate.wait()
+
+    c = AgentController(cfg_for(tmp_path), task_handler=handler)
+    await c.start()
+    try:
+        a = c.enqueue_task(sub(1))
+        await asyncio.sleep(0.05)
+        b = c.enqueue_task(sub(2))
+        assert c.cancel_task(b.id) == CancelResult.CANCELLED
+        assert c.cancel_task(b.id) == CancelResult.NOT_CANCELLABLE
+        assert c.cancel_task("missing") == CancelResult.NOT_FOUND
+        assert c.cancel_task(a.id) == CancelResult.CANCELLED
+    finally:
+        gate.set()
+        await c.stop()
+
+
+async def test_cleanup_closes_idle_sessions(tmp_path):
+    from datetime import timedelta
+
+    from app.db.sessions import SessionRepository, SessionStatus
+
+    c = AgentController(cfg_for(tmp_path))
+    await c.start()
+    try:
+        repo = SessionRepository(c.conn)
+        old = repo.create(project_id="p", now=c._clock() - timedelta(days=30))
+        await c.run_cleanup_now()
+        assert repo.get(old.id).status == SessionStatus.CLOSED
+    finally:
+        await c.stop()

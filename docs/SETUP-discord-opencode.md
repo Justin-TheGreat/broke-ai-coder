@@ -218,7 +218,6 @@ The architecture runs the controller inside WSL next to OpenCode:
 cd ~
 gh repo clone Justin-TheGreat/broke-ai-coder
 cd broke-ai-coder
-git checkout feat/providers-quota      # or main once branches are merged
 python3 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 .venv/bin/python -m pytest -q

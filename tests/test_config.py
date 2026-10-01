@@ -273,3 +273,57 @@ def test_collect_secret_values(make_config):
     }
     assert collect_secret_values(cfg, env) == frozenset({"k-or-123456", "tok-123456"})
     assert collect_secret_values(cfg, {}) == frozenset()
+
+
+def test_opencode_and_orchestrator_defaults():
+    cfg = parse_config({})
+    oc = cfg.opencode
+    assert oc.command == ["opencode"]
+    assert oc.provider_map == {"openrouter": "openrouter", "gemini": "google", "groq": "groq"}
+    assert oc.run_timeout_s == 1800 and oc.kill_grace_s == 5 and oc.health_timeout_s == 5
+    assert oc.max_line_bytes == 1_048_576 and oc.output_tail_chars == 4000
+    assert oc.stderr_tail_bytes == 4096 and oc.projects == {}
+    assert oc.project_directory("default") == "/workspace"
+    assert oc.project_directory("nope") is None
+    o = cfg.orchestrator
+    assert o.provider_refresh_interval_s == 300 and o.progress_min_interval_s == 10
+    assert o.session_idle_close_days == 7 and o.require_tool_calling is False
+
+
+def test_project_directory_lookup():
+    cfg = parse_config({"opencode": {"projects": {"my-proj": "/w/p"}}})
+    assert cfg.opencode.project_directory("my-proj") == "/w/p"
+
+
+@pytest.mark.parametrize(
+    "opencode",
+    [
+        {"provider_map": {"gemini": "google/x"}},
+        {"provider_map": {"": "x"}},
+        {"projects": {"default": "/x"}},
+        {"projects": {"bad name": "/x"}},
+        {"command": []},
+        {"command": [" "]},
+        {"server_url": "ftp://x"},
+        {"continue_prompt": "  "},
+        {"run_timeout_s": 0},
+    ],
+)
+def test_opencode_invalid(opencode):
+    with pytest.raises(ConfigError):
+        parse_config({"opencode": opencode})
+
+
+def test_http_base_url_only_for_localhost():
+    prov = {"openrouter": {"api_key_env": "K", "base_url": "http://example.com"}}
+    with pytest.raises(ConfigError, match="http:// only for localhost"):
+        parse_config({"providers": prov})
+    ok = {"openrouter": {"api_key_env": "K", "base_url": "http://localhost:8080"}}
+    assert parse_config({"providers": ok}).providers["openrouter"].base_url
+    ok = {"openrouter": {"api_key_env": "K", "base_url": "https://example.com"}}
+    assert parse_config({"providers": ok})
+
+
+def test_resolve_secret_strips():
+    assert resolve_secret("K", {"K": "  abc "}) == "abc"
+    assert resolve_secret("K", {"K": "   "}) is None

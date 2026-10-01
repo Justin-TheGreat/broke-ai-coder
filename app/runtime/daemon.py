@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from app.config.models import AppConfig
 from app.db.connection import db_size_bytes, open_database
 from app.db.migrations import migrate
 from app.db.retention import CleanupResult, run_retention_cleanup
-from app.db.tasks import TaskRepository
+from app.db.sessions import SessionRepository
+from app.db.tasks import ConcurrentTransition, TaskRecord, TaskRepository
+from app.orchestrator.state_machine import InvalidTransition, TaskStatus
 from app.runtime.interfaces import ChatFrontend, NullFrontend
 from app.timeutil import to_db, utcnow
+
+if TYPE_CHECKING:
+    from app.orchestrator.orchestrator import CancelResult, Orchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +32,8 @@ class TaskSubmission:
     discord_user_id: str
     discord_guild_id: str | None = None
     discord_channel_id: str | None = None
+    task_id: str | None = None
+    session_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +45,8 @@ class ControllerEvent:
 
 
 TaskHandler = Callable[["AgentController", TaskSubmission], Awaitable[None]]
+
+FRONTEND_EVENT_TIMEOUT_S = 10
 
 
 def _format_event(event: ControllerEvent) -> str:
@@ -51,11 +62,18 @@ class AgentController:
         *,
         frontend: ChatFrontend | None = None,
         task_handler: TaskHandler | None = None,
+        orchestrator: Orchestrator | None = None,
         clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self._config = config
         self._frontend: ChatFrontend = frontend if frontend is not None else NullFrontend()
-        self._task_handler: TaskHandler = task_handler or self._default_handler
+        self._orchestrator = orchestrator
+        if task_handler is not None:
+            self._task_handler: TaskHandler = task_handler
+        elif orchestrator is not None:
+            self._task_handler = orchestrator.handle
+        else:
+            self._task_handler = self._default_handler
         self._clock = clock
         self.conn: sqlite3.Connection | None = None
         self._task_queue: asyncio.Queue[TaskSubmission] = asyncio.Queue(
@@ -72,6 +90,10 @@ class AgentController:
         self.event_dropped_count = 0
         self._last_cleanup_at: datetime | None = None
 
+    @property
+    def orchestrator(self) -> Orchestrator | None:
+        return self._orchestrator
+
     # ---- lifecycle -------------------------------------------------
 
     async def start(self) -> None:
@@ -82,6 +104,9 @@ class AgentController:
         self.conn = open_database(db.path, busy_timeout_ms=db.busy_timeout_ms)
         try:
             migrate(self.conn)
+            if self._orchestrator is not None:
+                self._orchestrator.bind(self)
+                self._orchestrator.recover_interrupted()
             self._tasks = [
                 asyncio.create_task(self._worker_loop(), name="task-worker"),
                 asyncio.create_task(self._event_loop(), name="event-consumer"),
@@ -97,6 +122,8 @@ class AgentController:
             return
         self._stopped = True
         self._stop_event.set()
+        if self._orchestrator is not None:
+            self._orchestrator.begin_shutdown()
         try:
             await self._frontend.stop()
         except Exception:
@@ -157,6 +184,48 @@ class AgentController:
             return False
         return True
 
+    def enqueue_task(self, sub: TaskSubmission) -> TaskRecord | None:
+        if not self._started or self._stopped or self.conn is None or self._task_queue.full():
+            return None
+        record = TaskRepository(self.conn).create(
+            project_id=sub.project_id,
+            prompt=sub.prompt,
+            discord_user_id=sub.discord_user_id,
+            discord_guild_id=sub.discord_guild_id,
+            discord_channel_id=sub.discord_channel_id,
+            session_id=sub.session_id,
+            now=self._clock(),
+        )
+        self._task_queue.put_nowait(dataclasses.replace(sub, task_id=record.id))
+        self.emit(
+            ControllerEvent(
+                "task_queued",
+                at=self._clock(),
+                task_id=record.id,
+                fields={"channel_id": record.discord_channel_id, "short_id": record.id[:8]},
+            )
+        )
+        return record
+
+    def cancel_task(self, task_id: str) -> CancelResult:
+        if self._orchestrator is not None:
+            return self._orchestrator.request_cancel(task_id)
+        from app.orchestrator.orchestrator import CancelResult
+
+        if self.conn is None:
+            return CancelResult.NOT_FOUND
+        tasks = TaskRepository(self.conn)
+        rec = tasks.get(task_id)
+        if rec is None:
+            return CancelResult.NOT_FOUND
+        if rec.status != TaskStatus.QUEUED:
+            return CancelResult.NOT_CANCELLABLE
+        try:
+            tasks.transition(task_id, TaskStatus.CANCELLED, now=self._clock())
+        except (InvalidTransition, ConcurrentTransition):
+            return CancelResult.NOT_CANCELLABLE
+        return CancelResult.CANCELLED
+
     def emit(self, event: ControllerEvent) -> bool:
         try:
             self._event_queue.put_nowait(event)
@@ -199,6 +268,12 @@ class AgentController:
             event = await self._event_queue.get()
             try:
                 logger.info(_format_event(event))
+                try:
+                    await asyncio.wait_for(
+                        self._frontend.on_event(event), timeout=FRONTEND_EVENT_TIMEOUT_S
+                    )
+                except Exception as e:
+                    logger.warning("frontend on_event failed: %s", type(e).__name__)
             finally:
                 self._event_queue.task_done()
 
@@ -220,22 +295,28 @@ class AgentController:
         db = self._config.database
         now = self._clock()
 
-        def _work() -> CleanupResult:
+        def _work() -> tuple[CleanupResult, int]:
             conn = open_database(db.path, busy_timeout_ms=db.busy_timeout_ms)
             try:
-                return run_retention_cleanup(
+                sessions_closed = SessionRepository(conn).close_idle(
+                    cutoff=now - timedelta(days=self._config.orchestrator.session_idle_close_days),
+                    now=now,
+                )
+                result = run_retention_cleanup(
                     conn,
                     now=now,
                     retention_days=db.retention_days,
                     batch_size=db.cleanup_batch_size,
                 )
+                return result, sessions_closed
             finally:
                 conn.close()
 
-        result = await asyncio.to_thread(_work)
+        result, sessions_closed = await asyncio.to_thread(_work)
         self._last_cleanup_at = now
         fields: dict[str, str | int | float | bool | None] = dict(result.deleted)
         fields["db_size_bytes"] = result.db_size_bytes
+        fields["sessions_closed"] = sessions_closed
         self.emit(ControllerEvent("retention_cleanup", at=now, fields=fields))
         return result
 
@@ -250,4 +331,9 @@ class AgentController:
                 to_db(self._last_cleanup_at) if self._last_cleanup_at is not None else None
             ),
             "sqlite_db_bytes": db_size_bytes(self.conn) if self.conn is not None else None,
+            "running_task_id": (
+                self._orchestrator.running.task_id
+                if self._orchestrator is not None and self._orchestrator.running is not None
+                else None
+            ),
         }

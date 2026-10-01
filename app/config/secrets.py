@@ -11,7 +11,7 @@ def resolve_secret(env_name: str, environ: Mapping[str, str] | None = None) -> s
     value = env.get(env_name)
     if value is None or not value.strip():
         return None
-    return value
+    return value.strip()
 
 
 def credentials_present(

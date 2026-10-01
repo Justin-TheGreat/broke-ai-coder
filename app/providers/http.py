@@ -255,7 +255,7 @@ class HttpProviderAdapter:
             status_code=status,
             error_code=code[:100] if code else None,
             retry_after_s=retry_after,
-            request_id=request_id,
+            request_id=request_id[:100] if request_id else None,
         )
 
     async def classify_error(self, error: Exception) -> ErrorClass:

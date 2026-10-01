@@ -8,23 +8,31 @@ import sys
 from collections.abc import Sequence
 
 from app.config.loader import ConfigError, load_config
+from app.config.models import AppConfig
 from app.config.secrets import collect_secret_values
 from app.db.connection import open_database
 from app.db.migrations import migrate
 from app.redaction import SecretRedactor, install_redaction
-from app.runtime.daemon import AgentController
+from app.runtime.wiring import build_runtime, close_runtime
 
 logger = logging.getLogger(__name__)
 
 
-async def _serve(controller: AgentController) -> None:
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, controller.request_stop)
-        except NotImplementedError:
-            break  # Windows: rely on KeyboardInterrupt
-    await controller.run_forever()
+async def _serve(config: AppConfig, redactor: SecretRedactor, *, once: bool) -> None:
+    rt = build_runtime(config, redactor=redactor, once=once)
+    try:
+        if once:
+            await rt.controller.run_once()
+            return
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, rt.controller.request_stop)
+            except NotImplementedError:
+                break  # Windows: rely on KeyboardInterrupt
+        await rt.controller.run_forever()
+    finally:
+        await close_runtime(rt)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -57,11 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 conn.close()
             print(f"config OK; schema version {version}; database {config.database.path}")
             return 0
-        controller = AgentController(config)
-        if args.once:
-            asyncio.run(controller.run_once())
-        else:
-            asyncio.run(_serve(controller))
+        asyncio.run(_serve(config, redactor, once=args.once))
         return 0
     except KeyboardInterrupt:
         return 0

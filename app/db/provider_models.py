@@ -82,3 +82,9 @@ class ProviderModelRepository:
             for r in rows
             if is_allowlisted(config, provider, r["model"])
         ]
+
+    def list_model_ids(self, provider: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT model FROM provider_models WHERE provider = ? ORDER BY model", (provider,)
+        ).fetchall()
+        return [r["model"] for r in rows]
