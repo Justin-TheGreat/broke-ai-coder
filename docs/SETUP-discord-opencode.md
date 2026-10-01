@@ -60,7 +60,15 @@ Right-click (desktop) or long-press (iPhone) → **Copy … ID**:
 
 ## Part B — Provider API keys (≈15 min)
 
-Create one key per provider. Use free tiers only; **do not add a payment method** anywhere (that is a second safety net on top of the controller's $0 budget).
+Create one key per provider. This project is **free-only**: the controller has no paid mode, rejects paid config, and only accepts OpenRouter `:free` models. But whether Gemini and Groq charge you is decided by **your account**, not by the code, so keep every account billing-free:
+
+| Provider | Stay free by… | Why it matters |
+|---|---|---|
+| OpenRouter | **Never buy credits.** | With a $0 balance, a paid model can't be billed even if one were misconfigured. |
+| Gemini (AI Studio) | Create the key in a Google Cloud project with **no Cloud Billing account linked**. In AI Studio the key should show the **Free** tier. | Keys in a billing-enabled project use the paid tier and are charged per token. |
+| Groq | Stay on the **Free** plan; don't upgrade or add a card. | The paid plan bills usage above the free limits. |
+
+With billing absent everywhere, hitting a limit just returns a 429 error and the router falls back to the next free provider, or stops.
 
 | Provider | Where to create the key | Env var(s) |
 |---|---|---|

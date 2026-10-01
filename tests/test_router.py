@@ -16,7 +16,6 @@ from app.providers.base import (
 from app.router import (
     NoEligibleProvider,
     NoEligibleReason,
-    PaidApprovalRequired,
     RequiredCapabilities,
     RouteRequest,
     Selected,
@@ -26,7 +25,6 @@ from app.router import (
 )
 
 REQ = RouteRequest("t", "p")
-PAID_MODE = "free-first-paid-after-approval"
 
 
 def q(provider, confidence, model=None, unit=QuotaUnit.REQUESTS, **kw):
@@ -134,11 +132,7 @@ def test_tokens_above_context_window(make_config):
     req = RouteRequest("t", "p", estimated_input_tokens=190_000, estimated_output_tokens=20_000)
     d = route(req, cfg, full_state(cfg))
     assert isinstance(d, NoEligibleProvider)
-    assert all(
-        s.reason == SkipReason.CONTEXT_TOO_SMALL
-        for s in d.skipped
-        if s.candidate.cost_class == "FREE"
-    )
+    assert all(s.reason == SkipReason.CONTEXT_TOO_SMALL for s in d.skipped)
 
 
 def test_output_above_max_output(make_config):
@@ -240,8 +234,8 @@ def test_unknown_quota_does_not_filter(make_config):
 ALL_FREE = ("openrouter", "gemini", "groq")
 
 
-def test_default_mode_never_paid_even_if_only_candidate(make_config):
-    cfg = make_config(routing={"daily_paid_budget_usd": 100.0})
+def test_all_free_exhausted_stops_instead_of_paying(make_config):
+    cfg = make_config()
     d = route(
         REQ,
         cfg,
@@ -253,96 +247,19 @@ def test_default_mode_never_paid_even_if_only_candidate(make_config):
     )
     assert isinstance(d, NoEligibleProvider)
     assert d.reason == NoEligibleReason.FREE_CAPACITY_EXHAUSTED
-    assert reasons(d)["or-paid-1"] == SkipReason.PAID_BLOCKED_BY_MODE
+    # Every configured candidate was considered and skipped; nothing else exists to fall back to.
+    assert [s.candidate.model for s in d.skipped] == [c.model for c in build_candidates(cfg)]
 
 
-@pytest.mark.parametrize("mode", ["free-only", "free-first-no-paid"])
-def test_paid_blocked_modes(make_config, mode):
-    cfg = make_config(
-        routing={"mode": mode, "daily_paid_budget_usd": 100.0, "paid_requires_approval": False}
-    )
-    d = route(
-        REQ,
-        cfg,
-        full_state(
-            cfg,
-            quota=exhaust("gemini", "groq"),
-            cooldowns=cd(("openrouter", "openrouter/free")),
-        ),
-    )
-    assert isinstance(d, NoEligibleProvider)
-    assert d.reason == NoEligibleReason.FREE_CAPACITY_EXHAUSTED
-    assert reasons(d)["or-paid-1"] == SkipReason.PAID_BLOCKED_BY_MODE
-    # approved flag makes no difference
-    req = RouteRequest("t", "p", paid_approved=True)
-    d2 = route(
-        req,
-        cfg,
-        full_state(
-            cfg,
-            quota=exhaust("gemini", "groq"),
-            cooldowns=cd(("openrouter", "openrouter/free")),
-        ),
-    )
-    assert isinstance(d2, NoEligibleProvider)
+def test_router_has_no_paid_outcome():
+    import app.router as router_pkg
+    from app.providers.base import CostClass
 
-
-def free_down(cfg, **kw):
-    return full_state(
-        cfg,
-        quota=exhaust("gemini", "groq"),
-        cooldowns=cd(("openrouter", "openrouter/free")),
-        **kw,
-    )
-
-
-def paid_cfg(**routing):
-    return {"mode": PAID_MODE, **routing}
-
-
-def test_paid_budget_zero(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=0.0))
-    d = route(REQ, cfg, free_down(cfg))
-    assert isinstance(d, NoEligibleProvider)
-    assert d.reason == NoEligibleReason.PAID_BUDGET_EXHAUSTED
-    d = route(RouteRequest("t", "p", paid_approved=True), cfg, free_down(cfg))
-    assert isinstance(d, NoEligibleProvider)
-
-
-def test_paid_requires_approval(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0))
-    d = route(REQ, cfg, free_down(cfg))
-    assert isinstance(d, PaidApprovalRequired)
-    assert [c.model for c in d.candidates] == ["or-paid-1"]
-
-
-def test_paid_approved_selected(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0))
-    d = route(RouteRequest("t", "p", paid_approved=True), cfg, free_down(cfg))
-    assert model_of(d) == "or-paid-1"
-
-
-def test_paid_no_approval_required(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0, paid_requires_approval=False))
-    assert model_of(route(REQ, cfg, free_down(cfg))) == "or-paid-1"
-
-
-def test_paid_budget_spent_and_monthly(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0))
-    d = route(REQ, cfg, free_down(cfg, paid_spend_today_usd=5.0))
-    assert isinstance(d, NoEligibleProvider)
-    assert d.reason == NoEligibleReason.PAID_BUDGET_EXHAUSTED
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0, monthly_paid_budget_usd=10.0))
-    d = route(REQ, cfg, free_down(cfg, paid_spend_month_usd=10.0))
-    assert isinstance(d, NoEligibleProvider)
-    assert d.reason == NoEligibleReason.PAID_BUDGET_EXHAUSTED
-
-
-def test_free_always_beats_paid(make_config):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=5.0))
-    d = route(RouteRequest("t", "p", paid_approved=True), cfg, full_state(cfg))
-    assert model_of(d) == "openrouter/free"
-    assert d.candidate.cost_class == "FREE"
+    assert [c.value for c in CostClass] == ["FREE"]
+    assert not hasattr(router_pkg, "PaidApprovalRequired")
+    assert "paid_approved" not in RouteRequest.__dataclass_fields__
+    assert not any("PAID" in r.value for r in SkipReason)
+    assert not any("PAID" in r.value for r in NoEligibleReason)
 
 
 def test_deterministic(make_config):
@@ -373,32 +290,3 @@ def test_negative_tokens_rejected():
         RouteRequest("t", "p", estimated_input_tokens=-1)
     with pytest.raises(ValueError):
         RouteRequest("t", "p", estimated_output_tokens=-1)
-
-
-@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
-@pytest.mark.parametrize("field", ["paid_spend_today_usd", "paid_spend_month_usd"])
-def test_router_state_rejects_bad_spend(make_config, field, bad):
-    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=0.0))
-    with pytest.raises(ValueError, match=field):
-        full_state(cfg, **{field: bad})
-
-
-@pytest.mark.parametrize(
-    ("field", "routing"),
-    [
-        # Each case leaves the OTHER cap permissive so only the NaN comparison can block paid.
-        ("paid_spend_today_usd", {"daily_paid_budget_usd": 10.0}),
-        (
-            "paid_spend_month_usd",
-            {"daily_paid_budget_usd": 10.0, "monthly_paid_budget_usd": 10.0},
-        ),
-    ],
-)
-def test_paid_gate_fails_closed_on_nan_spend(make_config, field, routing):
-    # Bypass RouterState validation to prove the router comparison itself fails closed.
-    cfg = make_config(routing=paid_cfg(**routing))
-    state = free_down(cfg)
-    object.__setattr__(state, field, float("nan"))
-    d = route(RouteRequest("t", "p", paid_approved=True), cfg, state)
-    assert isinstance(d, NoEligibleProvider)
-    assert d.reason == NoEligibleReason.PAID_BUDGET_EXHAUSTED

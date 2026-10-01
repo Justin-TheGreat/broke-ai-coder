@@ -1,29 +1,42 @@
 from __future__ import annotations
 
-from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.providers.base import CostClass, QuotaDimension
+from app.providers.base import QuotaDimension
 
 ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
 
 _CFG = ConfigDict(extra="forbid", frozen=True)
 
+PAID_NOT_SUPPORTED = "paid inference is not supported: this project is free-only"
+_PAID_ROUTING_KEYS = (
+    "mode",
+    "paid_requires_approval",
+    "daily_paid_budget_usd",
+    "monthly_paid_budget_usd",
+)
 
-class RoutingMode(StrEnum):
-    FREE_ONLY = "free-only"
-    FREE_FIRST_NO_PAID = "free-first-no-paid"
-    FREE_FIRST_PAID_AFTER_APPROVAL = "free-first-paid-after-approval"
+
+def is_free_openrouter_model(model: str) -> bool:
+    """OpenRouter bills credits for any model that is not a free variant."""
+    return model == "openrouter/free" or model.endswith(":free")
 
 
 class PolicyConfig(BaseModel):
     model_config = _CFG
 
     provider: str
-    cost_class: CostClass
     enabled: bool = True
     model_order: list[str] = Field(min_length=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_cost_class(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "cost_class" in data:
+            raise ValueError(f"cost_class is not a setting; {PAID_NOT_SUPPORTED}")
+        return data
 
     @field_validator("provider")
     @classmethod
@@ -47,21 +60,19 @@ class PolicyConfig(BaseModel):
 class RoutingConfig(BaseModel):
     model_config = _CFG
 
-    mode: RoutingMode = RoutingMode.FREE_FIRST_NO_PAID
-    paid_requires_approval: bool = True
-    daily_paid_budget_usd: float = Field(0.0, ge=0, allow_inf_nan=False)
-    monthly_paid_budget_usd: float | None = Field(None, ge=0, allow_inf_nan=False)
     max_fallback_attempts: int = Field(3, ge=1)
     large_context_min_tokens: int = Field(128_000, ge=1)
     provider_order: list[str] = Field(default_factory=list)
     policies: dict[str, PolicyConfig] = Field(default_factory=dict)
 
-    @field_validator("mode", mode="before")
+    @model_validator(mode="before")
     @classmethod
-    def _mode_alias(cls, v: object) -> object:
-        if v == "free-first-paid-after-confirmation":
-            return RoutingMode.FREE_FIRST_PAID_AFTER_APPROVAL
-        return v
+    def _reject_paid_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            found = [k for k in _PAID_ROUTING_KEYS if k in data]
+            if found:
+                raise ValueError(f"{', '.join(found)}: {PAID_NOT_SUPPORTED}")
+        return data
 
     @model_validator(mode="after")
     def _check(self) -> RoutingConfig:
@@ -103,7 +114,7 @@ class LimitConfig(BaseModel):
     @classmethod
     def _no_spend(cls, v: QuotaDimension) -> QuotaDimension:
         if v == QuotaDimension.SPEND_USD:
-            raise ValueError("spend is governed by routing budgets")
+            raise ValueError(f"spend limits do not apply; {PAID_NOT_SUPPORTED}")
         return v
 
     @field_validator("model")
@@ -230,4 +241,12 @@ class AppConfig(BaseModel):
         for pid, pol in self.routing.policies.items():
             if pol.provider not in self.providers:
                 raise ValueError(f"policy {pid!r} references undefined provider {pol.provider!r}")
+            if pol.provider == "openrouter":
+                for m in pol.model_order:
+                    if not is_free_openrouter_model(m):
+                        raise ValueError(
+                            f"policy {pid!r}: OpenRouter model {m!r} is not a free variant"
+                            f" (use 'openrouter/free' or an id ending in ':free'); "
+                            f"{PAID_NOT_SUPPORTED}"
+                        )
         return self

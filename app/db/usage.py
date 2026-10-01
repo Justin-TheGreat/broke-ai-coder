@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,7 +27,6 @@ class UsageEvent:
     request_id: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
-    estimated_cost_usd: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,12 +36,6 @@ class UsageTotals:
     output_tokens: int
     events_missing_tokens: int
     earliest: datetime | None
-
-
-@dataclass(frozen=True, slots=True)
-class PaidSpend:
-    total_usd: float
-    missing_cost_events: int
 
 
 def _check_tokens(name: str, value: int | None) -> None:
@@ -56,14 +48,8 @@ def _check_tokens(name: str, value: int | None) -> None:
 def _validate(event: UsageEvent) -> None:
     _check_tokens("input_tokens", event.input_tokens)
     _check_tokens("output_tokens", event.output_tokens)
-    cost = event.estimated_cost_usd
-    if cost is not None:
-        if isinstance(cost, bool) or not isinstance(cost, int | float):
-            raise ValueError("estimated_cost_usd must be a number")
-        if not math.isfinite(cost) or cost < 0:
-            raise ValueError("estimated_cost_usd must be finite and >= 0")
-    if event.cost_class == CostClass.PAID and cost is None:
-        raise ValueError("PAID usage event requires estimated_cost_usd")
+    if event.cost_class != CostClass.FREE:
+        raise ValueError("only FREE usage can be recorded; paid inference is not supported")
     if not event.provider or not event.model:
         raise ValueError("provider and model must be non-empty")
     if event.occurred_at.tzinfo is None or event.occurred_at.utcoffset() is None:
@@ -84,8 +70,8 @@ class UsageRepository:
         with transaction(self._conn):
             cur = self._conn.execute(
                 "INSERT INTO usage_events (task_id, provider, model, request_id, input_tokens,"
-                " output_tokens, estimated_cost_usd, cost_class, status, occurred_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " output_tokens, cost_class, status, occurred_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event.task_id,
                     event.provider,
@@ -93,7 +79,6 @@ class UsageRepository:
                     event.request_id,
                     event.input_tokens,
                     event.output_tokens,
-                    event.estimated_cost_usd,
                     event.cost_class.value,
                     event.status.value,
                     to_db(event.occurred_at),
@@ -118,16 +103,6 @@ class UsageRepository:
             params.append(model)
         row = self._conn.execute(sql, params).fetchone()
         return _row_to_totals(row)
-
-    def paid_spend(self, *, since: datetime, until: datetime) -> PaidSpend:
-        row = self._conn.execute(
-            "SELECT COALESCE(SUM(COALESCE(estimated_cost_usd, 0.0)), 0.0) AS total,"
-            " COALESCE(SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 ELSE 0 END), 0) AS missing"
-            " FROM usage_events WHERE cost_class = 'PAID' AND occurred_at >= ?"
-            " AND occurred_at <= ?",
-            (to_db(since), to_db(until)),
-        ).fetchone()
-        return PaidSpend(total_usd=float(row["total"]), missing_cost_events=int(row["missing"]))
 
     def daily_totals(self, now: datetime) -> list[tuple[str, str, UsageTotals]]:
         rows = self._conn.execute(

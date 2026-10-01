@@ -8,9 +8,9 @@ from app.router import (
     FailedAttempt,
     NoEligibleProvider,
     NoEligibleReason,
-    PaidApprovalRequired,
     RouteRequest,
     Selected,
+    SkipReason,
     next_after_failure,
 )
 
@@ -59,15 +59,8 @@ def test_context_too_large_goes_to_qy(make_config):
     assert model_of(next_after_failure(REQ, attempts, cfg, st)) == "q-y"
 
 
-def test_auth_failed_excludes_whole_provider_including_paid(make_config):
-    cfg = make_config(
-        routing={
-            "mode": "free-first-paid-after-approval",
-            "daily_paid_budget_usd": 5.0,
-            "paid_requires_approval": False,
-            "max_fallback_attempts": 20,
-        }
-    )
+def test_auth_failed_excludes_whole_provider(make_config):
+    cfg = make_config(routing={"max_fallback_attempts": 20})
     st = full_state(cfg)
     attempts = [fa("openrouter", "openrouter/free", E.AUTH_FAILED)]
     for m, p in [
@@ -78,7 +71,7 @@ def test_auth_failed_excludes_whole_provider_including_paid(make_config):
     ]:
         attempts.append(fa(p, m))
     d = next_after_failure(REQ, attempts, cfg, st)
-    assert isinstance(d, NoEligibleProvider)  # or-paid-1 excluded with its provider
+    assert isinstance(d, NoEligibleProvider)
     assert d.reason == NoEligibleReason.FREE_CAPACITY_EXHAUSTED
 
 
@@ -100,10 +93,8 @@ def test_stop_errors(make_config, ec):
     assert d.reason == NoEligibleReason.NON_FALLBACK_ERROR
 
 
-def test_free_only_never_returns_paid(make_config):
-    cfg = make_config(
-        routing={"mode": "free-only", "daily_paid_budget_usd": 50.0, "max_fallback_attempts": 20}
-    )
+def test_exhausting_every_free_candidate_stops_the_task(make_config):
+    cfg = make_config(routing={"max_fallback_attempts": 20})
     attempts = [
         fa("openrouter", "openrouter/free"),
         fa("gemini", "g-3.8"),
@@ -113,26 +104,8 @@ def test_free_only_never_returns_paid(make_config):
     ]
     d = next_after_failure(REQ, attempts, cfg, full_state(cfg))
     assert isinstance(d, NoEligibleProvider)
-
-
-def test_fallback_to_paid_requires_approval(make_config):
-    cfg = make_config(
-        routing={
-            "mode": "free-first-paid-after-approval",
-            "daily_paid_budget_usd": 5.0,
-            "max_fallback_attempts": 20,
-        }
-    )
-    attempts = [
-        fa("gemini", "g-3.8"),
-        fa("gemini", "g-3.7"),
-        fa("groq", "q-x"),
-        fa("groq", "q-y"),
-        fa("openrouter", "openrouter/free"),
-    ]
-    d = next_after_failure(REQ, attempts, cfg, full_state(cfg))
-    assert isinstance(d, PaidApprovalRequired)
-    assert [c.model for c in d.candidates] == ["or-paid-1"]
+    assert d.reason == NoEligibleReason.FREE_CAPACITY_EXHAUSTED
+    assert {s.reason for s in d.skipped} == {SkipReason.EXCLUDED_AFTER_FAILURE}
 
 
 def test_empty_attempts(make_config):

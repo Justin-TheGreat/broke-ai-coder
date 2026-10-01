@@ -65,28 +65,19 @@ def _base_config_dict() -> dict[str, Any]:
                 "openrouter-free",
                 "gemini-free",
                 "groq-free",
-                "openrouter-paid",
             ],
             "policies": {
                 "openrouter-free": {
                     "provider": "openrouter",
-                    "cost_class": "FREE",
                     "model_order": ["openrouter/free"],
                 },
                 "gemini-free": {
                     "provider": "gemini",
-                    "cost_class": "FREE",
                     "model_order": ["g-3.8", "g-3.7"],
                 },
                 "groq-free": {
                     "provider": "groq",
-                    "cost_class": "FREE",
                     "model_order": ["q-x", "q-y"],
-                },
-                "openrouter-paid": {
-                    "provider": "openrouter",
-                    "cost_class": "PAID",
-                    "model_order": ["or-paid-1"],
                 },
             },
         },

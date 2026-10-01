@@ -7,6 +7,8 @@ import httpx
 import pytest
 from conftest import NOW, SECRET, json_response, secret_env
 
+from app.db.connection import open_database
+from app.db.migrations import migrate
 from app.db.provider_models import ProviderModelRepository
 from app.db.quota import QuotaSnapshotRepository
 from app.db.usage import UsageEvent, UsageRepository, UsageStatus
@@ -21,7 +23,6 @@ from app.providers.base import (
 from app.providers.registry import build_adapters
 from app.quota.cooldown import CooldownManager
 from app.quota.state import (
-    RouterStateError,
     build_router_state,
     refresh_all,
     route_with_state,
@@ -194,36 +195,16 @@ async def test_estimated_quota_blocks_gemini(db, make_config):
     assert gem and all(s.reason == SkipReason.QUOTA_EXHAUSTED for s in gem)
 
 
-def _raw_paid(db, cost, at=NOW):
-    db.execute(
-        "INSERT INTO usage_events (provider, model, cost_class, status, estimated_cost_usd,"
-        " occurred_at) VALUES ('openrouter', 'or-paid-1', 'PAID', 'success', ?, ?)",
-        (cost, at.isoformat(timespec="microseconds")),
-    )
-
-
-def test_bad_spend_negative(db, make_config):
+def test_route_with_state_fails_closed(tmp_path, make_config, caplog):
     cfg = make_config()
-    _raw_paid(db, -1.0)
-    with pytest.raises(RouterStateError, match="paid_spend"):
-        build_router_state(cfg, db, cooldowns(), {}, now=NOW, environ=secret_env())
-
-
-def test_bad_spend_null_cost(db, make_config):
-    cfg = make_config()
-    _raw_paid(db, None)
-    with pytest.raises(RouterStateError, match="unknown cost"):
-        build_router_state(cfg, db, cooldowns(), {}, now=NOW, environ=secret_env())
-
-
-def test_route_with_state_fails_closed(db, make_config, caplog):
-    cfg = make_config()
-    _raw_paid(db, -1.0)
+    conn = open_database(tmp_path / "closed.db")
+    migrate(conn)
+    conn.close()  # any DB failure while assembling state must fail closed, not crash
     with caplog.at_level(logging.ERROR):
         d = route_with_state(
             REQ,
             cfg,
-            lambda: build_router_state(cfg, db, cooldowns(), {}, now=NOW, environ=secret_env()),
+            lambda: build_router_state(cfg, conn, cooldowns(), {}, now=NOW, environ=secret_env()),
         )
     assert d == NoEligibleProvider(NoEligibleReason.ROUTER_STATE_UNAVAILABLE, ())
     assert "router state unavailable" in caplog.text
@@ -240,16 +221,6 @@ async def test_route_with_state_attempts_delegates(db, make_config):
     # non-RouterStateError exceptions propagate
     with pytest.raises(ZeroDivisionError):
         route_with_state(REQ, cfg, lambda: 1 / 0)
-
-
-def test_paid_spend_day_vs_month(db, make_config):
-    cfg = make_config()
-    yesterday = NOW - timedelta(days=1)  # 2026-09-29, same UTC month
-    _raw_paid(db, 0.5, NOW)
-    _raw_paid(db, 0.25, yesterday)
-    state = build_router_state(cfg, db, cooldowns(), {}, now=NOW, environ=secret_env())
-    assert state.paid_spend_today_usd == 0.5
-    assert state.paid_spend_month_usd == 0.75
 
 
 def test_secret_not_in_state_or_db(db, make_config):

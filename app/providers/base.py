@@ -7,8 +7,9 @@ from typing import Protocol, runtime_checkable
 
 
 class CostClass(StrEnum):
+    # Free-only by design: there is deliberately no PAID member, so paid inference
+    # cannot be represented anywhere in routing, usage accounting, or task records.
     FREE = "FREE"
-    PAID = "PAID"
 
 
 class QuotaConfidence(StrEnum):

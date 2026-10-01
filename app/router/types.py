@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
 from app.providers.base import (
-    CostClass,
     ErrorClass,
     HealthStatus,
     ModelCapability,
@@ -31,7 +29,6 @@ class RouteRequest:
     estimated_input_tokens: int = 0
     estimated_output_tokens: int = 0
     session_id: str | None = None
-    paid_approved: bool = False
 
     def __post_init__(self) -> None:
         if self.estimated_input_tokens < 0:
@@ -48,14 +45,6 @@ class RouterState:
     quota: Sequence[QuotaRecord] = ()
     health: Mapping[str, HealthStatus] = field(default_factory=dict)
     cooldowns: Mapping[tuple[str, str | None], datetime] = field(default_factory=dict)
-    paid_spend_today_usd: float = 0.0
-    paid_spend_month_usd: float = 0.0
-
-    def __post_init__(self) -> None:
-        for name in ("paid_spend_today_usd", "paid_spend_month_usd"):
-            value = getattr(self, name)
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(f"{name} must be finite and >= 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +52,6 @@ class Candidate:
     policy_id: str
     provider: str
     model: str
-    cost_class: CostClass
     provider_rank: int
     model_rank: int
 
@@ -77,7 +65,6 @@ class SkipReason(StrEnum):
     POLICY_DISABLED = "POLICY_DISABLED"
     PROVIDER_DISABLED = "PROVIDER_DISABLED"
     MISSING_CREDENTIAL = "MISSING_CREDENTIAL"
-    PAID_BLOCKED_BY_MODE = "PAID_BLOCKED_BY_MODE"
     PROVIDER_DOWN = "PROVIDER_DOWN"
     COOLDOWN = "COOLDOWN"
     MODEL_UNKNOWN = "MODEL_UNKNOWN"
@@ -95,7 +82,6 @@ class Skipped:
 
 class NoEligibleReason(StrEnum):
     FREE_CAPACITY_EXHAUSTED = "FREE_CAPACITY_EXHAUSTED"
-    PAID_BUDGET_EXHAUSTED = "PAID_BUDGET_EXHAUSTED"
     MAX_FALLBACK_ATTEMPTS_REACHED = "MAX_FALLBACK_ATTEMPTS_REACHED"
     NON_FALLBACK_ERROR = "NON_FALLBACK_ERROR"
     ROUTER_STATE_UNAVAILABLE = "ROUTER_STATE_UNAVAILABLE"
@@ -113,13 +99,7 @@ class NoEligibleProvider:
     skipped: tuple[Skipped, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class PaidApprovalRequired:
-    candidates: tuple[Candidate, ...]
-    skipped: tuple[Skipped, ...]
-
-
-RouteDecision = Selected | NoEligibleProvider | PaidApprovalRequired
+RouteDecision = Selected | NoEligibleProvider
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from app.config.models import AppConfig, RoutingMode
+from app.config.models import AppConfig
 from app.providers.base import (
     PROVIDER_FALLBACK_ERRORS,
     STOP_ERRORS,
-    CostClass,
     HealthStatus,
     ModelCapability,
     QuotaConfidence,
@@ -17,7 +16,6 @@ from app.router.types import (
     FailedAttempt,
     NoEligibleProvider,
     NoEligibleReason,
-    PaidApprovalRequired,
     RouteDecision,
     RouteRequest,
     RouterState,
@@ -38,7 +36,6 @@ def build_candidates(config: AppConfig) -> list[Candidate]:
                     policy_id=policy_id,
                     provider=policy.provider,
                     model=model,
-                    cost_class=policy.cost_class,
                     provider_rank=provider_rank,
                     model_rank=model_rank,
                 )
@@ -83,11 +80,6 @@ def _skip_reason(
         return SkipReason.PROVIDER_DISABLED
     if provider not in state.credentials_present:
         return SkipReason.MISSING_CREDENTIAL
-    if (
-        cand.cost_class == CostClass.PAID
-        and routing.mode != RoutingMode.FREE_FIRST_PAID_AFTER_APPROVAL
-    ):
-        return SkipReason.PAID_BLOCKED_BY_MODE
     if state.health.get(provider, HealthStatus.HEALTHY) == HealthStatus.DOWN:
         return SkipReason.PROVIDER_DOWN
     for key in ((provider, None), (provider, model)):
@@ -133,36 +125,20 @@ def route(
     excluded_pairs: frozenset[tuple[str, str]] = frozenset(),
     excluded_providers: frozenset[str] = frozenset(),
 ) -> RouteDecision:
-    routing = config.routing
+    # Every candidate is free (paid inference is unrepresentable), so the first
+    # eligible one in configured order wins; when none is eligible the task stops.
+    # All candidates are evaluated so `skipped` explains every ineligible one.
     skipped: list[Skipped] = []
-    eligible_free: list[Candidate] = []
-    eligible_paid: list[Candidate] = []
-
+    eligible: list[Candidate] = []
     for cand in build_candidates(config):
         reason = _skip_reason(cand, request, config, state, excluded_pairs, excluded_providers)
-        if reason is not None:
-            skipped.append(Skipped(cand, reason))
-        elif cand.cost_class == CostClass.FREE:
-            eligible_free.append(cand)
+        if reason is None:
+            eligible.append(cand)
         else:
-            eligible_paid.append(cand)
-
-    skipped_t = tuple(skipped)
-    if eligible_free:
-        return Selected(eligible_free[0], skipped_t)
-    if not eligible_paid:
-        return NoEligibleProvider(NoEligibleReason.FREE_CAPACITY_EXHAUSTED, skipped_t)
-
-    daily_left = routing.daily_paid_budget_usd - state.paid_spend_today_usd
-    monthly = routing.monthly_paid_budget_usd
-    # Fail closed: anything not provably positive (including NaN) blocks paid.
-    if not (daily_left > 0) or (
-        monthly is not None and not (monthly - state.paid_spend_month_usd > 0)
-    ):
-        return NoEligibleProvider(NoEligibleReason.PAID_BUDGET_EXHAUSTED, skipped_t)
-    if request.paid_approved or not routing.paid_requires_approval:
-        return Selected(eligible_paid[0], skipped_t)
-    return PaidApprovalRequired(tuple(eligible_paid), skipped_t)
+            skipped.append(Skipped(cand, reason))
+    if eligible:
+        return Selected(eligible[0], tuple(skipped))
+    return NoEligibleProvider(NoEligibleReason.FREE_CAPACITY_EXHAUSTED, tuple(skipped))
 
 
 def next_after_failure(

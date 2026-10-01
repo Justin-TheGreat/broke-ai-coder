@@ -1,11 +1,11 @@
-# SPEC.md — Discord-Controlled Free-First Coding Agent
+# SPEC.md — Discord-Controlled Free-Only Coding Agent
 
 > Version: 0.1
 > Date: 2026-09-30
 > Status: Draft / MVP specification
 > Intended runtime: Windows PC + WSL2
 >
-> This project is designed around OpenCode as the coding-agent runtime, controlled remotely from an iPhone through Discord. The primary optimization target is **maximum useful coding work at $0**, with a hard safety boundary preventing accidental paid usage.
+> This project is designed around OpenCode as the coding-agent runtime, controlled remotely from an iPhone through Discord. The primary optimization target is **maximum useful coding work at $0**. The user pays nothing: paid inference is not supported at all.
 
 ## 1. Product goal
 
@@ -24,15 +24,15 @@ iPhone Discord
     -> Discord progress + result
 ```
 
-The system should automatically prefer free capacity, fall back between providers when a provider is unavailable or rate-limited, and require explicit approval before any paid model can be used. The Discord bot, orchestrator, quota manager, model router, provider adapters, LLM gateway, and SQLite ledger should run as a **single small daemon process**. OpenCode is a separate external runtime and is explicitly excluded from the daemon's RAM/CPU budget.
+The system uses only free capacity, falls back between free providers when one is unavailable or rate-limited, and stops the task when no free capacity is left. There is no paid fallback. The Discord bot, orchestrator, quota manager, model router, provider adapters, LLM gateway, and SQLite ledger should run as a **single small daemon process**. OpenCode is a separate external runtime and is explicitly excluded from the daemon's RAM/CPU budget.
 
 ## 2. Primary objectives
 
 1. Remote control from iPhone Discord.
 2. Run real coding-agent work on the user's PC, not on Discord infrastructure.
-3. Prefer free inference in a configurable order.
+3. Use only free inference, in a configurable order.
 4. Route around provider-specific rate limits and outages.
-5. Never spend money silently.
+5. Never spend money. Paid inference does not exist in the system.
 6. Preserve OpenCode's file-editing, shell, git, and test capabilities.
 7. Support resumable sessions after Discord/SSH/network interruptions.
 8. Keep API keys and source code on the trusted PC.
@@ -46,7 +46,7 @@ The system should automatically prefer free capacity, fall back between provider
 - Public Internet exposure of OpenCode.
 - Automatic production deployment.
 - Automatic `git push` without confirmation.
-- Automatic paid spending.
+- Paid inference of any kind (no paid models, modes, budgets, or approvals).
 - Training or hosting an LLM locally.
 - Supporting every LLM provider on day one.
 
@@ -54,13 +54,12 @@ The system should automatically prefer free capacity, fall back between provider
 
 The initial provider set is:
 
-| Priority | Provider | Intended role | Default paid? |
+| Priority | Provider | Intended role | Paid? |
 |---|---|---|---|
 | 1 | OpenRouter `openrouter/free` | General free routing | No |
 | 2 | Google Gemini API | Free Gemini coding capacity | No |
 | 3 | Groq | Fast free fallback | No |
 | 4 | Other free providers/models | Expansion slot | No |
-| 99 | OpenRouter paid model | Last resort | **Blocked by default** |
 
 Important: Qwen is treated as a **model family**, not a mandatory provider. A Qwen model may arrive through OpenRouter, Groq, or another provider. The router must reason about provider/model pairs, not assume a single Qwen API.
 
@@ -136,7 +135,6 @@ Any of these operations require approval unless explicitly disabled for a truste
 - modifying deployment configuration
 - production deployment commands
 - package installation that changes the environment
-- switching from free to paid inference
 
 The bot must present the exact command/action before requesting approval.
 
@@ -169,7 +167,6 @@ For every new OpenCode task, the router receives:
   "estimated_input_tokens": 20000,
   "estimated_output_tokens": 5000,
   "session_id": "uuid",
-  "user_mode": "free-first"
 }
 ```
 
@@ -192,12 +189,12 @@ Provider priority and model priority are **separate, declarative policies**.
 Default provider order:
 
 ```text
-FREE-FIRST
+FREE-ONLY
     1. OpenRouter free router
     2. Gemini
     3. Groq
     4. Other explicitly configured free providers
-    5. PAID is not selected automatically
+    (no paid step: when all free candidates are unavailable, the task stops)
 ```
 
 For Gemini, Groq, and any other provider requiring model-level control, define an **ordered model allowlist**. The allowlist is a hard boundary:
@@ -259,7 +256,7 @@ Rules:
 4. Re-select based on capability + quota + policy.
 5. Keep the same parent `task_id` and continue the OpenCode session when the documented `--session` + `--model` path is compatible. OpenCode currently documents both flags.
 6. Enforce `max_fallback_attempts` (recommended default: 3).
-7. Never silently cross from FREE to PAID. A paid candidate enters `WAITING_APPROVAL` unless policy explicitly allows it.
+7. When every free candidate is exhausted, stop with `FREE_CAPACITY_EXHAUSTED`. There is never a paid candidate to fall back to.
 
 ### 6.5 Model switching
 
@@ -291,30 +288,16 @@ If `Gemini Flash 3.8` fails, the router must never jump to an unconfigured Gemin
 
 Do not treat every 5xx/timeout as proof that the provider did not process the request. Unknown-outcome failures must be logged and handled conservatively rather than blindly replayed.
 
-### 6.6 Paid fallback
+### 6.6 No paid inference
 
-Paid inference is blocked by default.
+The user pays nothing. Paid inference is not supported, not merely disabled:
 
-Three explicit modes are supported:
+- There are no paid modes, paid budgets, paid approvals, or paid policies. Configuration containing any of them is rejected at startup.
+- OpenRouter models must be `openrouter/free` or a model ID ending in `:free`; any other OpenRouter model bills credits and is rejected at config load.
+- The data layer cannot record paid usage: the cost class has only `FREE`, and the SQLite ledger rejects `PAID` rows.
+- When all free capacity is exhausted, the task stops and the user is told. It does not wait for approval to pay.
 
-```text
-free-only
-free-first-no-paid
-free-first-paid-after-confirmation
-```
-
-If paid fallback is enabled, the system must require one of:
-
-- explicit `/approve` for the current task, or
-- a project-level policy with a configured hard daily/monthly budget.
-
-Default budget:
-
-```text
-USD 0.00
-```
-
-A provider may not spend above the configured budget even if OpenCode requests it.
+Free-tier status for Gemini and Groq is an account property, not a model property. Their accounts must have no billing method attached, so the provider rejects requests past the free limit instead of charging.
 
 ## 7. Quota model
 
@@ -390,7 +373,6 @@ The orchestrator owns:
 
 - which model/provider is selected
 - when a task may start
-- whether paid mode is allowed
 - Discord lifecycle
 - quota accounting
 - retries/fallback
@@ -598,8 +580,6 @@ Required counters:
 - rate-limit events
 - estimated tokens
 - observed tokens when returned
-- free vs paid tasks
-- paid spend
 - approval count
 - provider fallback count
 
@@ -638,15 +618,11 @@ Example configuration concept:
 
 ```yaml
 routing:
-  mode: free-first-no-paid
-  paid_requires_approval: true
-  daily_paid_budget_usd: 0
   provider_order:
     - openrouter-free
     - gemini-free
     - groq-free
     - other-free
-    - openrouter-paid
 
   # Hard ordered model allowlists.
   # Use the provider's exact API model IDs in real configuration.
@@ -689,7 +665,7 @@ Model-policy rules:
 3. Discovery may report unlisted models, but they are metadata-only (`DISCOVERED_ONLY`).
 4. Reordering the list changes fallback order without code changes.
 5. Removing a model prevents new tasks and fallback attempts from selecting it.
-6. A configured model must still pass capability, quota, health, and cost-policy checks.
+6. A configured model must still pass capability, quota, and health checks.
 7. The same allowlist applies to initial routing and request-time fallback.
 8. Arbitrary model overrides from Discord are rejected unless the model is explicitly allowlisted for that provider.
 
@@ -710,7 +686,7 @@ The MVP is complete when all are true:
 9. Gemini/Groq selection is restricted to the configured per-provider ordered model allowlists; no unlisted model can ever be selected.
 10. `/status` shows current task/provider/session state.
 11. `/usage` shows provider quota state with an explicit confidence label.
-12. Paid inference cannot happen unless the configured paid policy permits it.
+12. Paid inference cannot happen: paid configuration is rejected, non-free OpenRouter models are rejected, and the ledger refuses paid usage.
 13. `git push` requires approval by default.
 14. API keys never appear in Discord responses or logs.
 15. Restarting the Discord bot does not corrupt persistent task records.
@@ -721,9 +697,9 @@ The MVP is complete when all are true:
 20. Daemon resource tests/measurements verify the configured RAM/CPU targets under a representative idle workload.
 ## 18. Design principles
 
-- **Free-first, not free-only.** Free capacity is preferred, but the system remains extensible.
+- **Free-only.** Only free capacity is ever used; the user pays nothing.
 - **Never confuse estimate with truth.** Quota dashboards and local estimates are explicitly labeled.
-- **No silent spending.** Paid inference is an explicit policy decision.
+- **No spending, ever.** Paid inference is not a configurable option.
 - **Agent runtime stays separate.** OpenCode performs coding; the control plane manages access, routing, and safety.
 - **Provider details stay behind adapters.** Free-tier APIs change often.
 - **Security before convenience.** Discord is an untrusted network boundary; only authorized users reach the local agent.

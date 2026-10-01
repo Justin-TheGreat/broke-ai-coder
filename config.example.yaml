@@ -1,28 +1,21 @@
 # Keys are never placed in this file, only env var names (api_key_env).
+# Free-only: there are no paid modes, budgets, or paid policies. Paid settings are rejected.
+# OpenRouter models must be "openrouter/free" or end in ":free" (anything else bills credits).
+# Gemini and Groq stay free only while their accounts have no billing attached.
 routing:
-  mode: free-first-no-paid
-  paid_requires_approval: true
-  daily_paid_budget_usd: 0
-  monthly_paid_budget_usd: null
   max_fallback_attempts: 3
   large_context_min_tokens: 128000
-  provider_order: [openrouter-free, gemini-free, groq-free, openrouter-paid]
+  provider_order: [openrouter-free, gemini-free, groq-free]
   policies:
     # model_order is an ordered hard allowlist: only listed models are ever routed, in this order.
     # Placeholder IDs below (<...>) must be replaced with real API model IDs.
-    openrouter-free: {provider: openrouter, cost_class: FREE, model_order: [openrouter/free]}
+    openrouter-free: {provider: openrouter, model_order: [openrouter/free]}
     gemini-free:
       provider: gemini
-      cost_class: FREE
       model_order: ["<gemini-flash-3.8-api-id>", "<gemini-flash-3.7-api-id>"]
     groq-free:
       provider: groq
-      cost_class: FREE
       model_order: ["<groq-model-x-api-id>", "<groq-model-y-api-id>"]
-    openrouter-paid:
-      provider: openrouter
-      cost_class: PAID
-      model_order: ["<configured-paid-model-id>"]
 providers:
   openrouter: {enabled: true, api_key_env: OPENROUTER_API_KEY}
   gemini:

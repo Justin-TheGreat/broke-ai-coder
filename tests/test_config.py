@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from app.config.loader import ConfigError, load_config, parse_config
-from app.config.models import RoutingMode
+from app.config.models import is_free_openrouter_model
 from app.config.secrets import credentials_present, resolve_secret
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -21,19 +21,95 @@ def test_empty_file_gives_defaults(tmp_path):
     p = tmp_path / "c.yaml"
     p.write_text("")
     cfg = load_config(p)
-    assert cfg.routing.mode == RoutingMode.FREE_FIRST_NO_PAID
-    assert cfg.routing.daily_paid_budget_usd == 0
     assert cfg.routing.max_fallback_attempts == 3
     assert cfg.database.retention_days == 60
 
 
-def test_confirmation_alias():
-    cfg = parse_config({"routing": {"mode": "free-first-paid-after-confirmation"}})
-    assert cfg.routing.mode == RoutingMode.FREE_FIRST_PAID_AFTER_APPROVAL
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"mode": "free-only"},
+        {"mode": "free-first-paid-after-approval"},
+        {"paid_requires_approval": True},
+        {"daily_paid_budget_usd": 0},
+        {"monthly_paid_budget_usd": None},
+    ],
+    ids=["mode-free-only", "mode-paid", "approval", "daily-budget", "monthly-budget"],
+)
+def test_paid_settings_rejected(routing):
+    # Even "harmless" legacy values are refused so nobody believes paid is configurable.
+    with pytest.raises(ConfigError, match="free-only"):
+        parse_config({"routing": routing})
+
+
+@pytest.mark.parametrize("cost_class", ["FREE", "PAID"])
+def test_policy_cost_class_rejected(cost_class):
+    data = {
+        "providers": {"a": {"api_key_env": "A_KEY"}},
+        "routing": {
+            "policies": {"x": {"provider": "a", "cost_class": cost_class, "model_order": ["m"]}}
+        },
+    }
+    with pytest.raises(ConfigError, match="free-only"):
+        parse_config(data)
+
+
+def test_yaml_paid_policy_rejected(tmp_path):
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        "providers:\n"
+        "  openrouter: {api_key_env: OPENROUTER_API_KEY}\n"
+        "routing:\n"
+        "  provider_order: [openrouter-paid]\n"
+        "  policies:\n"
+        "    openrouter-paid: {provider: openrouter, cost_class: PAID,"
+        " model_order: [anthropic/claude-opus]}\n"
+    )
+    with pytest.raises(ConfigError, match="free-only"):
+        load_config(p)
+
+
+@pytest.mark.parametrize("model", ["anthropic/claude-opus", "openai/gpt-5", "x/free", "m:freebie"])
+def test_openrouter_non_free_model_rejected(model):
+    data = {
+        "providers": {"openrouter": {"api_key_env": "OPENROUTER_API_KEY"}},
+        "routing": {"policies": {"or": {"provider": "openrouter", "model_order": [model]}}},
+    }
+    with pytest.raises(ConfigError, match="not a free variant"):
+        parse_config(data)
+
+
+def test_openrouter_free_variants_accepted():
+    data = {
+        "providers": {"openrouter": {"api_key_env": "OPENROUTER_API_KEY"}},
+        "routing": {
+            "provider_order": ["or"],
+            "policies": {
+                "or": {
+                    "provider": "openrouter",
+                    "model_order": ["openrouter/free", "qwen/qwen3-coder:free"],
+                }
+            },
+        },
+    }
+    parse_config(data)
+    assert is_free_openrouter_model("openrouter/free")
+    assert not is_free_openrouter_model("openrouter/auto")
+
+
+def test_free_variant_rule_only_applies_to_openrouter():
+    # Other providers' model ids carry no price signal; their free-ness is an account setting.
+    data = {
+        "providers": {"groq": {"api_key_env": "GROQ_API_KEY"}},
+        "routing": {
+            "policies": {"g": {"provider": "groq", "model_order": ["openai/gpt-oss-120b"]}}
+        },
+    }
+    parse_config(data)
 
 
 def _pol(provider="a", models=("m",), **kw):
-    return {"provider": provider, "cost_class": "FREE", "model_order": list(models), **kw}
+    return {"provider": provider, "model_order": list(models), **kw}
 
 
 def _data(routing, providers=("a", "b")):
@@ -58,9 +134,6 @@ def test_valid_minimal():
         (_data({"policies": {"x": _pol(models=())}}), "model_order"),
         ({"providers": {"a": {"api_key_env": "sk-or-abc"}}}, "api_key_env"),
         ({"bogus": 1}, "bogus"),
-        ({"routing": {"daily_paid_budget_usd": -1}}, "daily_paid_budget_usd"),
-        ({"routing": {"daily_paid_budget_usd": float("inf")}}, "daily_paid_budget_usd"),
-        ({"routing": {"monthly_paid_budget_usd": float("inf")}}, "monthly_paid_budget_usd"),
         ({"routing": {"max_fallback_attempts": 0}}, "max_fallback_attempts"),
     ],
     ids=[
@@ -72,23 +145,12 @@ def test_valid_minimal():
         "empty-model-order",
         "pasted-key",
         "extra-key",
-        "neg-budget",
-        "inf-daily-budget",
-        "inf-monthly-budget",
         "zero-attempts",
     ],
 )
 def test_invalid_rejected(data, match):
     with pytest.raises(ConfigError, match=match):
         parse_config(data)
-
-
-@pytest.mark.parametrize("key", ["daily_paid_budget_usd", "monthly_paid_budget_usd"])
-def test_yaml_inf_budget_rejected(tmp_path, key):
-    p = tmp_path / "c.yaml"
-    p.write_text(f"routing:\n  {key}: .inf\n")
-    with pytest.raises(ConfigError, match=key):
-        load_config(p)
 
 
 def test_load_wraps_validation_error(tmp_path):
@@ -168,7 +230,7 @@ def test_provider_extensions_load():
 @pytest.mark.parametrize(
     ("data", "match"),
     [
-        (_prov(limits=[{"dimension": "spend_usd", "limit": 1}]), "routing budgets"),
+        (_prov(limits=[{"dimension": "spend_usd", "limit": 1}]), "free-only"),
         (_prov(limits=[{"dimension": "requests_per_day", "limit": 0}]), "limit"),
         (_prov(limits=[{"dimension": "requests_per_day", "limit": float("nan")}]), "limit"),
         (_prov(limits=[{"dimension": "requests_per_day", "limit": float("inf")}]), "limit"),

@@ -62,10 +62,7 @@ def test_totals_empty(db):
 @pytest.mark.parametrize(
     "bad",
     [
-        {"cost_class": CostClass.PAID},
-        {"cost_class": CostClass.PAID, "estimated_cost_usd": -1.0},
-        {"estimated_cost_usd": float("inf")},
-        {"estimated_cost_usd": float("nan")},
+        {"cost_class": "PAID"},
         {"input_tokens": -1},
         {"output_tokens": True},
         {"input_tokens": 1.5},
@@ -90,24 +87,33 @@ def test_known_task_id_ok(db):
     UsageRepository(db).record(ev(task_id=task.id, request_id="r1"))
 
 
-def test_paid_spend_ignores_free(db):
-    repo = UsageRepository(db)
-    repo.record(ev(estimated_cost_usd=9.0))
-    repo.record(ev(cost_class=CostClass.PAID, estimated_cost_usd=0.25))
-    repo.record(ev(cost_class=CostClass.PAID, estimated_cost_usd=0.5, occurred_at=NOW - 2 * H))
-    s = repo.paid_spend(since=NOW - H, until=NOW)
-    assert (s.total_usd, s.missing_cost_events) == (0.25, 0)
-    assert repo.paid_spend(since=NOW - 3 * H, until=NOW).total_usd == 0.75
+def test_db_rejects_paid_usage_insert(db):
+    with pytest.raises(sqlite3.IntegrityError, match="free-only"):
+        db.execute(
+            "INSERT INTO usage_events (provider, model, cost_class, status, occurred_at)"
+            " VALUES ('p', 'm', 'PAID', 'success', ?)",
+            (NOW.isoformat(timespec="microseconds"),),
+        )
+    assert db.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
 
 
-def test_paid_spend_missing_cost_counted(db):
-    db.execute(
-        "INSERT INTO usage_events (provider, model, cost_class, status, occurred_at)"
-        " VALUES ('p', 'm', 'PAID', 'success', ?)",
-        (NOW.isoformat(timespec="microseconds"),),
-    )
-    s = UsageRepository(db).paid_spend(since=NOW - H, until=NOW)
-    assert (s.total_usd, s.missing_cost_events) == (0.0, 1)
+def test_db_rejects_update_to_paid(db):
+    UsageRepository(db).record(ev())
+    task = TaskRepository(db).create(project_id="p", prompt="x", discord_user_id="u")
+    with pytest.raises(sqlite3.IntegrityError, match="free-only"):
+        db.execute("UPDATE usage_events SET cost_class = 'PAID'")
+    with pytest.raises(sqlite3.IntegrityError, match="free-only"):
+        db.execute("UPDATE tasks SET cost_class = 'PAID' WHERE id = ?", (task.id,))
+    db.execute("UPDATE tasks SET cost_class = 'FREE' WHERE id = ?", (task.id,))
+
+
+def test_db_rejects_paid_policy_row(db):
+    with pytest.raises(sqlite3.IntegrityError, match="free-only"):
+        db.execute(
+            "INSERT INTO provider_model_policy"
+            " (provider, model, priority, enabled, cost_class, created_at, updated_at)"
+            " VALUES ('openrouter', 'x', 0, 1, 'PAID', 't', 't')"
+        )
 
 
 def test_daily_totals_excludes_yesterday(db):

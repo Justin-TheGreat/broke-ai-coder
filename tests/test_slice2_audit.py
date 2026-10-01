@@ -42,7 +42,6 @@ from app.quota.state import (
 from app.redaction import REDACTED, SecretRedactor, install_redaction
 from app.router.router import route
 from app.router.types import (
-    NoEligibleProvider,
     NoEligibleReason,
     RouteRequest,
     Selected,
@@ -491,7 +490,7 @@ def test_repeated_network_failures_cool_provider_wide_then_expire(make_config):
             "openrouter", "openrouter/free", E.TRANSIENT_NETWORK, now=NOW + timedelta(seconds=i)
         )
     assert until == NOW + timedelta(seconds=2 + 120)
-    assert m.is_cooling("openrouter", "or-paid-1")
+    assert m.is_cooling("openrouter", "other/model:free")  # provider-wide covers every model
     d = route(REQ, cfg, full_state(cfg, cooldowns=m.active(NOW + timedelta(seconds=3))))
     assert d.candidate.provider == "gemini"
     assert not m.is_cooling("openrouter", "x", now=until)
@@ -599,58 +598,6 @@ def test_allowlist_rechecked_against_config_not_stored_status(db, make_config):
     assert ("gemini", "g-evil") not in state.capabilities
 
 
-def _raw_paid(db, cost, at=NOW):
-    db.execute(
-        "INSERT INTO usage_events (provider, model, cost_class, status, estimated_cost_usd,"
-        " occurred_at) VALUES ('openrouter', 'or-paid-1', 'PAID', 'success', ?, ?)",
-        (cost, at.isoformat(timespec="microseconds")),
-    )
-
-
-@pytest.mark.parametrize("cost", [-0.01, -1e9, float("inf"), float("-inf"), None])
-def test_bad_spend_totals_fail_closed_never_clamped(db, make_config, cost):
-    cfg = make_config()
-    _raw_paid(db, cost)
-    with pytest.raises(RouterStateError):
-        build_router_state(cfg, db, mgr(), {}, now=NOW, environ=secret_env())
-
-
-def test_negative_spend_in_month_only_also_fails_closed(db, make_config):
-    cfg = make_config()
-    _raw_paid(db, -0.5, NOW - timedelta(days=2))  # same month, not today
-    with pytest.raises(RouterStateError):
-        build_router_state(cfg, db, mgr(), {}, now=NOW, environ=secret_env())
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="FINDING: individual negative paid rows (raw SQL) cancelling a positive one are not "
-    "detected; spec only requires negative totals to fail closed",
-)
-def test_bad_spend_cancelling_pair_not_hidden(db, make_config):
-    """+5 and -5 must not net to a clean 0.0 and pass silently as 'no spend'."""
-    cfg = make_config()
-    _raw_paid(db, 5.0)
-    _raw_paid(db, -5.0)
-    try:
-        state = build_router_state(cfg, db, mgr(), {}, now=NOW, environ=secret_env())
-    except RouterStateError:
-        return
-    pytest.fail(f"negative paid cost silently accepted: {state.paid_spend_today_usd}")
-
-
-@pytest.mark.parametrize("cost", [-1.0, None, float("inf")])
-def test_bad_spend_never_selects_paid_or_anything(db, make_config, cost):
-    cfg = make_config()
-    _raw_paid(db, cost)
-    # Free models are otherwise eligible; fail closed means NOTHING is selected.
-    d = route_with_state(
-        REQ, cfg, lambda: build_router_state(cfg, db, mgr(), {}, now=NOW, environ=secret_env())
-    )
-    assert d == NoEligibleProvider(NoEligibleReason.ROUTER_STATE_UNAVAILABLE, ())
-    assert not isinstance(d, Selected)
-
-
 def test_closed_connection_is_router_state_error_not_sqlite_error(make_config, tmp_path):
     from app.db.connection import open_database
     from app.db.migrations import migrate
@@ -687,15 +634,6 @@ def test_corrupt_quota_row_fails_closed(db, make_config):
     except sqlite3.Error as e:  # pragma: no cover
         pytest.fail(f"raw sqlite error escaped: {e}")
     assert all(r.remaining is None or r.remaining >= 0 for r in state.quota)
-
-
-def test_spend_zero_when_no_paid_rows_is_real_zero(db, make_config):
-    cfg = make_config()
-    UsageRepository(db).record(
-        UsageEvent("gemini", "g-3.8", CostClass.FREE, UsageStatus.SUCCESS, NOW)
-    )
-    state = build_router_state(cfg, db, mgr(), {}, now=NOW, environ=secret_env())
-    assert state.paid_spend_today_usd == 0.0 and state.paid_spend_month_usd == 0.0
 
 
 # ---------------------------------------------------------------- redaction

@@ -5,7 +5,7 @@ import logging
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 from app.config.models import AppConfig
 from app.config.secrets import credentials_present
@@ -153,14 +153,6 @@ def _build(
     usage = UsageRepository(conn)
     quota = exact + estimate_quota(config, usage, now, exact=exact)
 
-    utc_now = now.astimezone(UTC)
-    day_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    month_start = day_start.replace(day=1)
-    day = usage.paid_spend(since=day_start, until=now)
-    month = usage.paid_spend(since=month_start, until=now)
-    if day.missing_cost_events > 0 or month.missing_cost_events > 0:
-        raise RouterStateError("paid usage event with unknown cost; refusing to route")
-
     return RouterState(
         now=now,
         credentials_present=credentials_present(config, environ),
@@ -168,8 +160,6 @@ def _build(
         quota=quota,
         health={p: obs.health.status for p, obs in observations.items()},
         cooldowns=cooldowns.active(now),
-        paid_spend_today_usd=day.total_usd,
-        paid_spend_month_usd=month.total_usd,
     )
 
 

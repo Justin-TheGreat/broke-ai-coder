@@ -83,7 +83,17 @@ _V1: tuple[str, ...] = (
     "CREATE INDEX idx_fallback_attempts_started_at ON fallback_attempts(started_at)",
 )
 
-MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1),)
+# Free-only: SQLite cannot alter v1's CHECK constraints, so triggers reject any PAID row.
+_FREE_ONLY_TABLES = ("tasks", "provider_model_policy", "usage_events")
+_V2: tuple[str, ...] = tuple(
+    f"""CREATE TRIGGER {table}_free_only_{op.lower()} BEFORE {op} ON {table}
+  WHEN NEW.cost_class = 'PAID'
+  BEGIN SELECT RAISE(ABORT, 'paid inference is not supported: this project is free-only'); END"""
+    for table in _FREE_ONLY_TABLES
+    for op in ("INSERT", "UPDATE")
+)
+
+MIGRATIONS: tuple[Migration, ...] = (Migration(1, _V1), Migration(2, _V2))
 LATEST_VERSION: int = MIGRATIONS[-1].version
 
 

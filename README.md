@@ -1,8 +1,9 @@
 # broke-ai-coder
 
 A local agent controller that routes coding tasks across free-tier LLM providers
-in a configured order, falling back on rate limits or quota exhaustion, and never
-spending on paid models without explicit approval and a budget.
+in a configured order, falling back on rate limits or quota exhaustion. It is
+free-only: there is no paid mode, paid settings are rejected, and when all free
+capacity is used up the task stops instead of paying.
 
 ## Setup
 

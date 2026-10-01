@@ -107,9 +107,7 @@ OpenCode:
 
 Control plane:
   "Which provider can I use right now?"
-  "Is that provider free?"
-  "How much capacity remains?"
-  "Can this task spend money?"
+  "How much free capacity remains?"
   "Who is allowed to start it?"
   "Does this shell action need approval?"
   "What should Discord display?"
@@ -135,7 +133,6 @@ Must not:
 
 - contain provider API keys in source
 - execute shell commands directly
-- select paid models by itself
 
 ### 4.2 Agent Orchestrator
 
@@ -176,7 +173,6 @@ Responsibilities:
 
 - discover candidate models
 - filter by capability
-- enforce free/paid policy
 - evaluate quota state
 - evaluate provider health
 - return the next candidate
@@ -237,8 +233,7 @@ This keeps OpenCode responsible for the coding-agent loop while the orchestrator
 @dataclass
 class Candidate:
     provider: str
-    model: str
-    cost_class: Literal["FREE", "PAID"]
+    model: str  # always free; paid models cannot be configured
     capabilities: set[str]
     quota_confidence: Literal["EXACT", "ESTIMATED", "UNKNOWN", "EXHAUSTED", "COOLDOWN"]
     remaining_requests: int | None
@@ -250,38 +245,27 @@ class Candidate:
 ### 5.2 Selection pseudocode
 
 ```python
-def choose_candidate(req, candidates, policy):
+def choose_candidate(req, candidates):
     eligible = []
 
-    for c in candidates:
+    for c in candidates:  # every candidate is free; there is no paid tier
         if c.health not in {"HEALTHY", "DEGRADED"}:
             continue
         if not supports(c, req.required_capabilities):
             continue
         if c.quota_confidence in {"EXHAUSTED", "COOLDOWN"}:
             continue
-        if not policy.allows(c.cost_class):
-            continue
         if not within_safety_threshold(c, req):
             continue
         eligible.append(c)
 
-    free = [c for c in eligible if c.cost_class == "FREE"]
+    if not eligible:
+        raise NoEligibleProvider("FREE_CAPACITY_EXHAUSTED")  # stop; never pay
 
-    if free:
-        return min(free, key=free_candidate_sort_key)
-
-    paid = [c for c in eligible if c.cost_class == "PAID"]
-    if not paid:
-        raise NoEligibleProvider()
-
-    if not policy.paid_requires_approval:
-        return min(paid, key=paid_candidate_sort_key)
-
-    raise PaidApprovalRequired(paid)
+    return min(eligible, key=candidate_sort_key)
 ```
 
-`free_candidate_sort_key` is `(provider priority, configured model_order index)` and nothing else. Capability, quota confidence, remaining capacity, and health act only as the eligibility filters above; they must never reorder candidates (see §7.1 and SPEC §6.3).
+`candidate_sort_key` is `(provider priority, configured model_order index)` and nothing else. Capability, quota confidence, remaining capacity, and health act only as the eligibility filters above; they must never reorder candidates (see §7.1 and SPEC §6.3).
 
 ### 5.3 Request-time fallback / model switching
 
@@ -321,7 +305,7 @@ The request-time fallback engine must:
 4. Exclude the failed provider/model for the remainder of the retry chain (or until its cooldown expires).
 5. Select the next eligible **provider/model pair**, not merely another provider.
 6. Reuse the existing OpenCode session when the CLI/server contract allows continuing the session with `--session` and a new `--model`; otherwise create a controlled continuation with the saved session context. OpenCode documents `--session` and `--model` for `opencode run`.
-7. Never silently cross from FREE to PAID. A paid candidate pauses in `WAITING_APPROVAL` unless policy explicitly permits it.
+7. When every free candidate is exhausted, stop with `FREE_CAPACITY_EXHAUSTED`. There is no paid candidate to fall back to.
 8. Stop after a configurable maximum number of fallback attempts to avoid loops.
 
 ### 5.4 Error classes and fallback behavior
@@ -444,13 +428,11 @@ provider_order:
   - gemini-free
   - groq-free
   - other-free
-  - openrouter-paid
 
 providers:
   - id: openrouter-free
     provider: openrouter
     model: openrouter/free
-    cost_class: FREE
     priority: 10
     enabled: true
 
@@ -459,7 +441,6 @@ providers:
     model_order:
       - <gemini-flash-3.8-api-id>
       - <gemini-flash-3.7-api-id>
-    cost_class: FREE
     priority: 20
     enabled: true
 
@@ -468,19 +449,11 @@ providers:
     model_order:
       - <groq-model-x-api-id>
       - <groq-model-y-api-id>
-    cost_class: FREE
     priority: 30
     enabled: true
-
-  - id: openrouter-paid
-    provider: openrouter
-    model_order:
-      - <configured-paid-model-id>
-    cost_class: PAID
-    priority: 100
-    enabled: true
-    requires_approval: true
 ```
+
+There is no paid policy. Configuration containing paid settings (`cost_class`, paid modes, budgets) is rejected at load. OpenRouter models must be `openrouter/free` or end in `:free`, because any other OpenRouter model bills credits.
 
 `model_order` is a **hard allowlist and ordered fallback chain** for that provider. Provider adapters may discover other models for metadata/health purposes, but the router must never select a model outside the configured list.
 
@@ -615,7 +588,7 @@ status
 session_id
 selected_provider
 selected_model
-cost_class
+cost_class        (always FREE; the ledger rejects PAID)
 created_at
 started_at
 finished_at
@@ -631,7 +604,7 @@ provider
 model
 priority
 enabled
-cost_class
+cost_class        (always FREE; the ledger rejects PAID)
 created_at
 updated_at
 ```
@@ -680,8 +653,8 @@ model
 request_id
 input_tokens
 output_tokens
-estimated_cost_usd
-cost_class
+estimated_cost_usd (unused; always NULL)
+cost_class        (always FREE; the ledger rejects PAID)
 status
 timestamp
 ```
@@ -764,8 +737,7 @@ These metrics describe only the controller process and its SQLite file. They are
 | OpenCode restarted | Mark running session uncertain and require recovery logic |
 | Provider 429 | Update quota/cooldown and try next eligible provider |
 | Provider 401 | Disable provider until credential is fixed |
-| All free exhausted | Report `FREE_CAPACITY_EXHAUSTED`; do not spend |
-| Paid candidate exists | Ask for approval unless policy explicitly permits |
+| All free exhausted | Report `FREE_CAPACITY_EXHAUSTED` and stop; never spend |
 | Tool approval times out | Deny action |
 | PC offline | Discord cannot execute; bot should report unavailable |
 
@@ -822,10 +794,8 @@ Potential additions after MVP:
 - local Ollama/llama.cpp candidate
 - GitHub PR agent mode
 - scheduled coding tasks
-- per-project budgets
 - per-project allowlists
 - richer OpenCode event streaming
-- token-cost prediction before paid approval
 - provider performance history
 
 These should not complicate the MVP interfaces.

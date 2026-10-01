@@ -313,7 +313,7 @@ Support:
 openrouter/free
 ```
 
-and selected paid models behind policy control.
+and other OpenRouter free variants (model IDs ending in `:free`). Paid OpenRouter models are never supported.
 
 Acceptance:
 - API key loads from environment/secret storage.
@@ -443,7 +443,7 @@ Acceptance:
 
 ---
 
-# Phase 5 — Smart free-first routing
+# Phase 5 — Free-only routing
 
 ## T050 — Implement candidate generation
 
@@ -456,12 +456,11 @@ Generate provider/model candidates based on:
 - capabilities
 - current health
 - quota state
-- cost class
 
 Acceptance:
 - Candidate list is deterministic for the same inputs.
 
-## T051 — Implement free-first policy
+## T051 — Implement free-only provider order
 
 **Status:** TODO
 **Depends on:** T050
@@ -473,12 +472,12 @@ Default order:
 2. Gemini free
 3. Groq free
 4. other free
-5. paid only after policy/approval
+(no paid step)
 ```
 
 Acceptance:
 - If OpenRouter is exhausted and Gemini has capacity, Gemini is selected.
-- If all free candidates are unavailable, the task stops rather than spending.
+- If all free candidates are unavailable, the task stops with `FREE_CAPACITY_EXHAUSTED`.
 
 ## T051A — Implement per-provider ordered model allowlists
 
@@ -533,22 +532,23 @@ coding/tool reliability metadata
 Acceptance:
 - A task requiring a capability is never routed to a candidate that does not support it.
 
-## T053 — Paid fallback guardrail
+## T053 — Free-only guardrail
 
 **Status:** TODO
 **Depends on:** T051
 
-Implement:
+Make paid inference impossible rather than merely disabled:
 
 ```text
-FREE_ONLY
-FREE_FIRST_NO_PAID
-FREE_FIRST_PAID_AFTER_APPROVAL
+no paid modes, budgets, approvals, or paid policies in config (rejected at load)
+OpenRouter models must be openrouter/free or end in :free (rejected at load otherwise)
+cost class has only FREE; the SQLite ledger rejects PAID rows
 ```
 
 Acceptance:
-- Default deployment cannot create paid usage.
-- Paid request produces an approval prompt.
+- A config containing any paid setting fails to load with a clear error.
+- A non-free OpenRouter model ID fails to load.
+- Paid usage cannot be recorded, even by raw SQL.
 
 ## T054 — Request-time provider/model fallback
 
@@ -566,14 +566,14 @@ Required behavior:
 5. Ask the router for the next compatible provider/model.
 6. Continue the same OpenCode session when supported by `--session` + `--model`.
 7. Enforce `max_fallback_attempts`.
-8. Never switch FREE → PAID without the paid policy/approval gate.
+8. When every free candidate is exhausted, stop with `FREE_CAPACITY_EXHAUSTED`.
 
 Acceptance:
 - Simulated OpenRouter 429 causes Gemini free candidate to run.
 - Simulated Gemini 429 causes Groq candidate to run.
 - Simulated model-specific context failure switches to a compatible model.
 - All attempts are persisted in order.
-- Free-only mode never sends a paid request.
+- Exhausting every free candidate stops the task; nothing is paid for.
 
 ## T055 — Safe replay and unknown-outcome handling
 
@@ -625,23 +625,6 @@ Implement:
 Acceptance:
 - Only authorized user can resolve.
 - Approval token is one-time and expires.
-
-## T062 — Paid-model approval
-
-**Status:** TODO
-**Depends on:** T053, T061
-
-Present:
-
-```text
-Provider
-Model
-Estimated cost
-Reason free candidates unavailable
-```
-
-Acceptance:
-- User must explicitly approve before paid execution.
 
 ## T063 — Command cancellation
 
@@ -736,14 +719,13 @@ Test:
 - exhausted candidate skipped
 - capability mismatch skipped
 - cooldown respected
-- paid approval required
 - no candidate available
 - request-time 429 triggers next candidate
 - model-specific error switches to the next configured model for the same provider
 - an unlisted model is never selected
 - Gemini Flash 3.8 falls back only to configured Flash 3.7, then leaves Gemini
 - fallback chain stops at max attempts
-- paid candidate is never selected without approval
+- exhausting all free candidates stops the task (no paid outcome exists)
 
 ## T082 — End-to-end local test
 
@@ -790,14 +772,12 @@ same user task continues safely
 **Status:** TODO
 **Depends on:** T053, T082
 
-Verify that with:
+Verify that:
 
-```yaml
-mode: free-first-no-paid
-daily_paid_budget_usd: 0
-```
-
-no paid provider can be invoked even if it is the only eligible candidate.
+- the shipped `config.example.yaml` contains no paid settings and loads;
+- adding any paid setting or a non-free OpenRouter model makes config loading fail;
+- with every free provider exhausted, `/code` reports `FREE_CAPACITY_EXHAUSTED` and no request is sent;
+- the ledger contains no `PAID` rows after the end-to-end test.
 
 ---
 
@@ -829,7 +809,6 @@ Show provider cards such as:
 OpenRouter Free  — 38 req remaining (EXACT)
 Gemini           — ~120 req remaining (ESTIMATED)
 Groq             — 14.2k TPM remaining (EXACT)
-Paid spend       — $0.00 / $0.00
 ```
 
 Do not display a number if the system cannot support the number; use `UNKNOWN`.
@@ -990,12 +969,6 @@ Discord
  -> pull request
 ```
 
-## T113 — Cost prediction
-
-**Status:** BACKLOG
-
-Estimate paid cost before approval using model pricing and expected input/output tokens.
-
 ## T114 — Web dashboard
 
 **Status:** BACKLOG
@@ -1005,7 +978,6 @@ Display:
 - quota history
 - routing events
 - provider health
-- spend
 - session history
 
 ---
@@ -1068,7 +1040,7 @@ T092-T102
 [ ] Provider fallback works
 [ ] Per-provider model allowlists are enforced
 [ ] Quota state is visible
-[ ] Paid is blocked by default
+[ ] Paid inference is impossible (config, router, and ledger)
 [ ] Sensitive actions require approval
 [ ] Secrets are protected
 [ ] Restart/recovery works

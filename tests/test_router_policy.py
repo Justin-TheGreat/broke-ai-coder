@@ -6,7 +6,8 @@ from app.router.policy import ModelRoutingStatus, is_allowlisted, model_listing
 def test_is_allowlisted(make_config):
     cfg = make_config()
     assert is_allowlisted(cfg, "gemini", "g-3.8")
-    assert is_allowlisted(cfg, "openrouter", "or-paid-1")
+    assert is_allowlisted(cfg, "openrouter", "openrouter/free")
+    assert not is_allowlisted(cfg, "openrouter", "anthropic/claude-opus")
     assert not is_allowlisted(cfg, "gemini", "g-pro")
     assert not is_allowlisted(cfg, "groq", "g-3.8")
 
