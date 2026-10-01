@@ -1,54 +1,39 @@
-# Review: MVP vertical slice 1 (offline core)
+# Review: MVP vertical slice 1 (offline core), re-review after fix round
 
-VERDICT: NEEDS WORK
+VERDICT: SHIP
 
-The slice matches the spec closely, and most of the safety invariants hold. pytest gives 161 passed, and ruff check and ruff format --check are both clean (I re-ran them). The work is blocked from SHIP by one safety-gate defect: with a $0 budget, the paid gate can still select a paid model. I reproduced this; details are below. The fix is small.
+All 3 REQUIRED fixes from the previous review are done correctly, and the new tests can tell fixed code from broken code. I re-ran everything myself with `.venv/Scripts/python`. pytest gives 173 passed. `ruff check` passes and `ruff format --check` reports all 50 files formatted. The fix round touched only the files listed below, and no other behavior changed.
 
-## Required fixes
+## Required fixes: verification
 
-1. **The paid budget gate fails open on NaN or negative spend. This breaks the "$0 budget never selects paid" rule.**
-   `app/router/router.py:156-159` checks `daily_left <= 0`, which is a fail-closed test written the wrong way round. Reproduced in `free-first-paid-after-approval` mode with `daily_paid_budget_usd=0`, all free candidates unavailable, and `paid_approved=True`:
-   - `paid_spend_today_usd=0.0` gives NoEligibleProvider. Correct.
-   - `paid_spend_today_usd=float("nan")` gives **Selected(or-paid-1)**.
-   - `paid_spend_today_usd=-1.0` gives **Selected(or-paid-1)**. A negative spend effectively raises the budget.
+1. **Paid budget gate fails closed. DONE.**
+   - `app/router/router.py:158-162`: the gate now reads `not (daily_left > 0) or (monthly is not None and not (monthly - spend_month > 0))`. A NaN in either term now gives PAID_BUDGET_EXHAUSTED.
+   - `app/router/types.py:54-58`: `RouterState.__post_init__` rejects spend values that are non-finite or negative, using `math.isfinite`. This covers the -1 case, which the gate cannot catch by itself because 0 - (-1) > 0. RouterState is not built anywhere else in `app/` yet, so no callers break.
+   - Tests in `tests/test_router.py`:
+     - `test_router_state_rejects_bad_spend` checks NaN, inf and -1 for both fields, and asserts `ValueError` with the field name in the message.
+     - `test_paid_gate_fails_closed_on_nan_spend` sets the other cap to 10.0, so only the NaN comparison can block paid. It skips RouterState validation by using `object.__setattr__`, which is the right way to test the gate directly.
+     - I ran a positive control from the scratchpad: the same config and state with spend 0 returns `Selected` paid. The test therefore fails only because of the gate. This agrees with the tester's report that reverting the gate to `<= 0` makes it fail.
+   - The original 4 cases with both budgets at 0 could not catch a revert. Replacing them with these 2 cases makes the suite stronger, even though the test count went down.
+2. **Non-finite budgets are rejected in config. DONE.** `app/config/models.py:52-53` sets `allow_inf_nan=False` on both budget fields. Infinite daily and monthly budgets are covered in `test_invalid_rejected` (parse_config). They are also covered in `test_yaml_inf_budget_rejected`, which loads `.inf` from YAML through `load_config` and expects ConfigError. The default config still loads.
+3. **Rejection tests now assert the actual error. DONE.** `tests/test_config.py:50-83`: every case uses `pytest.raises(ConfigError, match=...)` with its own message fragment, and the `noqa: B017` is gone.
 
-   `RouterState` (`app/router/types.py:43-51`) does not validate the spend fields. Spend will come from DB aggregation in the next slice, and refund or correction rows or a bad SUM would feed straight into this gate. Fix:
-   - In `router.py:156-159`, write the gate positively so that anything not provably positive blocks paid:
-     `if not (daily_left > 0) or (monthly is not None and not (monthly - state.paid_spend_month_usd > 0)):` -> `PAID_BUDGET_EXHAUSTED`.
-   - In `types.py`, add a `RouterState.__post_init__` that raises `ValueError` unless both `paid_spend_*_usd` values are finite and `>= 0`. Use `math.isfinite`.
-   - In `tests/test_router.py`, add a test that budget 0 with spend NaN or -1 and `paid_approved=True` never returns Selected PAID. Add the same test for the monthly cap.
+## Follow-ups (carried forward, not blocking; fix in the next slice)
 
-2. **Reject non-finite budgets in config.** `app/config/models.py:52-53`: the YAML value `.inf` is currently accepted as `daily_paid_budget_usd` and means unlimited paid spend. I verified that `.inf` routes to Selected PAID. NaN is already rejected by `ge=0`. Add `allow_inf_nan=False` to both `Field(...)` calls, or add `allow_inf_nan=False` to `_CFG`. Then add `.inf` to the rejected cases in `tests/test_config.py`. SPEC §8 asks for a "configured hard daily/monthly budget", and infinity is not a hard cap.
-
-3. **Make the config rejection tests check the actual error.** `tests/test_config.py:78` uses `pytest.raises(Exception)`, so it would pass on any `TypeError` or `KeyError` bug. `parse_config` wraps errors in `ConfigError`, so assert `pytest.raises(ConfigError, match=...)` with a per-case match string such as "unknown policy id", "duplicate", "undefined provider", "api_key_env", or "extra". Pass the match strings through the parametrize list.
-
-## Should fix (test strength; not blocking on their own)
-
-- `tests/test_router.py:144` `test_output_above_max_output` only checks for NoEligibleProvider. Also assert that the free skips are `SkipReason.CONTEXT_TOO_SMALL`. Today it would pass with any skip reason.
-- `tests/test_router.py:66`: the "never a third Gemini model" case never puts both listed Gemini models in cooldown while the healthy unlisted `g-pro` is present. Add an assertion that the result is `c-a`, not `g-pro`, and that no candidate or skipped entry ever has model `g-pro`.
-- `tests/test_router_fallback.py:105` `test_free_only_never_returns_paid` should also assert `reason == FREE_CAPACITY_EXHAUSTED` and that `or-paid-1` is skipped with `PAID_BLOCKED_BY_MODE`. Also run it with `paid_approved=True` and `paid_requires_approval: false` so the mode gate is the only thing blocking paid.
-- `tests/test_daemon.py:66` is loose (`results[-1] is False`). All submissions happen synchronously before the worker can run, so assert the exact result `[True, False, False, False]`. Then yield once, let the worker take the item, and show that exactly one more submission is accepted and the next one is rejected.
-- No test covers the skip-reason precedence (spec §5.2 "first failing check, in this exact order"). Add one candidate that fails several checks, for example excluded, disabled, and DOWN, and assert it gets `EXCLUDED_AFTER_FAILURE`. Add a second where PAID_BLOCKED_BY_MODE wins over PROVIDER_DOWN.
-- No test covers model-scoped quota records. A record for `(gemini, g-3.8)` must not filter `g-3.7`.
-- Retention: no test shows that an old provider_event or usage_event belonging to a SUCCEEDED task inside an OPEN session is kept. Old QUEUED and WAITING_APPROVAL tasks are not tested either; only RUNNING is.
-
-## Verified correct (safety invariants)
-
-- **Unlisted model never selected:** `build_candidates` (router.py:30-46) iterates only `provider_order` and then `model_order`. The capabilities map cannot inject candidates. `is_allowlisted` and `model_listing` are correct.
-- **No reordering:** candidates come out in sort-key order and `route` only filters, preserving that order. Free is always chosen before paid.
-- **Paid mode gate:** FREE_ONLY and FREE_FIRST_NO_PAID always skip PAID with PAID_BLOCKED_BY_MODE, whatever `paid_approved` is (router.py:86-90). The default config is no-paid with budget 0.
-- **No silent FREE->PAID:** `next_after_failure` delegates to `route`, so fallback passes through the same mode, budget, and approval gate and returns PaidApprovalRequired (router.py:160-162). Selecting paid without approval only happens with an explicit `paid_requires_approval: false`, which matches SPEC §6.4 rule 7 ("unless policy explicitly allows it").
-- **max_fallback_attempts:** enforced as total attempts, `len >= max` (router.py:175). The boundary is covered by tests: 2 attempts at the default still route, 3 stop.
-- **AUTH_FAILED / PROVIDER_UNAVAILABLE** exclude the whole provider, including its paid policy. This is tested with paid otherwise auto-selectable, which is a good test.
-- **Retention:** one cutoff per run, strict `<`, protected-task fragment reused, non-terminal tasks and OPEN sessions protected, batched deletes in per-batch transactions, checkpoint only after deletes, no VACUUM. The only non-bound SQL is the f-string with constant table names (retention.py:398).
-- **SQL injection:** every value is bound with `?` or `:name`. The f-strings in tasks.py:315/327 interpolate only constant column fragments and placeholders.
-- **Secrets:** only env var names are stored, enforced by `ENV_NAME_PATTERN`. Secret values are never logged or persisted, the schema has no key columns, and handler-error events log only the exception type name.
-- **Bounded queues:** both queues are bounded, `put_nowait` rejects or drops instead of buffering, and there are no unbounded buffers.
-- **Windows:** connections are closed in fixtures, in `stop()`, in the cleanup thread, and in `--check`. `add_signal_handler` NotImplementedError is caught.
-- There is no network or subprocess use in `app/`.
-
-## Notes / deferrals (acceptable for this slice)
-
-- T052 lists "coding/tool reliability metadata". The spec deliberately covers only tool calling, structured output, vision, and context, so record this as a deferral in TASKS.md.
-- `transaction()` (connection.py:29-38): if ROLLBACK itself raises (for example, SQLite already rolled back after SQLITE_FULL), that error hides the original one. Consider wrapping ROLLBACK in try/except. This is low priority.
-- `submit_task` still accepts submissions after `stop()`. The queue is bounded, so nothing is lost silently, but rejecting submissions once `_stopped` is set would be cleaner.
+- `tests/test_router.py` `test_output_above_max_output`: assert that the free skips are `SkipReason.CONTEXT_TOO_SMALL`. Right now any skip reason passes.
+- `tests/test_router.py` "never a third Gemini model": put both listed Gemini models in cooldown while the unlisted `g-pro` is healthy. Assert the result is `c-a` and that `g-pro` never shows up in candidates or skipped.
+- `tests/test_router_fallback.py` `test_free_only_never_returns_paid`:
+  - Assert `reason == FREE_CAPACITY_EXHAUSTED`.
+  - Assert `or-paid-1` is skipped with `PAID_BLOCKED_BY_MODE`.
+  - Also run it with `paid_approved=True` and `paid_requires_approval: false`.
+- `tests/test_daemon.py:66`: assert exactly `[True, False, False, False]`. Then yield once and show that exactly one more submission is accepted.
+- Add skip-reason precedence tests (spec section 5.2):
+  - A candidate that is excluded, disabled and DOWN gets `EXCLUDED_AFTER_FAILURE`.
+  - PAID_BLOCKED_BY_MODE wins over PROVIDER_DOWN.
+- Add a test for model-scoped quota records: a record for `(gemini, g-3.8)` must not filter `g-3.7`.
+- Retention tests:
+  - Old provider_event and usage_event rows for a SUCCEEDED task inside an OPEN session are kept.
+  - Old QUEUED and WAITING_APPROVAL tasks are protected. Only RUNNING is tested today.
+- Record the deferral of T052 "coding/tool reliability metadata" in TASKS.md.
+- `transaction()` (connection.py:29-38): wrap ROLLBACK in try/except so a failed rollback does not hide the original exception.
+- `submit_task`: reject submissions once `_stopped` is set.
+- When spend aggregation from the DB lands next slice, make sure the SUM is clamped or validated before it builds RouterState. `__post_init__` will raise on negative or NaN values, and that error has to surface as a clear error, not crash the router loop.

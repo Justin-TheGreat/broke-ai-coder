@@ -373,3 +373,32 @@ def test_negative_tokens_rejected():
         RouteRequest("t", "p", estimated_input_tokens=-1)
     with pytest.raises(ValueError):
         RouteRequest("t", "p", estimated_output_tokens=-1)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
+@pytest.mark.parametrize("field", ["paid_spend_today_usd", "paid_spend_month_usd"])
+def test_router_state_rejects_bad_spend(make_config, field, bad):
+    cfg = make_config(routing=paid_cfg(daily_paid_budget_usd=0.0))
+    with pytest.raises(ValueError, match=field):
+        full_state(cfg, **{field: bad})
+
+
+@pytest.mark.parametrize(
+    ("field", "routing"),
+    [
+        # Each case leaves the OTHER cap permissive so only the NaN comparison can block paid.
+        ("paid_spend_today_usd", {"daily_paid_budget_usd": 10.0}),
+        (
+            "paid_spend_month_usd",
+            {"daily_paid_budget_usd": 10.0, "monthly_paid_budget_usd": 10.0},
+        ),
+    ],
+)
+def test_paid_gate_fails_closed_on_nan_spend(make_config, field, routing):
+    # Bypass RouterState validation to prove the router comparison itself fails closed.
+    cfg = make_config(routing=paid_cfg(**routing))
+    state = free_down(cfg)
+    object.__setattr__(state, field, float("nan"))
+    d = route(RouteRequest("t", "p", paid_approved=True), cfg, state)
+    assert isinstance(d, NoEligibleProvider)
+    assert d.reason == NoEligibleReason.PAID_BUDGET_EXHAUSTED

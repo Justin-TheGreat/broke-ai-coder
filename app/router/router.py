@@ -155,7 +155,10 @@ def route(
 
     daily_left = routing.daily_paid_budget_usd - state.paid_spend_today_usd
     monthly = routing.monthly_paid_budget_usd
-    if daily_left <= 0 or (monthly is not None and monthly - state.paid_spend_month_usd <= 0):
+    # Fail closed: anything not provably positive (including NaN) blocks paid.
+    if not (daily_left > 0) or (
+        monthly is not None and not (monthly - state.paid_spend_month_usd > 0)
+    ):
         return NoEligibleProvider(NoEligibleReason.PAID_BUDGET_EXHAUSTED, skipped_t)
     if request.paid_approved or not routing.paid_requires_approval:
         return Selected(eligible_paid[0], skipped_t)

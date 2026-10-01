@@ -49,8 +49,8 @@ class RoutingConfig(BaseModel):
 
     mode: RoutingMode = RoutingMode.FREE_FIRST_NO_PAID
     paid_requires_approval: bool = True
-    daily_paid_budget_usd: float = Field(0.0, ge=0)
-    monthly_paid_budget_usd: float | None = Field(None, ge=0)
+    daily_paid_budget_usd: float = Field(0.0, ge=0, allow_inf_nan=False)
+    monthly_paid_budget_usd: float | None = Field(None, ge=0, allow_inf_nan=False)
     max_fallback_attempts: int = Field(3, ge=1)
     large_context_min_tokens: int = Field(128_000, ge=1)
     provider_order: list[str] = Field(default_factory=list)

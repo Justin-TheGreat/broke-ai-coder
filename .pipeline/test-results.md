@@ -1,19 +1,16 @@
-# Test results
+# Test results: review fix round
 
-Status: ALL PASS
+Status: ALL PASS. pytest 173 passed; ruff check clean; ruff format --check clean (50 files).
 
-Command: `.venv/Scripts/python -m pytest -q` -> 161 passed in about 1.4 s
-Lint: `.venv/Scripts/python -m ruff check .` -> All checks passed; `ruff format --check .` -> clean.
+## Regression check (paid gate fail-closed)
+- The original fail-closed test (NaN/-1 with budgets 0) did NOT catch a revert: with the gate reverted to `<= 0`, 4/4 still passed, because the other zero-budget cap blocked paid. The -1 spend cases cannot be caught by the gate at all (0 - -1 = 1 > 0 in both versions); they are covered by RouterState validation.
+- Fixed in tests/test_router.py only: replaced it with `test_paid_gate_fails_closed_on_nan_spend` (daily and monthly; the other cap is set to 10.0 so only the NaN comparison can block).
+- With the gate reverted to `daily_left <= 0 or (monthly is not None and monthly - state.paid_spend_month_usd <= 0)`: 2 FAILED (as required). With the fix: 2 passed.
+- router.py restored from a byte-exact backup; `git diff app/router/router.py` hash matches the pre-revert state.
 
-Files: tests/test_config.py, test_state_machine.py, test_db_migrations.py, test_task_repository.py,
-test_retention.py, test_providers_fake.py, test_router.py, test_router_fallback.py,
-test_router_policy.py, test_daemon.py, test_cli.py (extended).
+## Other verified behaviors
+- RouterState rejects NaN/inf/-1 for both spend fields (6 cases, `ValueError` match=field name).
+- `.inf` daily/monthly budgets rejected via parse_config and via load_config from YAML (`.inf`), asserting ConfigError with match on the field name.
+- Config rejection cases all assert `ConfigError` with a specific match.
 
-Covered: all spec section 10 cases (router acceptance, paid gating in every mode, fallback chain,
-max_fallback_attempts, state machine full transition matrix, migrations/WAL/busy_timeout/schema-too-new,
-persistence across reopen, 60-day retention incl. protected tasks/strict cutoff/idempotency/batch_size=1,
-config validation failures, secrets absent from repr/json/logs, daemon queues/handlers/stop/start-twice,
-CLI check/missing/invalid/--once subprocess).
-
-Note: one test initially failed due to a test-side misuse of the `full_state` helper (duplicate
-`credentials_present` kwarg); fixed in the test with `dataclasses.replace`. No application defects found.
+Test count went 175 -> 173 because the 4 gate cases were replaced by 2 effective ones.

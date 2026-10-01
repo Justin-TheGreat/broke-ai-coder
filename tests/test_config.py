@@ -48,18 +48,20 @@ def test_valid_minimal():
 
 
 @pytest.mark.parametrize(
-    "data",
+    ("data", "match"),
     [
-        _data({"provider_order": ["nope"], "policies": {"x": _pol()}}),
-        _data({"provider_order": ["x", "x"], "policies": {"x": _pol()}}),
-        _data({"policies": {"x": _pol(models=("m", "m"))}}),
-        _data({"policies": {"x": _pol(), "y": _pol()}}),
-        _data({"policies": {"x": _pol(provider="undefined")}}),
-        _data({"policies": {"x": _pol(models=())}}),
-        {"providers": {"a": {"api_key_env": "sk-or-abc"}}},
-        {"bogus": 1},
-        {"routing": {"daily_paid_budget_usd": -1}},
-        {"routing": {"max_fallback_attempts": 0}},
+        (_data({"provider_order": ["nope"], "policies": {"x": _pol()}}), "unknown policy id"),
+        (_data({"provider_order": ["x", "x"], "policies": {"x": _pol()}}), "duplicate entries"),
+        (_data({"policies": {"x": _pol(models=("m", "m"))}}), "duplicate models"),
+        (_data({"policies": {"x": _pol(), "y": _pol()}}), "appears in policies"),
+        (_data({"policies": {"x": _pol(provider="undefined")}}), "undefined provider"),
+        (_data({"policies": {"x": _pol(models=())}}), "model_order"),
+        ({"providers": {"a": {"api_key_env": "sk-or-abc"}}}, "api_key_env"),
+        ({"bogus": 1}, "bogus"),
+        ({"routing": {"daily_paid_budget_usd": -1}}, "daily_paid_budget_usd"),
+        ({"routing": {"daily_paid_budget_usd": float("inf")}}, "daily_paid_budget_usd"),
+        ({"routing": {"monthly_paid_budget_usd": float("inf")}}, "monthly_paid_budget_usd"),
+        ({"routing": {"max_fallback_attempts": 0}}, "max_fallback_attempts"),
     ],
     ids=[
         "unknown-order-id",
@@ -71,12 +73,22 @@ def test_valid_minimal():
         "pasted-key",
         "extra-key",
         "neg-budget",
+        "inf-daily-budget",
+        "inf-monthly-budget",
         "zero-attempts",
     ],
 )
-def test_invalid_rejected(data):
-    with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+def test_invalid_rejected(data, match):
+    with pytest.raises(ConfigError, match=match):
         parse_config(data)
+
+
+@pytest.mark.parametrize("key", ["daily_paid_budget_usd", "monthly_paid_budget_usd"])
+def test_yaml_inf_budget_rejected(tmp_path, key):
+    p = tmp_path / "c.yaml"
+    p.write_text(f"routing:\n  {key}: .inf\n")
+    with pytest.raises(ConfigError, match=key):
+        load_config(p)
 
 
 def test_load_wraps_validation_error(tmp_path):

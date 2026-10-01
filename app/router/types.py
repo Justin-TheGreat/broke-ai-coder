@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -49,6 +50,12 @@ class RouterState:
     cooldowns: Mapping[tuple[str, str | None], datetime] = field(default_factory=dict)
     paid_spend_today_usd: float = 0.0
     paid_spend_month_usd: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("paid_spend_today_usd", "paid_spend_month_usd"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
 
 
 @dataclass(frozen=True, slots=True)
