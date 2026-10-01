@@ -11,3 +11,7 @@ data/
 *.egg-info/
 build/
 dist/
+discord.txt
+provider_api.txt
+
+

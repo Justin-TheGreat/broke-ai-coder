@@ -336,17 +336,6 @@ Acceptance:
 - Successful request through OpenCode.
 - 429 handling is tested.
 
-## T033 — Implement Cerebras adapter
-
-**Status:** TODO
-**Depends on:** T030
-
-Support at least one current free-tier coding-capable model.
-
-Acceptance:
-- Model availability can be configured without modifying router code.
-- Rate-limit information can be normalized.
-
 ## T034 — Implement Groq adapter
 
 **Status:** TODO
@@ -361,7 +350,7 @@ Acceptance:
 ## T035 — Provider health/cooldown manager
 
 **Status:** TODO
-**Depends on:** T031-T034
+**Depends on:** T031, T032, T034
 
 Implement temporary provider cooldowns after:
 
@@ -401,7 +390,7 @@ Acceptance:
 ## T041 — Exact quota ingestion where available
 
 **Status:** TODO
-**Depends on:** T031-T034, T040
+**Depends on:** T031, T032, T034, T040
 
 Implement provider-specific exact sources where reliable.
 
@@ -459,7 +448,7 @@ Acceptance:
 ## T050 — Implement candidate generation
 
 **Status:** TODO
-**Depends on:** T031-T034, T040
+**Depends on:** T031, T032, T034, T040
 
 Generate provider/model candidates based on:
 
@@ -482,10 +471,9 @@ Default order:
 ```text
 1. OpenRouter free
 2. Gemini free
-3. Cerebras free
-4. Groq free
-5. other free
-6. paid only after policy/approval
+3. Groq free
+4. other free
+5. paid only after policy/approval
 ```
 
 Acceptance:
@@ -506,9 +494,6 @@ model_order:
   gemini:
     - <gemini-flash-3.8-api-id>
     - <gemini-flash-3.7-api-id>
-  cerebras:
-    - <cerebras-model-a-api-id>
-    - <cerebras-model-b-api-id>
   groq:
     - <groq-model-x-api-id>
     - <groq-model-y-api-id>
@@ -526,7 +511,7 @@ Requirements:
 
 Acceptance:
 - Gemini configured as `[Flash 3.8, Flash 3.7]` never invokes any third Gemini model.
-- Cerebras and Groq likewise never invoke an unlisted model.
+- Groq likewise never invokes an unlisted model.
 - A simulated Flash 3.8 429 causes Flash 3.7 to be attempted before another Gemini model or another provider.
 - `/models` marks configured models `ALLOWED` and other discovered models `DISCOVERED_ONLY`.
 
@@ -585,7 +570,7 @@ Required behavior:
 
 Acceptance:
 - Simulated OpenRouter 429 causes Gemini free candidate to run.
-- Simulated Gemini 429 causes Cerebras or Groq candidate to run.
+- Simulated Gemini 429 causes Groq candidate to run.
 - Simulated model-specific context failure switches to a compatible model.
 - All attempts are persisted in order.
 - Free-only mode never sends a paid request.
@@ -676,14 +661,13 @@ Acceptance:
 ## T070 — Secret management
 
 **Status:** TODO
-**Depends on:** T031-T034
+**Depends on:** T031, T032, T034
 
 Use environment variables or local secret storage:
 
 ```text
 OPENROUTER_API_KEY
 GEMINI_API_KEY
-CEREBRAS_API_KEY
 GROQ_API_KEY
 DISCORD_BOT_TOKEN
 ```
@@ -730,7 +714,7 @@ Acceptance:
 ## T080 — Provider adapter unit tests
 
 **Status:** TODO
-**Depends on:** T031-T034
+**Depends on:** T031, T032, T034
 
 Mock:
 
@@ -844,7 +828,6 @@ Show provider cards such as:
 ```text
 OpenRouter Free  — 38 req remaining (EXACT)
 Gemini           — ~120 req remaining (ESTIMATED)
-Cerebras         — 720k tokens remaining (EXACT/CONFIGURED)
 Groq             — 14.2k TPM remaining (EXACT)
 Paid spend       — $0.00 / $0.00
 ```
@@ -870,7 +853,7 @@ Gemini
 ## T093 — Health-check command
 
 **Status:** TODO
-**Depends on:** T031-T034
+**Depends on:** T031, T032, T034
 
 Optional admin-only command:
 
@@ -1064,7 +1047,6 @@ T103
 Then add:
 
 ```text
-T033
 T034
 T035
 T041-T044

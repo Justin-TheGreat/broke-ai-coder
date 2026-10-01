@@ -40,7 +40,7 @@ REQ = RouteRequest("t", "p")
 H = timedelta(hours=1)
 
 
-def handler_for(*, gemini_status=200, cerebras_status=200, groq_status=200):
+def handler_for(*, gemini_status=200, groq_status=200):
     def handler(request: httpx.Request) -> httpx.Response:
         host = request.url.host
         if host == "generativelanguage.googleapis.com":
@@ -59,10 +59,6 @@ def handler_for(*, gemini_status=200, cerebras_status=200, groq_status=200):
                     ]
                 },
             )
-        if host == "api.cerebras.ai":
-            if cerebras_status != 200:
-                return json_response(cerebras_status, {})
-            return json_response(200, {"data": [{"id": "c-a"}]})
         if host == "api.groq.com":
             return json_response(groq_status, {"data": [{"id": "q-x", "context_window": 9000}]})
         if host == "openrouter.ai":
@@ -107,7 +103,7 @@ def exhausted_openrouter():
 async def test_end_to_end(db, make_config):
     cfg = make_config()
     obs = await refresh(cfg, db)
-    assert set(obs) == {"openrouter", "gemini", "cerebras", "groq"}
+    assert set(obs) == {"openrouter", "gemini", "groq"}
     QuotaSnapshotRepository(db).insert(exhausted_openrouter())
     cd = cooldowns()
     cd.record_failure("gemini", "g-3.8", ErrorClass.RATE_LIMITED)
@@ -140,9 +136,9 @@ async def test_missing_credentials_not_refreshed(db, make_config):
 
 async def test_health_down(db, make_config):
     cfg = make_config()
-    obs = await refresh(cfg, db, cerebras_status=503)
+    obs = await refresh(cfg, db, groq_status=503)
     state = build_router_state(cfg, db, cooldowns(), obs, now=NOW, environ=secret_env())
-    assert state.health["cerebras"] == HealthStatus.DOWN
+    assert state.health["groq"] == HealthStatus.DOWN
 
 
 async def test_discovery_failure_falls_back_to_db(db, make_config):

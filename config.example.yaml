@@ -6,7 +6,7 @@ routing:
   monthly_paid_budget_usd: null
   max_fallback_attempts: 3
   large_context_min_tokens: 128000
-  provider_order: [openrouter-free, gemini-free, cerebras-free, groq-free, openrouter-paid]
+  provider_order: [openrouter-free, gemini-free, groq-free, openrouter-paid]
   policies:
     # model_order is an ordered hard allowlist: only listed models are ever routed, in this order.
     # Placeholder IDs below (<...>) must be replaced with real API model IDs.
@@ -15,10 +15,6 @@ routing:
       provider: gemini
       cost_class: FREE
       model_order: ["<gemini-flash-3.8-api-id>", "<gemini-flash-3.7-api-id>"]
-    cerebras-free:
-      provider: cerebras
-      cost_class: FREE
-      model_order: ["<cerebras-model-a-api-id>", "<cerebras-model-b-api-id>"]
     groq-free:
       provider: groq
       cost_class: FREE
@@ -38,7 +34,6 @@ providers:
     #   - {dimension: requests_per_minute, limit: <from your AI Studio dashboard>, model: "<id>"}
     # models:
     #   "<model-id>": {supports_tool_calling: true, context_window: <tokens>}
-  cerebras:   {enabled: true, api_key_env: CEREBRAS_API_KEY}
   groq:       {enabled: true, api_key_env: GROQ_API_KEY}
 discord:
   bot_token_env: DISCORD_BOT_TOKEN

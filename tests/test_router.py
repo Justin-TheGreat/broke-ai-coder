@@ -72,14 +72,14 @@ def test_g38_cooldown_goes_to_g37_never_unlisted(make_config):
     assert model_of(route(REQ, cfg, st)) == "g-3.7"
 
 
-def test_both_gemini_out_goes_to_cerebras(make_config):
+def test_both_gemini_out_goes_to_groq(make_config):
     cfg = make_config()
     st = full_state(
         cfg,
         quota=exhaust("openrouter"),
         cooldowns=cd(("gemini", "g-3.8"), ("gemini", "g-3.7")),
     )
-    assert model_of(route(REQ, cfg, st)) == "c-a"
+    assert model_of(route(REQ, cfg, st)) == "q-x"
 
 
 def test_swapping_config_order_changes_selection(make_config):
@@ -105,7 +105,7 @@ def test_removed_model_never_selected(make_config):
     d = route(REQ, cfg2, st)
     assert model_of(d) == "g-3.7"
     st2 = full_state(cfg, quota=exhaust("openrouter"), cooldowns=cd(("gemini", "g-3.7")))
-    assert model_of(route(REQ, cfg2, st2)) == "c-a"
+    assert model_of(route(REQ, cfg2, st2)) == "q-x"
     assert all(c.model != "g-3.8" for c in build_candidates(cfg2))
 
 
@@ -174,7 +174,7 @@ def test_disabled_provider_and_policy(make_config):
 
     c2 = parse_config(data)
     d = route(REQ, c2, full_state(c2))
-    assert model_of(d) == "c-a"
+    assert model_of(d) == "q-x"
     r = reasons(d)
     assert r["openrouter/free"] == SkipReason.PROVIDER_DISABLED
     assert r["g-3.8"] == SkipReason.POLICY_DISABLED
@@ -192,7 +192,7 @@ def test_health_down_skipped_degraded_allowed(make_config):
 def test_provider_wide_cooldown(make_config):
     cfg = make_config()
     st = full_state(cfg, cooldowns=cd(("gemini", None)), quota=exhaust("openrouter"))
-    assert model_of(route(REQ, cfg, st)) == "c-a"
+    assert model_of(route(REQ, cfg, st)) == "q-x"
 
 
 def test_expired_and_boundary_cooldown_and_quota(make_config):
@@ -237,7 +237,7 @@ def test_unknown_quota_does_not_filter(make_config):
     assert model_of(route(REQ, cfg, full_state(cfg, quota=(rec,)))) == "openrouter/free"
 
 
-ALL_FREE = ("openrouter", "gemini", "cerebras", "groq")
+ALL_FREE = ("openrouter", "gemini", "groq")
 
 
 def test_default_mode_never_paid_even_if_only_candidate(make_config):
@@ -247,7 +247,7 @@ def test_default_mode_never_paid_even_if_only_candidate(make_config):
         cfg,
         full_state(
             cfg,
-            quota=exhaust("gemini", "cerebras", "groq"),
+            quota=exhaust("gemini", "groq"),
             cooldowns=cd(("openrouter", "openrouter/free")),
         ),
     )
@@ -266,7 +266,7 @@ def test_paid_blocked_modes(make_config, mode):
         cfg,
         full_state(
             cfg,
-            quota=exhaust("gemini", "cerebras", "groq"),
+            quota=exhaust("gemini", "groq"),
             cooldowns=cd(("openrouter", "openrouter/free")),
         ),
     )
@@ -280,7 +280,7 @@ def test_paid_blocked_modes(make_config, mode):
         cfg,
         full_state(
             cfg,
-            quota=exhaust("gemini", "cerebras", "groq"),
+            quota=exhaust("gemini", "groq"),
             cooldowns=cd(("openrouter", "openrouter/free")),
         ),
     )
@@ -290,7 +290,7 @@ def test_paid_blocked_modes(make_config, mode):
 def free_down(cfg, **kw):
     return full_state(
         cfg,
-        quota=exhaust("gemini", "cerebras", "groq"),
+        quota=exhaust("gemini", "groq"),
         cooldowns=cd(("openrouter", "openrouter/free")),
         **kw,
     )
@@ -358,7 +358,7 @@ def test_skipped_in_candidate_order(make_config):
     order = [c.model for c in build_candidates(cfg)]
     got = [s.candidate.model for s in d.skipped]
     assert got == [m for m in order if m in got]
-    assert model_of(d) == "c-a"
+    assert model_of(d) == "q-x"
 
 
 def test_candidates_sorted_by_config_order(make_config):

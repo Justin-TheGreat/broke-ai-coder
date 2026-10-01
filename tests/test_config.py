@@ -118,10 +118,9 @@ def test_credentials_present(make_config):
     env = {
         "OPENROUTER_API_KEY": "x",
         "GEMINI_API_KEY": "   ",
-        "CEREBRAS_API_KEY": "",
-        "GROQ_API_KEY": "y",
+        "GROQ_API_KEY": "",
     }
-    assert credentials_present(cfg, env) == frozenset({"openrouter", "groq"})
+    assert credentials_present(cfg, env) == frozenset({"openrouter"})
     assert resolve_secret("MISSING", {}) is None
     assert resolve_secret("GEMINI_API_KEY", env) is None
 

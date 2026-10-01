@@ -58,18 +58,17 @@ The initial provider set is:
 |---|---|---|---|
 | 1 | OpenRouter `openrouter/free` | General free routing | No |
 | 2 | Google Gemini API | Free Gemini coding capacity | No |
-| 3 | Cerebras | High-throughput free fallback | No |
-| 4 | Groq | Fast free fallback | No |
-| 5 | Other free providers/models | Expansion slot | No |
+| 3 | Groq | Fast free fallback | No |
+| 4 | Other free providers/models | Expansion slot | No |
 | 99 | OpenRouter paid model | Last resort | **Blocked by default** |
 
-Important: Qwen is treated as a **model family**, not a mandatory provider. A Qwen model may arrive through OpenRouter, Groq, Cerebras, or another provider. The router must reason about provider/model pairs, not assume a single Qwen API.
+Important: Qwen is treated as a **model family**, not a mandatory provider. A Qwen model may arrive through OpenRouter, Groq, or another provider. The router must reason about provider/model pairs, not assume a single Qwen API.
 
 OpenRouter currently exposes a free-model router at `openrouter/free`; its current page says it selects free models dynamically and filters for capabilities such as tool calling. OpenRouter's free plan currently lists 25+ free models / 4 free providers and a 50 requests/day rate limit. These values are expected to change and therefore must not be hard-coded as permanent product rules. See the references list in `ARCHITECTURE.md` §16.
 
 Gemini API free-tier rate limits are model- and project-dependent and are measured across dimensions such as RPM, TPM, and RPD. Google states that active limits can be viewed in AI Studio and that RPD resets at midnight Pacific. Exact limits are therefore configuration/runtime data, not constants in source code.
 
-Groq and Cerebras expose provider-specific rate-limit information. Groq returns remaining/reset information in response headers; Cerebras documents free-tier TPM/TPH/TPD/RPM/RPH/RPD limits and says the authoritative limits for an organization are visible in its account.
+Groq exposes provider-specific rate-limit information: it returns remaining/reset information in response headers.
 
 ## 5. User experience
 
@@ -123,7 +122,7 @@ Changed:
 
 Tests: 52 passed
 Git: working tree modified, no commit created
-Provider: cerebras / gpt-oss-120b
+Provider: groq / openai/gpt-oss-120b
 Cost class: FREE
 ```
 
@@ -196,13 +195,12 @@ Default provider order:
 FREE-FIRST
     1. OpenRouter free router
     2. Gemini
-    3. Cerebras
-    4. Groq
-    5. Other explicitly configured free providers
-    6. PAID is not selected automatically
+    3. Groq
+    4. Other explicitly configured free providers
+    5. PAID is not selected automatically
 ```
 
-For Gemini, Cerebras, Groq, and any other provider requiring model-level control, define an **ordered model allowlist**. The allowlist is a hard boundary:
+For Gemini, Groq, and any other provider requiring model-level control, define an **ordered model allowlist**. The allowlist is a hard boundary:
 
 ```text
 provider/model not in allowlist
@@ -216,11 +214,6 @@ Gemini:
     Flash 3.8
     -> Flash 3.7
     -> stop for Gemini
-
-Cerebras:
-    Model A
-    -> Model B
-    -> stop for Cerebras
 
 Groq:
     Model X
@@ -253,7 +246,7 @@ gemini-flash
    ↓ HTTP 429
 record attempt + cooldown
    ↓
-cerebras-model
+groq-model
    ↓
 success
 ```
@@ -289,11 +282,9 @@ Gemini Flash 3.8
    ↓ quota/model error
 Gemini Flash 3.7
    ↓ quota/model error
-Cerebras Model A
-   ↓ quota/model error
-Cerebras Model B
-   ↓
 Groq Model X
+   ↓ quota/model error
+Groq Model Y
 ```
 
 If `Gemini Flash 3.8` fails, the router must never jump to an unconfigured Gemini model such as a Pro, Lite, Preview, Experimental, or other family member.
@@ -377,7 +368,6 @@ Initial adapters:
 ```text
 OpenRouterAdapter
 GeminiAdapter
-CerebrasAdapter
 GroqAdapter
 ```
 
@@ -593,10 +583,10 @@ Every task must log structured events:
   "task_id": "uuid",
   "timestamp": "2026-09-30T14:20:00-07:00",
   "event": "provider_selected",
-  "provider": "cerebras",
-  "model": "gpt-oss-120b",
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
   "quota_confidence": "exact",
-  "reason": "OpenRouter unavailable; Cerebras free capacity available"
+  "reason": "OpenRouter unavailable; Groq free capacity available"
 }
 ```
 
@@ -654,7 +644,6 @@ routing:
   provider_order:
     - openrouter-free
     - gemini-free
-    - cerebras-free
     - groq-free
     - other-free
     - openrouter-paid
@@ -665,9 +654,6 @@ routing:
     gemini:
       - <gemini-flash-3.8-api-id>
       - <gemini-flash-3.7-api-id>
-    cerebras:
-      - <cerebras-model-a-api-id>
-      - <cerebras-model-b-api-id>
     groq:
       - <groq-model-x-api-id>
       - <groq-model-y-api-id>
@@ -681,10 +667,6 @@ providers:
   gemini:
     enabled: true
     api_key_env: GEMINI_API_KEY
-
-  cerebras:
-    enabled: true
-    api_key_env: CEREBRAS_API_KEY
 
   groq:
     enabled: true
@@ -721,11 +703,11 @@ The MVP is complete when all are true:
 2. The task runs on the home PC through OpenCode.
 3. The router selects a configured free candidate when one is eligible.
 4. At least OpenRouter and Gemini are supported.
-5. At least one of Cerebras or Groq is supported as a fallback.
+5. Groq is supported as a fallback.
 6. The system can detect and handle a provider 429 without crashing the task controller.
 7. A request-time 429/quota/availability failure causes the next eligible provider/model to be attempted when available.
 8. A model-specific failure can switch to another compatible model without losing the parent task/session identity.
-9. Gemini/Cerebras/Groq selection is restricted to the configured per-provider ordered model allowlists; no unlisted model can ever be selected.
+9. Gemini/Groq selection is restricted to the configured per-provider ordered model allowlists; no unlisted model can ever be selected.
 10. `/status` shows current task/provider/session state.
 11. `/usage` shows provider quota state with an explicit confidence label.
 12. Paid inference cannot happen unless the configured paid policy permits it.

@@ -37,7 +37,7 @@ def test_chain_to_gemini_then_37(make_config):
     st = full_state(cfg)
     assert model_of(next_after_failure(REQ, [OR], cfg, st)) == "g-3.8"
     assert model_of(next_after_failure(REQ, [OR, G38], cfg, st)) == "g-3.7"
-    assert model_of(next_after_failure(REQ, [OR, G38, G37], cfg, st)) == "c-a"
+    assert model_of(next_after_failure(REQ, [OR, G38, G37], cfg, st)) == "q-x"
 
 
 def test_max_attempts_default_stops(make_config):
@@ -47,16 +47,16 @@ def test_max_attempts_default_stops(make_config):
     assert d.reason == NoEligibleReason.MAX_FALLBACK_ATTEMPTS_REACHED
 
 
-def test_context_too_large_goes_to_cb(make_config):
+def test_context_too_large_goes_to_qy(make_config):
     cfg = make_config(routing={"max_fallback_attempts": 9})
     st = full_state(cfg)
     attempts = [
         fa("openrouter", "openrouter/free", E.QUOTA_EXHAUSTED),
         fa("gemini", "g-3.8"),
         fa("gemini", "g-3.7"),
-        fa("cerebras", "c-a", E.CONTEXT_TOO_LARGE),
+        fa("groq", "q-x", E.CONTEXT_TOO_LARGE),
     ]
-    assert model_of(next_after_failure(REQ, attempts, cfg, st)) == "c-b"
+    assert model_of(next_after_failure(REQ, attempts, cfg, st)) == "q-y"
 
 
 def test_auth_failed_excludes_whole_provider_including_paid(make_config):
@@ -73,8 +73,6 @@ def test_auth_failed_excludes_whole_provider_including_paid(make_config):
     for m, p in [
         ("g-3.8", "gemini"),
         ("g-3.7", "gemini"),
-        ("c-a", "cerebras"),
-        ("c-b", "cerebras"),
         ("q-x", "groq"),
         ("q-y", "groq"),
     ]:
@@ -89,7 +87,7 @@ def test_provider_unavailable_skips_g37(make_config):
     d = next_after_failure(
         REQ, [OR, fa("gemini", "g-3.8", E.PROVIDER_UNAVAILABLE)], cfg, full_state(cfg)
     )
-    assert model_of(d) == "c-a"
+    assert model_of(d) == "q-x"
 
 
 @pytest.mark.parametrize(
@@ -110,8 +108,6 @@ def test_free_only_never_returns_paid(make_config):
         fa("openrouter", "openrouter/free"),
         fa("gemini", "g-3.8"),
         fa("gemini", "g-3.7"),
-        fa("cerebras", "c-a"),
-        fa("cerebras", "c-b"),
         fa("groq", "q-x"),
         fa("groq", "q-y"),
     ]
@@ -130,8 +126,6 @@ def test_fallback_to_paid_requires_approval(make_config):
     attempts = [
         fa("gemini", "g-3.8"),
         fa("gemini", "g-3.7"),
-        fa("cerebras", "c-a"),
-        fa("cerebras", "c-b"),
         fa("groq", "q-x"),
         fa("groq", "q-y"),
         fa("openrouter", "openrouter/free"),

@@ -7,7 +7,6 @@ from datetime import datetime
 import httpx
 
 from app.config.models import AppConfig
-from app.providers.cerebras import CerebrasAdapter
 from app.providers.gemini import GeminiAdapter
 from app.providers.groq import GroqAdapter
 from app.providers.http import HttpProviderAdapter
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 ADAPTER_TYPES: Mapping[str, type[HttpProviderAdapter]] = {
     "openrouter": OpenRouterAdapter,
     "gemini": GeminiAdapter,
-    "cerebras": CerebrasAdapter,
     "groq": GroqAdapter,
 }
 

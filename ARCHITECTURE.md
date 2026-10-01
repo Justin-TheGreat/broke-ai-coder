@@ -42,9 +42,9 @@
 │ + opencode run --attach      │       └─────────────────────────┘
 └──────────────┬───────────────┘
                │ LLM API
-       ┌───────┼────────┬──────────┐
-       ▼       ▼        ▼          ▼
- OpenRouter  Gemini   Cerebras    Groq
+       ┌───────┼────────┐
+       ▼       ▼        ▼
+ OpenRouter  Gemini    Groq
 ```
 
 ## 2. Deployment topology
@@ -308,7 +308,7 @@ HTTP 429
   ↓
 record attempt + cooldown
   ↓
-Cerebras model A
+Groq model X
   ↓
 success
 ```
@@ -383,7 +383,7 @@ Example:
 ```text
 #1 openrouter/free     → 429 rate_limit → FALLBACK
 #2 gemini/gemini-flash → 429 quota     → FALLBACK
-#3 cerebras/gpt-oss    → success       → COMPLETE
+#3 groq/gpt-oss        → success       → COMPLETE
 ```
 
 ## 6. Quota architecture
@@ -412,7 +412,6 @@ Examples:
 
 - Groq: response headers include remaining request/token values and reset information.
 - OpenRouter: provider/account APIs and activity/limit information where available.
-- Cerebras: account limits are documented and visible in the account.
 - Gemini: active rate limits are visible in AI Studio; runtime behavior/429s are authoritative for actual availability.
 
 The system must not claim an exact remaining count when the provider only exposes a dashboard or generic limit.
@@ -443,7 +442,6 @@ Use declarative configuration rather than embedding provider order or model orde
 provider_order:
   - openrouter-free
   - gemini-free
-  - cerebras-free
   - groq-free
   - other-free
   - openrouter-paid
@@ -465,22 +463,13 @@ providers:
     priority: 20
     enabled: true
 
-  - id: cerebras-free
-    provider: cerebras
-    model_order:
-      - <cerebras-model-a-api-id>
-      - <cerebras-model-b-api-id>
-    cost_class: FREE
-    priority: 30
-    enabled: true
-
   - id: groq-free
     provider: groq
     model_order:
       - <groq-model-x-api-id>
       - <groq-model-y-api-id>
     cost_class: FREE
-    priority: 40
+    priority: 30
     enabled: true
 
   - id: openrouter-paid
@@ -793,7 +782,6 @@ broke-ai-coder/
 │   │   ├── base.py
 │   │   ├── openrouter.py
 │   │   ├── gemini.py
-│   │   ├── cerebras.py
 │   │   └── groq.py
 │   ├── opencode/
 │   ├── approvals/
@@ -852,7 +840,6 @@ These should not complicate the MVP interfaces.
 - Google Gemini API rate limits: https://ai.google.dev/gemini-api/docs/rate-limits
 - Google Gemini API billing: https://ai.google.dev/gemini-api/docs/billing/
 - Groq rate limits: https://console.groq.com/docs/rate-limits
-- Cerebras rate limits: https://inference-docs.cerebras.ai/support/rate-limits
 - Discord application commands: https://docs.discord.com/developers/docs/interactions/slash-commands
 
 Quota numbers and available free models must be re-validated at runtime because provider policies change.

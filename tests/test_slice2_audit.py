@@ -25,7 +25,6 @@ from app.providers.base import (
     QuotaConfidence,
     QuotaUnit,
 )
-from app.providers.cerebras import CerebrasAdapter
 from app.providers.errors import MalformedResponseError, ProviderError
 from app.providers.gemini import GeminiAdapter
 from app.providers.groq import GroqAdapter
@@ -51,9 +50,9 @@ from app.router.types import (
 
 E = ErrorClass
 REQ = RouteRequest("t", "p")
-ALL = [OpenRouterAdapter, GeminiAdapter, CerebrasAdapter, GroqAdapter]
+ALL = [OpenRouterAdapter, GeminiAdapter, GroqAdapter]
 ALL_IDS = [c.__name__ for c in ALL]
-COMPAT = [CerebrasAdapter, GroqAdapter]
+COMPAT = [GroqAdapter]
 
 
 async def raised(cls, handler, call="list_models", **cfg):
@@ -114,9 +113,7 @@ async def test_status_drives_class_for_any_body_shape(cls, status, expected, bod
     )
 
 
-@pytest.mark.parametrize(
-    "cls", [GeminiAdapter, CerebrasAdapter, GroqAdapter], ids=lambda c: c.__name__
-)
+@pytest.mark.parametrize("cls", [GeminiAdapter, GroqAdapter], ids=lambda c: c.__name__)
 async def test_403_is_auth_failed(cls):
     _, err = await raised(cls, lambda r: json_response(403, {"error": {"message": "no"}}))
     assert err.error_class == E.AUTH_FAILED
@@ -129,9 +126,7 @@ async def test_openrouter_402_and_403():
     assert err.error_class == E.POLICY_REJECTED
 
 
-@pytest.mark.parametrize(
-    "cls", [GeminiAdapter, CerebrasAdapter, GroqAdapter], ids=lambda c: c.__name__
-)
+@pytest.mark.parametrize("cls", [GeminiAdapter, GroqAdapter], ids=lambda c: c.__name__)
 async def test_402_is_not_special_outside_openrouter(cls):
     _, err = await raised(cls, lambda r: json_response(402, {}))
     assert err.error_class == E.INVALID_REQUEST
@@ -364,8 +359,8 @@ async def test_unparseable_or_missing_headers_yield_no_records(cls, headers):
         assert await adapter.get_quota() == []
 
 
-async def test_groq_headers_with_cerebras_names_not_cross_parsed():
-    """Cerebras-style header names on Groq (and vice versa) must not fabricate EXACT data."""
+async def test_groq_ignores_foreign_header_names():
+    """Non-Groq rate-limit header names on Groq must not fabricate EXACT data."""
     cer = {
         "x-ratelimit-limit-requests-day": "100",
         "x-ratelimit-remaining-requests-day": "50",
@@ -373,30 +368,6 @@ async def test_groq_headers_with_cerebras_names_not_cross_parsed():
     adapter, _ = make(GroqAdapter, lambda r: json_response(200, {"data": []}, cer), key=SECRET)
     async with adapter:
         assert await adapter.get_quota() == []
-    adapter, _ = make(
-        CerebrasAdapter, lambda r: json_response(200, {"data": []}, GROQ_HEADERS), key=SECRET
-    )
-    async with adapter:
-        assert await adapter.get_quota() == []
-
-
-async def test_cerebras_headers_exact_seconds_reset():
-    h = {
-        "x-ratelimit-limit-requests-day": "1000",
-        "x-ratelimit-remaining-requests-day": "400",
-        "x-ratelimit-reset-requests-day": "3600.5",
-        "x-ratelimit-limit-tokens-minute": "60000",
-        "x-ratelimit-remaining-tokens-minute": "100",
-        "x-ratelimit-reset-tokens-minute": "12",
-    }
-    adapter, _ = make(CerebrasAdapter, lambda r: json_response(200, {"data": []}, h), key=SECRET)
-    async with adapter:
-        recs = await adapter.get_quota()
-    d = {r.window: r for r in recs}
-    assert (d["day"].limit, d["day"].remaining, d["day"].used) == (1000, 400, 600)
-    assert d["day"].reset_at == NOW + timedelta(seconds=3600.5)
-    assert d["minute"].remaining == 100
-    assert all(r.confidence == QuotaConfidence.EXACT for r in recs)
 
 
 async def test_gemini_never_exact_even_if_response_has_ratelimit_headers():
@@ -466,7 +437,7 @@ def test_429_cools_only_that_model_gemini_second_model_routes(make_config):
     m.record_failure("gemini", "g-3.8", E.RATE_LIMITED, retry_after_s=30)
     assert m.is_cooling("gemini", "g-3.8")
     assert not m.is_cooling("gemini", "g-3.7")
-    assert not m.is_cooling("cerebras", "g-3.8")
+    assert not m.is_cooling("groq", "g-3.8")
     from app.providers.base import QuotaRecord
 
     exhausted_or = QuotaRecord(
@@ -493,7 +464,7 @@ def test_flash_38_to_37_to_next_provider_then_back(make_config):
     m.record_failure("gemini", "g-3.7", E.RATE_LIMITED, retry_after_s=20)
     d = route(REQ, cfg, full_state(cfg, quota=[exhausted_or], cooldowns=m.active(NOW)))
     assert isinstance(d, Selected)
-    assert d.candidate.provider == "cerebras"
+    assert d.candidate.provider == "groq"
     # 3.8 expires first
     t = NOW + timedelta(seconds=10)
     d = route(REQ, cfg, full_state(cfg, now=t, quota=[exhausted_or], cooldowns=m.active(t)))

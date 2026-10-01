@@ -22,7 +22,6 @@ def secret_env() -> dict[str, str]:
     return {
         "OPENROUTER_API_KEY": SECRET + "-or",
         "GEMINI_API_KEY": SECRET + "-ge",
-        "CEREBRAS_API_KEY": SECRET + "-ce",
         "GROQ_API_KEY": SECRET + "-gq",
     }
 
@@ -59,13 +58,12 @@ def _base_config_dict() -> dict[str, Any]:
     return {
         "providers": {
             p: {"enabled": True, "api_key_env": f"{p.upper()}_API_KEY"}
-            for p in ("openrouter", "gemini", "cerebras", "groq")
+            for p in ("openrouter", "gemini", "groq")
         },
         "routing": {
             "provider_order": [
                 "openrouter-free",
                 "gemini-free",
-                "cerebras-free",
                 "groq-free",
                 "openrouter-paid",
             ],
@@ -79,11 +77,6 @@ def _base_config_dict() -> dict[str, Any]:
                     "provider": "gemini",
                     "cost_class": "FREE",
                     "model_order": ["g-3.8", "g-3.7"],
-                },
-                "cerebras-free": {
-                    "provider": "cerebras",
-                    "cost_class": "FREE",
-                    "model_order": ["c-a", "c-b"],
                 },
                 "groq-free": {
                     "provider": "groq",
