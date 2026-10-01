@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def open_database(
@@ -32,7 +35,10 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
     except BaseException:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error as rollback_error:
+            logger.warning("rollback failed: %s", type(rollback_error).__name__)
         raise
     else:
         conn.execute("COMMIT")

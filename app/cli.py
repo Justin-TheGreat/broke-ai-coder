@@ -8,8 +8,10 @@ import sys
 from collections.abc import Sequence
 
 from app.config.loader import ConfigError, load_config
+from app.config.secrets import collect_secret_values
 from app.db.connection import open_database
 from app.db.migrations import migrate
+from app.redaction import SecretRedactor, install_redaction
 from app.runtime.daemon import AgentController
 
 logger = logging.getLogger(__name__)
@@ -34,12 +36,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    redactor = SecretRedactor()
+    install_redaction(redactor)
 
     try:
         config = load_config(args.config)
     except ConfigError as e:
         print(str(e), file=sys.stderr)
         return 2
+    redactor.add(*collect_secret_values(config))
 
     try:
         if args.check:

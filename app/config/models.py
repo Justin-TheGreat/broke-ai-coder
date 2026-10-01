@@ -4,7 +4,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from app.providers.base import CostClass
+from app.providers.base import CostClass, QuotaDimension
 
 ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
 
@@ -82,11 +82,102 @@ class RoutingConfig(BaseModel):
         return self
 
 
+class ModelMetadataConfig(BaseModel):
+    model_config = _CFG
+
+    supports_tool_calling: bool | None = None
+    supports_structured_output: bool | None = None
+    supports_vision: bool | None = None
+    context_window: int | None = Field(None, ge=1)
+    max_output_tokens: int | None = Field(None, ge=1)
+
+
+class LimitConfig(BaseModel):
+    model_config = _CFG
+
+    dimension: QuotaDimension
+    limit: float = Field(gt=0, allow_inf_nan=False)
+    model: str | None = None
+
+    @field_validator("dimension")
+    @classmethod
+    def _no_spend(cls, v: QuotaDimension) -> QuotaDimension:
+        if v == QuotaDimension.SPEND_USD:
+            raise ValueError("spend is governed by routing budgets")
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def _model_valid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("model must be non-empty when given")
+        return v
+
+
 class ProviderConfig(BaseModel):
     model_config = _CFG
 
     enabled: bool = True
     api_key_env: str = Field(pattern=ENV_NAME_PATTERN)
+    base_url: str | None = None
+    timeout_s: float = Field(10, gt=0, le=120, allow_inf_nan=False)
+    models: dict[str, ModelMetadataConfig] = Field(default_factory=dict)
+    limits: list[LimitConfig] = Field(default_factory=list)
+
+    @field_validator("base_url")
+    @classmethod
+    def _base_url_valid(cls, v: str | None) -> str | None:
+        if v is not None and not v.startswith(("https://", "http://")):
+            raise ValueError("base_url must start with https:// or http://")
+        return v
+
+    @field_validator("models")
+    @classmethod
+    def _models_keys(cls, v: dict[str, ModelMetadataConfig]) -> dict[str, ModelMetadataConfig]:
+        out: dict[str, ModelMetadataConfig] = {}
+        for key, meta in v.items():
+            k = key.strip()
+            if not k:
+                raise ValueError("models keys must be non-empty")
+            if k in out:
+                raise ValueError(f"models contains duplicate key {k!r}")
+            out[k] = meta
+        return out
+
+    @model_validator(mode="after")
+    def _limits_unique(self) -> ProviderConfig:
+        seen: set[tuple[str | None, QuotaDimension]] = set()
+        for lim in self.limits:
+            key = (lim.model, lim.dimension)
+            if key in seen:
+                raise ValueError(f"duplicate limit for (model, dimension) {key}")
+            seen.add(key)
+        return self
+
+
+class CooldownConfig(BaseModel):
+    model_config = _CFG
+
+    rate_limit_default_s: float = Field(60, gt=0, allow_inf_nan=False)
+    provider_unavailable_s: float = Field(120, gt=0, allow_inf_nan=False)
+    network_failure_threshold: int = Field(3, ge=1)
+    network_failure_window_s: float = Field(300, gt=0, allow_inf_nan=False)
+    network_failure_cooldown_s: float = Field(120, gt=0, allow_inf_nan=False)
+    max_cooldown_s: float = Field(3600, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check(self) -> CooldownConfig:
+        for name in (
+            "rate_limit_default_s",
+            "provider_unavailable_s",
+            "network_failure_cooldown_s",
+        ):
+            if getattr(self, name) > self.max_cooldown_s:
+                raise ValueError(f"{name} must be <= max_cooldown_s")
+        return self
 
 
 class DiscordConfig(BaseModel):
@@ -132,6 +223,7 @@ class AppConfig(BaseModel):
     opencode: OpenCodeConfig = Field(default_factory=OpenCodeConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    cooldown: CooldownConfig = Field(default_factory=CooldownConfig)
 
     @model_validator(mode="after")
     def _providers_defined(self) -> AppConfig:

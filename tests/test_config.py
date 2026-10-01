@@ -137,3 +137,78 @@ def test_secret_not_in_config_or_logs(make_config, caplog):
     assert "SECRET123" not in cfg.model_dump_json()
     assert "SECRET123" not in caplog.text
     assert "SECRET123" not in repr(present)
+
+
+def _prov(**kw):
+    return {"providers": {"a": {"api_key_env": "A_KEY", **kw}}}
+
+
+def test_provider_extensions_load():
+    cfg = parse_config(
+        {
+            **_prov(
+                base_url="https://x.example/v1",
+                timeout_s=5,
+                models={" m1 ": {"supports_vision": True, "context_window": 10}},
+                limits=[
+                    {"dimension": "requests_per_day", "limit": 5},
+                    {"dimension": "requests_per_day", "limit": 3, "model": " m1 "},
+                ],
+            ),
+            "cooldown": {"rate_limit_default_s": 30, "max_cooldown_s": 600},
+        }
+    )
+    prov = cfg.providers["a"]
+    assert prov.base_url == "https://x.example/v1" and prov.timeout_s == 5
+    assert "m1" in prov.models and prov.models["m1"].supports_vision is True
+    assert prov.limits[1].model == "m1"
+    assert cfg.cooldown.rate_limit_default_s == 30
+    assert parse_config({}).cooldown.network_failure_threshold == 3
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        (_prov(limits=[{"dimension": "spend_usd", "limit": 1}]), "routing budgets"),
+        (_prov(limits=[{"dimension": "requests_per_day", "limit": 0}]), "limit"),
+        (_prov(limits=[{"dimension": "requests_per_day", "limit": float("nan")}]), "limit"),
+        (_prov(limits=[{"dimension": "requests_per_day", "limit": float("inf")}]), "limit"),
+        (
+            _prov(
+                limits=[
+                    {"dimension": "requests_per_day", "limit": 1},
+                    {"dimension": "requests_per_day", "limit": 2},
+                ]
+            ),
+            "duplicate limit",
+        ),
+        (_prov(limits=[{"dimension": "requests_per_week", "limit": 1}]), "dimension"),
+        (_prov(limits=[{"dimension": "requests_per_day", "limit": 1, "model": " "}]), "model"),
+        (_prov(base_url="ftp://x"), "base_url"),
+        (_prov(timeout_s=0), "timeout_s"),
+        (_prov(models={" ": {}}), "non-empty"),
+        ({"cooldown": {"rate_limit_default_s": 5000}}, "max_cooldown_s"),
+        ({"cooldown": {"network_failure_threshold": 0}}, "network_failure_threshold"),
+    ],
+)
+def test_provider_extension_rejected(data, match):
+    with pytest.raises(ConfigError, match=match):
+        parse_config(data)
+
+
+def test_example_config_has_cooldown():
+    cfg = load_config(ROOT / "config.example.yaml")
+    assert cfg.cooldown.max_cooldown_s == 3600
+
+
+def test_collect_secret_values(make_config):
+    from app.config.secrets import collect_secret_values
+
+    cfg = make_config()
+    env = {
+        "OPENROUTER_API_KEY": "k-or-123456",
+        "DISCORD_BOT_TOKEN": "tok-123456",
+        "GROQ_API_KEY": " ",
+    }
+    assert collect_secret_values(cfg, env) == frozenset({"k-or-123456", "tok-123456"})
+    assert collect_secret_values(cfg, {}) == frozenset()

@@ -32,4 +32,10 @@ copy config.example.yaml config.yaml
 
 - API keys are read only from the environment variables named in the config. Keys are
   never stored in config files or the database.
-- Discord, OpenCode, and real provider adapters are not implemented yet.
+- HTTP provider adapters exist for metadata, health and quota only (no inference calls).
+  Discord and OpenCode are not implemented yet.
+- `providers.<p>.limits`: your own quota limits per dimension (optionally per model), used to
+  estimate remaining quota from recorded usage. No limits are shipped.
+- `providers.<p>.models`: per-model capability overrides (tools, vision, context window, ...).
+- `cooldown`: how long rate-limited or failing providers and models are skipped.
+- Log output redacts configured API keys.

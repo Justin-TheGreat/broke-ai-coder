@@ -31,6 +31,16 @@ class HealthStatus(StrEnum):
     DOWN = "DOWN"
 
 
+class QuotaDimension(StrEnum):
+    REQUESTS_PER_MINUTE = "requests_per_minute"
+    REQUESTS_PER_HOUR = "requests_per_hour"
+    REQUESTS_PER_DAY = "requests_per_day"
+    TOKENS_PER_MINUTE = "tokens_per_minute"
+    TOKENS_PER_HOUR = "tokens_per_hour"
+    TOKENS_PER_DAY = "tokens_per_day"
+    SPEND_USD = "spend_usd"
+
+
 class ErrorClass(StrEnum):
     RATE_LIMITED = "RATE_LIMITED"
     QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"

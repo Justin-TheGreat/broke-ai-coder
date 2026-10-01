@@ -116,3 +116,10 @@ async def test_start_twice_raises(tmp_path):
             await c.start()
     finally:
         await c.stop()
+
+
+async def test_submit_rejected_after_stop(tmp_path):
+    c = AgentController(cfg_for(tmp_path))
+    await c.start()
+    await c.stop()
+    assert c.submit_task(sub()) is False

@@ -4,16 +4,45 @@ from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
+import httpx
 import pytest
 
 from app.config.loader import parse_config
-from app.config.models import AppConfig
+from app.config.models import AppConfig, ProviderConfig
 from app.db.connection import open_database
 from app.db.migrations import migrate
 from app.providers.base import ModelCapability
 from app.router.types import RouterState
 
 NOW = datetime(2026, 9, 30, 21, 0, 0, tzinfo=UTC)
+SECRET = "sk-test-SECRET-0123456789"
+
+
+def secret_env() -> dict[str, str]:
+    return {
+        "OPENROUTER_API_KEY": SECRET + "-or",
+        "GEMINI_API_KEY": SECRET + "-ge",
+        "CEREBRAS_API_KEY": SECRET + "-ce",
+        "GROQ_API_KEY": SECRET + "-gq",
+    }
+
+
+def json_response(status: int, body: Any, headers: dict[str, str] | None = None) -> httpx.Response:
+    return httpx.Response(status, json=body, headers=headers)
+
+
+def provider_cfg(**kw: Any) -> ProviderConfig:
+    data: dict[str, Any] = {"api_key_env": "TEST_API_KEY"}
+    data.update(kw)
+    return ProviderConfig(**data)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _blocked(self: Any, request: Any) -> Any:
+        raise RuntimeError("real network call attempted")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _blocked)
 
 
 @pytest.fixture

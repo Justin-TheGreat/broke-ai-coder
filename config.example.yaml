@@ -29,7 +29,15 @@ routing:
       model_order: ["<configured-paid-model-id>"]
 providers:
   openrouter: {enabled: true, api_key_env: OPENROUTER_API_KEY}
-  gemini:     {enabled: true, api_key_env: GEMINI_API_KEY}
+  gemini:
+    enabled: true
+    api_key_env: GEMINI_API_KEY
+    # Optional. Fill in numbers from your own provider dashboard; none are shipped here.
+    # limits:
+    #   - {dimension: requests_per_day, limit: <from your AI Studio dashboard>}
+    #   - {dimension: requests_per_minute, limit: <from your AI Studio dashboard>, model: "<id>"}
+    # models:
+    #   "<model-id>": {supports_tool_calling: true, context_window: <tokens>}
   cerebras:   {enabled: true, api_key_env: CEREBRAS_API_KEY}
   groq:       {enabled: true, api_key_env: GROQ_API_KEY}
 discord:
@@ -50,3 +58,10 @@ runtime:
   task_queue_maxsize: 100
   event_queue_maxsize: 1000
   shutdown_timeout_s: 10
+cooldown:
+  rate_limit_default_s: 60
+  provider_unavailable_s: 120
+  network_failure_threshold: 3
+  network_failure_window_s: 300
+  network_failure_cooldown_s: 120
+  max_cooldown_s: 3600

@@ -147,6 +147,9 @@ class AgentController:
     # ---- queues ----------------------------------------------------
 
     def submit_task(self, submission: TaskSubmission) -> bool:
+        if self._stopped:
+            logger.warning("controller stopped; submission rejected")
+            return False
         try:
             self._task_queue.put_nowait(submission)
         except asyncio.QueueFull:

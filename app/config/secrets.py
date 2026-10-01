@@ -22,3 +22,12 @@ def credentials_present(
         for name, prov in config.providers.items()
         if resolve_secret(prov.api_key_env, environ) is not None
     )
+
+
+def collect_secret_values(
+    config: AppConfig, environ: Mapping[str, str] | None = None
+) -> frozenset[str]:
+    names = [prov.api_key_env for prov in config.providers.values()]
+    names.append(config.discord.bot_token_env)
+    values = (resolve_secret(n, environ) for n in names)
+    return frozenset(v for v in values if v is not None)

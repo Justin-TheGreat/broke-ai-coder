@@ -1,1087 +1,786 @@
-# Spec: MVP vertical slice 1 (offline core)
+# Spec: slice 2: provider HTTP adapters, cooldowns, quota, redaction (offline-testable)
 
-Covers T001, T001A, config loading, T020, T021, T021A, T030 (interfaces + fake), T050/T051/T051A/T053 (pure router + fallback selection).
-Source docs: `SPEC.md`, `ARCHITECTURE.md`, `TASKS.md` at repo root.
+Covers T031-T034 (adapters), T035 (cooldowns), T040-T043 (quota normalization, snapshots, usage accounting, estimates), the RouterState assembly, and T070/T073 (secret redaction). It also includes two trivial follow-ups from `.pipeline/review.md`.
+Branch: `feat/providers-quota`. Source docs: `SPEC.md`, `ARCHITECTURE.md`, `TASKS.md`. Slice-1 conventions still apply:
+- `from __future__ import annotations` at the top of every module.
+- Frozen slotted dataclasses.
+- `StrEnum`.
+- Pydantic `ConfigDict(extra="forbid", frozen=True)` via `_CFG`.
+- No `print` outside `app/cli.py`.
+- `logging.getLogger(__name__)`.
 
 ## OPEN QUESTIONS
 
-None. Every place where the docs conflict or leave a gap is decided below under "Decisions". Implement those decisions as written.
+None blocking. Every uncertain provider detail is a module-level constant in one place and is listed under "Assumptions" (§0.2). Implement the assumptions as written.
 
-## Decisions (where the docs conflict or are silent)
+## 0. Environment, decisions, assumptions
 
-1. **Config shape.** SPEC §16 and ARCH §7 disagree. This spec uses one merged shape (see §3): `routing.provider_order` lists **policy ids** (e.g. `gemini-free`), and `routing.policies.<policy_id>` holds `provider`, `cost_class`, `enabled`, and `model_order`. Provider priority is the **index in `provider_order`**. There is no numeric `priority` field. The per-policy `requires_approval` flag from ARCH is dropped. The global `routing.paid_requires_approval` is the only approval switch. `providers.openrouter.free_model` is dropped because `openrouter/free` is simply the single entry in `policies.openrouter-free.model_order`.
-2. **Mode names.** The YAML values are `free-only`, `free-first-no-paid` (default), and `free-first-paid-after-approval`. `free-first-paid-after-confirmation` (the SPEC §6.6 wording) is accepted as an input alias for the third value. The Python enum names are `FREE_ONLY`, `FREE_FIRST_NO_PAID`, and `FREE_FIRST_PAID_AFTER_APPROVAL`. In the router, `FREE_ONLY` and `FREE_FIRST_NO_PAID` behave identically: paid candidates are never selected.
-3. **Budget.** `daily_paid_budget_usd` defaults to `0.0`. `monthly_paid_budget_usd` defaults to `None`, meaning there is no monthly cap and the daily cap still applies. A paid selection, or a paid approval prompt, is only possible when the remaining budget is `> 0` (decision 4 has the exact rule). Cost prediction is out of scope (T113).
-4. **`max_fallback_attempts` (default 3)** is the maximum **total** number of attempts in one task's chain, counting the initial attempt. This matches the `fallback_attempts.attempt_no` numbering. When `len(attempts_so_far) >= max_fallback_attempts`, there is no further candidate.
-5. **Router outcomes are returned values (frozen dataclasses), not raised exceptions.** They are named `Selected`, `NoEligibleProvider`, and `PaidApprovalRequired`.
-6. **The router is pure.** It does not read env vars, the DB, the clock, or the network. The caller passes in a `RouterState` snapshot that includes `now`. The caller updates cooldown/quota state before calling `next_after_failure` (SPEC §6.4 rule 2).
-7. **Missing data.**
-   - Missing capability metadata for a provider/model means the candidate is ineligible (`MODEL_UNKNOWN`), per SPEC §6.2 rule 2.
-   - Missing health info for a provider means it is treated as `HEALTHY`.
-   - Quota records whose `reset_at <= now` are ignored as expired. `UNKNOWN` confidence never filters.
-8. **`large_context`** means `context_window is not None and context_window >= routing.large_context_min_tokens` (default 128000).
-9. **Model override from Discord** is out of scope. Only the `is_allowlisted()` helper is provided.
-10. **SQL column renames** avoid SQL keywords: `quota_snapshots.limit` becomes `limit_value`, `window` becomes `quota_window`, and `usage_events.timestamp` becomes `occurred_at`.
-11. **Timestamps** are stored as TEXT in ISO-8601 UTC with microseconds (`2026-09-30T21:00:00.000000+00:00`), always produced by `app.timeutil.to_db()`. This makes lexicographic comparison valid.
-12. **Persistence uses stdlib `sqlite3`** with explicit transactions. There is no ORM. The SQLite connection is used on the event loop thread. The retention job runs in `asyncio.to_thread` on its **own** connection.
-13. **The daemon's task worker** only persists submitted tasks as `QUEUED` in this slice. Routing and execution wiring is the next slice. Discord and OpenCode are Protocol stubs with Null implementations.
+### 0.1 Environment
+- Use `.venv/Scripts/python` only. Never use the bare `python` on PATH.
+- Add `"httpx>=0.27,<1"` to `[project] dependencies` in `pyproject.toml`. Then run `.venv/Scripts/python -m pip install -e ".[dev]"`. httpx is **not** installed yet. Installing needs the network; tests do not.
+- Check with `.venv/Scripts/python -m pytest`, `-m ruff check .` and `-m ruff format --check .`. Slice 1 must stay green.
+- Tests never touch the network. Every adapter in tests gets `transport=httpx.MockTransport(handler)`. A conftest autouse guard (§10) blocks any real transport.
 
-## 0. Environment / tooling
+### 0.2 Assumptions (each one is a constant in one module; change it there only)
+| # | Assumption | Where |
+|---|---|---|
+| A1 | Base URLs: OpenRouter `https://openrouter.ai/api/v1`, Gemini `https://generativelanguage.googleapis.com/v1beta`, Cerebras `https://api.cerebras.ai/v1`, Groq `https://api.groq.com/openai/v1`. Config `base_url` overrides them. Request paths are relative (for example `"models"`). | `DEFAULT_BASE_URL` per adapter |
+| A2 | Auth: OpenRouter, Cerebras and Groq use `Authorization: Bearer <key>`. Gemini uses the header `x-goog-api-key: <key>`, **never** a `?key=` query param, so keys never appear in URLs. | `_auth_headers` per adapter |
+| A3 | OpenRouter `GET key` returns `{"data": {"limit": number\|null, "usage": number, "limit_remaining": number\|null, ...}}` in USD. No other fields are read. No authoritative remaining **request** count exists, so free-request quota comes only from configured limits through the estimator. | `openrouter.py` |
+| A4 | OpenRouter `GET models` returns `{"data":[{"id", "context_length", "top_provider":{"max_completion_tokens"}, "supported_parameters":[...], "architecture":{"input_modalities":[...]}}]}`. `"tools"` in supported_parameters means tool calling. `"structured_outputs"` or `"response_format"` means structured output. `"image"` in input_modalities means vision. `openrouter/free` is assumed to appear in this list. If it does not, it shows as MODEL_UNKNOWN in `skipped`, which is visible and fail-closed. | `openrouter.py` |
+| A5 | Gemini `GET models?pageSize=1000[&pageToken=]` returns `{"models":[{"name":"models/<id>", "inputTokenLimit", "outputTokenLimit", "supportedGenerationMethods":[...]}], "nextPageToken"?}`. Strip the `models/` prefix. Keep only models whose methods include `generateContent`; if the field is absent, keep the model. At most 10 pages. Gemini has no remaining-quota API, so `get_quota()` returns `[]` and the estimator supplies ESTIMATED records. | `gemini.py` |
+| A6 | Gemini errors use `{"error":{"code","message","status","details":[...]}}`. Error code = `status`. A `details[]` item with `"reason": "API_KEY_INVALID"` means AUTH_FAILED, even on HTTP 400. A details item whose `@type` ends with `google.rpc.RetryInfo` carries `retryDelay` like `"30s"`, which is used as Retry-After when no header is present. | `gemini.py` |
+| A7 | Groq headers: `x-ratelimit-{limit,remaining,reset}-requests` mean **requests per day** and `...-tokens` mean **tokens per minute**. Reset values are Go-style durations (`2m59.56s`). | `GROQ_HEADER_DIMENSIONS` |
+| A8 | Cerebras headers: `x-ratelimit-{limit,remaining,reset}-requests-day` and `...-tokens-minute`. Reset values are seconds as a decimal string. | `CEREBRAS_HEADER_DIMENSIONS` |
+| A9 | Groq and Cerebras `get_quota()` probe `GET models`, which uses no inference. Headers seen on that probe are recorded with `model=None` (provider-wide), because the probe is not model-scoped. If the headers are absent, the result is `[]` (UNKNOWN). Configured limits then feed the estimator, which labels them ESTIMATED. `GET models` on Cerebras returns only ids, so capabilities come from config metadata (§3.1). | `groq.py`, `cerebras.py` |
+| A10 | OpenAI-compatible error body is `{"error":{"message","type","code"}}`. Error code = `code` if it is a str, else `type`. | `http.py` |
+| A11 | Estimates use **rolling** windows: minute 60 s, hour 3600 s, day 86400 s. Gemini RPD really resets at midnight Pacific. A rolling 24 h window counts at least as much usage as the calendar window, so the estimate is never higher than the truth. Calendar alignment is deferred (no tzdata dependency on Windows). | `WINDOW_SECONDS` in `normalize.py` |
+| A12 | Paid spend windows are UTC: "today" starts at UTC midnight and "month" starts at 00:00 UTC on the 1st. | `state.py` |
+| A13 | Every usage event counts as one request toward request quotas, whatever its status. This is conservative. | `usage.py` |
 
-- Python 3.12+. Create the venv with `py -3.14 -m venv .venv`. Do not use the bare `python` on PATH, which is an unrelated 3.11 interpreter.
-- Install: `.venv\Scripts\python -m pip install -e ".[dev]"`
-- Test: `.venv\Scripts\python -m pytest`
-- Lint: `.venv\Scripts\python -m ruff check .` and `.venv\Scripts\python -m ruff format --check .`
+### 0.3 Decisions
+1. **Adapters only report provider-observed data.** `get_quota()` returns EXACT or UNKNOWN records from provider headers or APIs. ESTIMATED records come only from `app/quota/estimator.py`, which reads configured limits and DB usage. Estimates are computed on demand and **not persisted** in this slice. No numeric limit appears in source. Configured limits come from `providers.<p>.limits`.
+2. **Refreshing and building are separate steps.** `refresh_provider_state` calls the adapters over the network, persists snapshots and models, and returns observations. `build_router_state` is synchronous and reads only the DB, the cooldown manager and cached observations. The router never triggers network calls. Scheduling refreshes (T044) is out of scope.
+3. **429 cooldowns are model-scoped** (`(provider, model)`), so a Gemini model-1 429 still allows Gemini model-2 (T051A). PROVIDER_UNAVAILABLE and repeated network failures put the whole provider in cooldown (`(provider, None)`).
+4. **Keys are resolved from the env at every request** through `resolve_secret(cfg.api_key_env, environ)`. They are never stored on adapters, errors, dataclasses or the DB.
+5. **Fail closed on bad state.** `build_router_state` raises only `RouterStateError`; it never lets `ValueError` or `sqlite3.Error` escape. `route_with_state` turns that error into `NoEligibleProvider(ROUTER_STATE_UNAVAILABLE)`.
 
-## 1. Files to create
+## 1. Files
 
+Create:
 ```text
-.gitignore
+app/providers/errors.py
+app/providers/ratelimit.py
+app/providers/http.py
+app/providers/openrouter.py
+app/providers/gemini.py
+app/providers/cerebras.py
+app/providers/groq.py
+app/providers/registry.py
+app/quota/__init__.py          (only `from __future__ import annotations`)
+app/quota/normalize.py
+app/quota/cooldown.py
+app/quota/estimator.py
+app/quota/state.py
+app/db/quota.py
+app/db/usage.py
+app/db/provider_models.py
+app/redaction.py
+tests/test_provider_http_common.py
+tests/test_provider_openrouter.py
+tests/test_provider_gemini.py
+tests/test_provider_cerebras.py
+tests/test_provider_groq.py
+tests/test_cooldown.py
+tests/test_quota_normalize.py
+tests/test_quota_repository.py
+tests/test_usage.py
+tests/test_estimator.py
+tests/test_router_state.py
+tests/test_redaction.py
+tests/test_db_connection.py
+```
+Modify:
+```text
 pyproject.toml
-README.md
 config.example.yaml
-scripts/setup_venv.ps1
-scripts/check.ps1
-app/__init__.py
-app/__main__.py
-app/cli.py
-app/timeutil.py
-app/config/__init__.py
-app/config/models.py
-app/config/loader.py
-app/config/secrets.py
-app/db/__init__.py
-app/db/connection.py
-app/db/migrations.py
-app/db/tasks.py
-app/db/retention.py
-app/orchestrator/__init__.py
-app/orchestrator/state_machine.py
-app/providers/__init__.py
+README.md
 app/providers/base.py
-app/providers/fake.py
-app/router/__init__.py
+app/config/models.py
+app/config/secrets.py
+app/db/connection.py
 app/router/types.py
-app/router/router.py
-app/router/policy.py
-app/runtime/__init__.py
-app/runtime/interfaces.py
 app/runtime/daemon.py
+app/cli.py
 tests/conftest.py
 tests/test_config.py
-tests/test_state_machine.py
-tests/test_db_migrations.py
-tests/test_task_repository.py
-tests/test_retention.py
-tests/test_providers_fake.py
-tests/test_router.py
-tests/test_router_fallback.py
-tests/test_router_policy.py
 tests/test_daemon.py
-tests/test_cli.py
 ```
+Patterns to copy:
+- Repositories follow `app/db/tasks.py`: a class taking `conn`, writes in `transaction()`, `to_db`/`from_db`, and a `_row_to_*` helper.
+- Config models follow `app/config/models.py`.
+- Adapter tests follow the style of `tests/test_providers_fake.py`.
+- Parametrized rejection tests follow `tests/test_config.py::test_invalid_rejected`, using `pytest.raises(..., match=...)`.
 
-The repo has no existing code, so there are no patterns to copy. Follow the conventions below in every file:
-
-- Every module starts with `from __future__ import annotations`.
-- Domain types are `@dataclass(frozen=True, slots=True)`. Config uses Pydantic v2 models with `ConfigDict(extra="forbid", frozen=True)`.
-- Enums are `enum.StrEnum`.
-- No `print` outside `app/cli.py`. Use `logging.getLogger(__name__)`.
-
-### 1.1 `.gitignore`
-
-```
-.venv/
-__pycache__/
-*.py[cod]
-*.db
-*.db-wal
-*.db-shm
-.env
-data/
-.pytest_cache/
-.ruff_cache/
-*.egg-info/
-build/
-dist/
-```
-
-### 1.2 `pyproject.toml`
-
-- `[build-system]`: setuptools>=69, wheel. Package discovery uses `[tool.setuptools.packages.find] include = ["app*"]`.
-- `[project]`: name `broke-ai-coder`, version `0.1.0`, `requires-python = ">=3.12"`, dependencies `pydantic>=2.12,<3` and `pyyaml>=6.0`.
-- `[project.optional-dependencies] dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6"]`
-- `[project.scripts] agent-controller = "app.cli:main"`
-- `[tool.pytest.ini_options]`: `testpaths = ["tests"]`, `asyncio_mode = "auto"`, `asyncio_default_fixture_loop_scope = "function"`.
-- `[tool.ruff]`: `line-length = 100`, `target-version = "py312"`. Set `[tool.ruff.lint] select = ["E","F","I","B","UP"]`.
-
-### 1.3 `scripts/setup_venv.ps1` / `scripts/check.ps1`
-
-- `setup_venv.ps1` runs `py -3.14 -m venv .venv`. If that fails, it falls back to `py -3.12 -m venv .venv`. It then runs `.venv\Scripts\python -m pip install -e ".[dev]"`.
-- `check.ps1` runs ruff check, ruff format --check, and pytest using `.venv\Scripts\python`. It exits non-zero on the first failure.
-
-### 1.4 `README.md` (stub)
-
-Include:
-
-- A one-paragraph purpose statement.
-- The venv setup commands from §0.
-- `copy config.example.yaml config.yaml`.
-- The run commands `.\.venv\Scripts\python -m app --check`, `--once`, and no flag.
-- The test and lint commands.
-- A note that API keys are read only from the env vars named in config.
-- A note that Discord/OpenCode/provider adapters are not implemented yet.
-
-### 1.5 `config.example.yaml`
-
-It must validate with `load_config`; a test checks this. Content:
-
-```yaml
-routing:
-  mode: free-first-no-paid
-  paid_requires_approval: true
-  daily_paid_budget_usd: 0
-  monthly_paid_budget_usd: null
-  max_fallback_attempts: 3
-  large_context_min_tokens: 128000
-  provider_order: [openrouter-free, gemini-free, cerebras-free, groq-free, openrouter-paid]
-  policies:
-    openrouter-free: {provider: openrouter, cost_class: FREE, model_order: [openrouter/free]}
-    gemini-free:
-      provider: gemini
-      cost_class: FREE
-      model_order: ["<gemini-flash-3.8-api-id>", "<gemini-flash-3.7-api-id>"]
-    cerebras-free:
-      provider: cerebras
-      cost_class: FREE
-      model_order: ["<cerebras-model-a-api-id>", "<cerebras-model-b-api-id>"]
-    groq-free:
-      provider: groq
-      cost_class: FREE
-      model_order: ["<groq-model-x-api-id>", "<groq-model-y-api-id>"]
-    openrouter-paid:
-      provider: openrouter
-      cost_class: PAID
-      model_order: ["<configured-paid-model-id>"]
-providers:
-  openrouter: {enabled: true, api_key_env: OPENROUTER_API_KEY}
-  gemini:     {enabled: true, api_key_env: GEMINI_API_KEY}
-  cerebras:   {enabled: true, api_key_env: CEREBRAS_API_KEY}
-  groq:       {enabled: true, api_key_env: GROQ_API_KEY}
-discord:
-  bot_token_env: DISCORD_BOT_TOKEN
-  allowed_user_ids: []
-  allowed_guild_ids: []
-  allowed_channel_ids: []
-opencode:
-  server_url: http://127.0.0.1:4096
-  working_directory: /workspace
-database:
-  path: data/agent-controller.db
-  busy_timeout_ms: 5000
-  retention_days: 60
-  cleanup_interval_hours: 24
-  cleanup_batch_size: 500
-runtime:
-  task_queue_maxsize: 100
-  event_queue_maxsize: 1000
-  shutdown_timeout_s: 10
-```
-
-Add YAML comments explaining three points:
-
-- `model_order` is an ordered hard allowlist.
-- Placeholder IDs must be replaced with real API IDs.
-- Keys are never placed in this file, only env var names.
-
-## 2. `app/timeutil.py`
+## 2. `app/providers/base.py` (add only)
 
 ```python
-def utcnow() -> datetime                    # aware, UTC
-def to_db(dt: datetime) -> str              # raises ValueError if dt is naive; dt.astimezone(UTC).isoformat(timespec="microseconds")
-def from_db(value: str) -> datetime         # datetime.fromisoformat; result is aware UTC
-def to_db_opt(dt: datetime | None) -> str | None
-def from_db_opt(value: str | None) -> datetime | None
+class QuotaDimension(StrEnum):
+    REQUESTS_PER_MINUTE = "requests_per_minute"
+    REQUESTS_PER_HOUR = "requests_per_hour"
+    REQUESTS_PER_DAY = "requests_per_day"
+    TOKENS_PER_MINUTE = "tokens_per_minute"
+    TOKENS_PER_HOUR = "tokens_per_hour"
+    TOKENS_PER_DAY = "tokens_per_day"
+    SPEND_USD = "spend_usd"
 ```
+It lives here, not in `app/quota`, so that `app/config/models.py` can import it without a cycle.
 
-## 3. Config (`app/config/`)
+## 3. Config (`app/config/models.py`, `app/config/secrets.py`), example, README
 
-### 3.1 `models.py`
+### 3.1 New models
 
-`CostClass` is imported from `app.providers.base`.
-
+All use `_CFG`. Every float uses `allow_inf_nan=False`.
 ```python
-class RoutingMode(StrEnum):
-    FREE_ONLY = "free-only"
-    FREE_FIRST_NO_PAID = "free-first-no-paid"
-    FREE_FIRST_PAID_AFTER_APPROVAL = "free-first-paid-after-approval"
+class ModelMetadataConfig(BaseModel):        # overlays discovered capability; None = keep discovered value
+    supports_tool_calling: bool | None = None
+    supports_structured_output: bool | None = None
+    supports_vision: bool | None = None
+    context_window: int | None = Field(None, ge=1)
+    max_output_tokens: int | None = Field(None, ge=1)
 
+class LimitConfig(BaseModel):
+    dimension: QuotaDimension             # SPEND_USD -> ValueError ("spend is governed by routing budgets")
+    limit: float = Field(gt=0, allow_inf_nan=False)
+    model: str | None = None              # None = provider-wide (usage of all models summed); stripped, non-empty if given
 
-# A field_validator(mode="before") on RoutingConfig.mode maps "free-first-paid-after-confirmation" -> FREE_FIRST_PAID_AFTER_APPROVAL.
-
-ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
-
-
-class PolicyConfig(BaseModel):
-    provider: str  # non-empty after strip
-    cost_class: CostClass
+class ProviderConfig(BaseModel):          # existing fields unchanged
     enabled: bool = True
-    model_order: list[
-        str
-    ]  # min_length=1; each entry stripped and non-empty; duplicates -> ValueError
+    api_key_env: str = Field(pattern=ENV_NAME_PATTERN)
+    base_url: str | None = None           # must start with "https://" or "http://" else ValueError
+    timeout_s: float = Field(10, gt=0, le=120, allow_inf_nan=False)
+    models: dict[str, ModelMetadataConfig] = Field(default_factory=dict)   # keys stripped, non-empty
+    limits: list[LimitConfig] = Field(default_factory=list)   # duplicate (model, dimension) -> ValueError
 
+class CooldownConfig(BaseModel):
+    rate_limit_default_s: float = Field(60, gt=0)
+    provider_unavailable_s: float = Field(120, gt=0)
+    network_failure_threshold: int = Field(3, ge=1)
+    network_failure_window_s: float = Field(300, gt=0)
+    network_failure_cooldown_s: float = Field(120, gt=0)
+    max_cooldown_s: float = Field(3600, gt=0)
+    # model_validator(after): rate_limit_default_s, provider_unavailable_s, network_failure_cooldown_s
+    # must each be <= max_cooldown_s
 
-class RoutingConfig(BaseModel):
-    mode: RoutingMode = RoutingMode.FREE_FIRST_NO_PAID
-    paid_requires_approval: bool = True
-    daily_paid_budget_usd: float = Field(0.0, ge=0)
-    monthly_paid_budget_usd: float | None = Field(None, ge=0)
-    max_fallback_attempts: int = Field(3, ge=1)
-    large_context_min_tokens: int = Field(128_000, ge=1)
-    provider_order: list[str] = []
-    policies: dict[str, PolicyConfig] = {}
-    # model_validator(after):
-    #  - provider_order has no duplicates
-    #  - every provider_order id exists in policies (unknown id -> ValueError naming it)
-    #  - a (provider, model) pair appears in at most one policy (else ValueError, because cost class would be ambiguous)
-    #  - policies not listed in provider_order are allowed; they are never routed
-
-
-class ProviderConfig(BaseModel):
-    enabled: bool = True
-    api_key_env: str  # must match ENV_NAME_PATTERN; this rejects pasted keys such as "sk-or-..."
-
-
-class DiscordConfig(BaseModel):
-    bot_token_env: str = "DISCORD_BOT_TOKEN"  # ENV_NAME_PATTERN
-    allowed_user_ids: list[int] = []
-    allowed_guild_ids: list[int] = []
-    allowed_channel_ids: list[int] = []
-
-
-class OpenCodeConfig(BaseModel):
-    server_url: str = "http://127.0.0.1:4096"
-    working_directory: str = "/workspace"
-
-
-class DatabaseConfig(BaseModel):
-    path: str = "data/agent-controller.db"
-    busy_timeout_ms: int = Field(5000, ge=0)
-    retention_days: int = Field(60, ge=1)
-    cleanup_interval_hours: float = Field(24, gt=0, le=24)  # cleanup runs at least daily
-    cleanup_batch_size: int = Field(500, ge=1)
-
-
-class RuntimeConfig(BaseModel):
-    task_queue_maxsize: int = Field(100, ge=1)
-    event_queue_maxsize: int = Field(1000, ge=1)
-    shutdown_timeout_s: float = Field(10, gt=0)
-
-
-class AppConfig(BaseModel):
-    routing: RoutingConfig = RoutingConfig()
-    providers: dict[str, ProviderConfig] = {}
-    discord: DiscordConfig = DiscordConfig()
-    opencode: OpenCodeConfig = OpenCodeConfig()
-    database: DatabaseConfig = DatabaseConfig()
-    runtime: RuntimeConfig = RuntimeConfig()
-    # model_validator(after): every routing.policies[*].provider must be a key of providers (else ValueError)
+class AppConfig:  add  cooldown: CooldownConfig = Field(default_factory=CooldownConfig)
 ```
 
-All models use `ConfigDict(extra="forbid", frozen=True)`. Use `Field(default_factory=...)` for mutable defaults.
-
-### 3.2 `loader.py`
-
+### 3.2 `secrets.py` (add)
 ```python
-class ConfigError(Exception): ...
-def load_config(path: str | os.PathLike[str]) -> AppConfig
-def parse_config(data: Mapping[str, Any] | None) -> AppConfig
+def collect_secret_values(config: AppConfig, environ: Mapping[str, str] | None = None) -> frozenset[str]
+    # resolved values of every providers[*].api_key_env plus discord.bot_token_env; unresolved ones are skipped
 ```
 
-`load_config` behavior:
+### 3.3 `config.example.yaml`
+- Add a `cooldown:` block with the defaults above.
+- Under `gemini`, add a **commented-out** example of `limits:` and `models:`, using placeholder text such as `limit: <from your AI Studio dashboard>`.
+- Do not put real numbers in the example. The file must still validate.
 
-- **Missing file:** raise `ConfigError("config file not found: <path>")`.
-- **YAML parsing:** use `yaml.safe_load`.
-- **Empty file:** treat as `{}`, which produces a valid all-default config.
-- **Non-mapping top level:** raise `ConfigError`.
-- **Validation failures:** wrap `yaml.YAMLError` and `pydantic.ValidationError` in `ConfigError` with a readable message.
+### 3.4 `README.md`
+- Replace the line "Discord, OpenCode, and real provider adapters are not implemented yet." with one that says HTTP provider adapters exist for metadata, health and quota only (no inference calls), and that Discord and OpenCode are not implemented yet.
+- Add one line each describing the `providers.<p>.limits`, `providers.<p>.models` and `cooldown` config keys.
+- Note that log output redacts configured keys.
 
-### 3.3 `secrets.py`
+## 4. Provider errors and HTTP plumbing
 
+### 4.1 `app/providers/errors.py`
 ```python
-def resolve_secret(env_name: str, environ: Mapping[str, str] | None = None) -> str | None
-    # environ defaults to os.environ; an empty or whitespace-only value returns None. Never log the value.
-def credentials_present(config: AppConfig, environ: Mapping[str, str] | None = None) -> frozenset[str]
-    # provider names whose api_key_env resolves to a non-None secret
-```
-
-Secret values must never be stored on any config object or dataclass. Only env var names are stored.
-
-## 4. Provider types (`app/providers/base.py`)
-
-```python
-class CostClass(StrEnum):
-    FREE = "FREE"
-    PAID = "PAID"
-
-
-class QuotaConfidence(StrEnum):
-    EXACT, ESTIMATED, UNKNOWN, EXHAUSTED, COOLDOWN  # value == name
-
-
-class QuotaUnit(StrEnum):
-    REQUESTS, TOKENS, USD
-
-
-class HealthStatus(StrEnum):
-    HEALTHY, DEGRADED, DOWN
-
-
-class ErrorClass(StrEnum):
-    (
-        RATE_LIMITED,
-        QUOTA_EXHAUSTED,
-        MODEL_UNAVAILABLE,
-        CONTEXT_TOO_LARGE,
-        CAPABILITY_UNSUPPORTED,
-    )
-    (
-        TRANSIENT_NETWORK,
-        PROVIDER_UNAVAILABLE,
-        AUTH_FAILED,
-    )
-    TIMEOUT_UNKNOWN_OUTCOME, INVALID_REQUEST, POLICY_REJECTED, UNKNOWN
-
-
-PAIR_FALLBACK_ERRORS: frozenset[
-    ErrorClass
-]  # RATE_LIMITED, QUOTA_EXHAUSTED, MODEL_UNAVAILABLE, CONTEXT_TOO_LARGE, CAPABILITY_UNSUPPORTED, TRANSIENT_NETWORK
-PROVIDER_FALLBACK_ERRORS: frozenset[
-    ErrorClass
-]  # PROVIDER_UNAVAILABLE, AUTH_FAILED  (excludes every model of that provider)
-STOP_ERRORS: frozenset[
-    ErrorClass
-]  # TIMEOUT_UNKNOWN_OUTCOME, INVALID_REQUEST, POLICY_REJECTED, UNKNOWN
-# Together the three sets cover every ErrorClass member exactly once (add a test for this).
-
-
-@dataclass(frozen=True, slots=True)
-class ModelCapability:
-    provider: str
-    model: str
-    supports_tool_calling: bool = False
-    supports_structured_output: bool = False
-    supports_vision: bool = False
-    context_window: int | None = None
-    max_output_tokens: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class QuotaRecord:
-    provider: str
-    model: str | None  # None = applies to every model of the provider
-    window: str  # e.g. "minute", "hour", "day"
-    unit: QuotaUnit
-    confidence: QuotaConfidence
-    observed_at: datetime
-    source: str
-    limit: int | float | None = None
-    used: int | float | None = None
-    remaining: int | float | None = None  # unknown -> None, never 0 (T040)
-    reset_at: datetime | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderHealth:
-    provider: str
-    status: HealthStatus
-    checked_at: datetime
-    detail: str | None = None
-
-
-@runtime_checkable
-class ProviderAdapter(Protocol):
-    provider_id: str
-
-    async def health_check(self) -> ProviderHealth: ...
-    async def get_quota(self) -> list[QuotaRecord]: ...
-    async def list_models(self) -> list[ModelCapability]: ...
-    async def classify_error(self, error: Exception) -> ErrorClass: ...
-```
-
-### 4.1 `app/providers/fake.py`
-
-```python
-class FakeProviderError(Exception):
-    def __init__(self, error_class: ErrorClass, message: str = "") ...
-    error_class: ErrorClass
-
-class FakeProviderAdapter:
-    def __init__(self, provider_id: str, *, models: Sequence[ModelCapability] = (),
-                 quota: Sequence[QuotaRecord] = (), health: ProviderHealth | None = None) -> None
-    # health defaults to HEALTHY with checked_at=utcnow()
-    def set_models(self, models: Sequence[ModelCapability]) -> None
-    def set_quota(self, quota: Sequence[QuotaRecord]) -> None
-    def set_health(self, health: ProviderHealth) -> None
-    calls: list[str]   # appends the method name on every async call
-    # async methods return copies (new lists).
-    # classify_error returns e.error_class for FakeProviderError, else ErrorClass.UNKNOWN.
-```
-
-It must pass `isinstance(adapter, ProviderAdapter)`. It makes no network or I/O calls.
-
-## 5. Router (`app/router/`)
-
-### 5.1 `types.py`
-
-```python
-@dataclass(frozen=True, slots=True)
-class RequiredCapabilities:
-    tool_calling: bool = False
-    structured_output: bool = False
-    vision: bool = False
-    large_context: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class RouteRequest:
-    task_id: str
-    project_id: str
-    required_capabilities: RequiredCapabilities = RequiredCapabilities()
-    estimated_input_tokens: int = 0  # negative -> ValueError in __post_init__
-    estimated_output_tokens: int = 0  # negative -> ValueError
-    session_id: str | None = None
-    paid_approved: bool = False  # an explicit /approve for paid use exists for this task
-
-
-@dataclass(frozen=True, slots=True)
-class RouterState:
-    now: datetime  # aware
-    credentials_present: frozenset[str] = frozenset()  # provider names
-    capabilities: Mapping[tuple[str, str], ModelCapability] = {}  # (provider, model) -> capability
-    quota: Sequence[QuotaRecord] = ()
-    health: Mapping[str, HealthStatus] = {}  # provider -> status; missing = HEALTHY
-    cooldowns: Mapping[
-        tuple[str, str | None], datetime
-    ] = {}  # (provider, model|None) -> until; None = whole provider
-    paid_spend_today_usd: float = 0.0
-    paid_spend_month_usd: float = 0.0
-    # use field(default_factory=...) for the mapping defaults
-
-
-@dataclass(frozen=True, slots=True)
-class Candidate:
-    policy_id: str
-    provider: str
-    model: str
-    cost_class: CostClass
-    provider_rank: int  # index in routing.provider_order
-    model_rank: int  # index in policy.model_order
-
+class ProviderError(Exception):
+    def __init__(self, provider: str, error_class: ErrorClass, message: str, *,
+                 status_code: int | None = None, error_code: str | None = None,
+                 retry_after_s: float | None = None, request_id: str | None = None) -> None
+    # attributes of the same names; `message` is stored ALREADY REDACTED (caller passes through redactor) and truncated to 300 chars
     @property
-    def sort_key(self) -> tuple[int, int]:
-        return (self.provider_rank, self.model_rank)
-
-
-class SkipReason(StrEnum):
-    (
-        EXCLUDED_AFTER_FAILURE,
-        POLICY_DISABLED,
-        PROVIDER_DISABLED,
-        MISSING_CREDENTIAL,
-    )
-    (
-        PAID_BLOCKED_BY_MODE,
-        PROVIDER_DOWN,
-        COOLDOWN,
-        MODEL_UNKNOWN,
-        CAPABILITY_MISMATCH,
-    )
-    CONTEXT_TOO_SMALL, QUOTA_EXHAUSTED, QUOTA_INSUFFICIENT
-
-
-@dataclass(frozen=True, slots=True)
-class Skipped:
-    candidate: Candidate
-    reason: SkipReason
-
-
-class NoEligibleReason(StrEnum):
-    (
-        FREE_CAPACITY_EXHAUSTED,
-        PAID_BUDGET_EXHAUSTED,
-        MAX_FALLBACK_ATTEMPTS_REACHED,
-        NON_FALLBACK_ERROR,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class Selected:
-    candidate: Candidate
-    skipped: tuple[Skipped, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class NoEligibleProvider:
-    reason: NoEligibleReason
-    skipped: tuple[Skipped, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class PaidApprovalRequired:
-    candidates: tuple[Candidate, ...]  # eligible paid candidates in configured order (non-empty)
-    skipped: tuple[Skipped, ...]
-
-
-RouteDecision = Selected | NoEligibleProvider | PaidApprovalRequired
-
-
-@dataclass(frozen=True, slots=True)
-class FailedAttempt:
-    provider: str
-    model: str
-    error_class: ErrorClass
+    def retry_after_ms(self) -> int | None      # round(retry_after_s*1000) or None
+    __str__  -> f"{provider}: {error_class} status={status_code} code={error_code}: {message}"
+    __repr__ -> f"ProviderError(provider=..., error_class=..., status_code=..., error_code=...)"
+class MalformedResponseError(ProviderError)     # always error_class UNKNOWN
+class MissingCredentialError(ProviderError)     # always error_class AUTH_FAILED; message names the env var, never a value
 ```
+These errors never hold an `httpx.Request`, an `httpx.Response`, or any headers.
 
-### 5.2 `router.py`
+### 4.2 `app/providers/ratelimit.py`
+```python
+def parse_duration(value: str | None) -> float | None
+    # seconds. Plain non-negative number "12.5" -> 12.5. Go-style sequence of <num><unit>, units h|m|s|ms|us|µs,
+    # must consume the whole (stripped) string: "2m59.56s"->179.56, "7.66s"->7.66, "1h2m3s"->3723.0, "120ms"->0.12, "0s"->0.0.
+    # "", None, "abc", "-1s", "5x" -> None.
+def parse_number(value: str | None) -> int | float | None     # non-negative finite; int if integral text; else None
+def parse_retry_after(value: str | None, now: datetime) -> float | None
+    # delta-seconds (r"^\d+(\.\d+)?$") -> float; else HTTP-date via email.utils.parsedate_to_datetime
+    # (naive -> UTC), seconds = max(0, (dt - now).total_seconds()); anything invalid -> None
+def parse_rate_limit_headers(headers: Mapping[str, str], dimensions: Mapping[str, QuotaDimension], *,
+                             provider: str, model: str | None, now: datetime) -> list[QuotaRecord]
+```
+`parse_rate_limit_headers` rules:
+- Header lookup is case-insensitive.
+- For each `(suffix, dim)` in mapping order, read `x-ratelimit-limit-{suffix}`, `x-ratelimit-remaining-{suffix}` and `x-ratelimit-reset-{suffix}`.
+- If both limit and remaining fail to parse, emit no record for that dimension.
+- `confidence` is EXACT if remaining parsed, otherwise UNKNOWN.
+- `used = limit - remaining` only when both are known and `limit >= remaining`; otherwise `None`.
+- `reset_at = now + parse_duration(reset)` when it parses; otherwise `None`.
+- `window` and `unit` come from `DIMENSION_SPECS[dim]` (§6.1).
+- `source = f"{provider}:response-headers"`.
+
+### 4.3 `app/providers/http.py`: `HttpProviderAdapter` base class
 
 ```python
-def build_candidates(config: AppConfig) -> list[Candidate]
-def route(request: RouteRequest, config: AppConfig, state: RouterState, *,
-          excluded_pairs: frozenset[tuple[str, str]] = frozenset(),
-          excluded_providers: frozenset[str] = frozenset()) -> RouteDecision
-def next_after_failure(request: RouteRequest, attempts: Sequence[FailedAttempt],
-                       config: AppConfig, state: RouterState) -> RouteDecision
-```
-
-**`build_candidates`** iterates `for provider_rank, policy_id in enumerate(routing.provider_order)` and then `for model_rank, model in enumerate(policy.model_order)`. It yields one Candidate for each pair, including disabled policies and providers so that they show up in `skipped`. The output is already in sort-key order. **Never sort by anything other than `sort_key`.** Models not listed in config never become candidates.
-
-**`route`** evaluates each candidate in list order. The first failing check, in this exact order, gives that candidate's `SkipReason`:
-
-1. `(provider, model) in excluded_pairs` or `provider in excluded_providers` gives `EXCLUDED_AFTER_FAILURE`.
-2. `not policy.enabled` gives `POLICY_DISABLED`.
-3. `not providers[provider].enabled` gives `PROVIDER_DISABLED`.
-4. `provider not in state.credentials_present` gives `MISSING_CREDENTIAL`.
-5. `cost_class == PAID` and `mode != FREE_FIRST_PAID_AFTER_APPROVAL` gives `PAID_BLOCKED_BY_MODE`.
-6. `state.health.get(provider, HEALTHY) == DOWN` gives `PROVIDER_DOWN`.
-7. An active cooldown gives `COOLDOWN`. A cooldown is active when `cooldowns[(provider, None)]` or `cooldowns[(provider, model)]` is `> state.now`.
-8. `(provider, model) not in state.capabilities` gives `MODEL_UNKNOWN`.
-9. A required capability flag that is unsupported gives `CAPABILITY_MISMATCH`. For `large_context`, see Decision 8.
-10. Safety threshold failures give `CONTEXT_TOO_SMALL`:
-    - `context_window` is known and `est_in + est_out > context_window`, or
-    - `max_output_tokens` is known and `est_out > max_output_tokens`.
-11. Quota checks use the records that are applicable (`r.provider == provider and r.model in (None, model)`) and not expired (`r.reset_at is None or r.reset_at > now`). Process them in sequence order. The first record that triggers decides the reason:
-    - `EXHAUSTED` gives `QUOTA_EXHAUSTED`.
-    - `COOLDOWN` gives `COOLDOWN`.
-    - `EXACT` or `ESTIMATED` with `remaining is not None`:
-      - `REQUESTS` and `remaining < 1` gives `QUOTA_EXHAUSTED`.
-      - `TOKENS` and `remaining < est_in + est_out` gives `QUOTA_INSUFFICIENT`.
-      - `USD` is ignored.
-    - `UNKNOWN` never filters.
-
-After evaluating all candidates:
-
-- If any FREE candidate is eligible, return `Selected(first eligible FREE)`.
-- Otherwise, if no PAID candidate is eligible, return `NoEligibleProvider(FREE_CAPACITY_EXHAUSTED)`.
-- Otherwise (paid eligible, which implies the paid-after-approval mode), check the budget. If `daily_paid_budget_usd - paid_spend_today_usd <= 0`, or the monthly cap is set and `monthly - paid_spend_month_usd <= 0`, return `NoEligibleProvider(PAID_BUDGET_EXHAUSTED)`.
-- Otherwise, if `request.paid_approved` or `not routing.paid_requires_approval`, return `Selected(first eligible PAID)`.
-- Otherwise return `PaidApprovalRequired(all eligible PAID, in order)`.
-
-`skipped` always lists every skipped candidate in candidate order. Eligible-but-not-chosen candidates are not listed.
-
-**`next_after_failure`**:
-
-1. If `attempts` is empty, raise `ValueError`.
-2. If `attempts[-1].error_class in STOP_ERRORS`, return `NoEligibleProvider(NON_FALLBACK_ERROR, skipped=())`.
-3. If `len(attempts) >= routing.max_fallback_attempts`, return `NoEligibleProvider(MAX_FALLBACK_ATTEMPTS_REACHED, skipped=())`.
-4. Set `excluded_pairs = {(a.provider, a.model) for a in attempts}` and `excluded_providers = {a.provider for a in attempts if a.error_class in PROVIDER_FALLBACK_ERRORS}`. Return `route(..., excluded_pairs=..., excluded_providers=...)`.
-
-The same allowlist and paid gate therefore apply to fallback. FREE never crosses silently to PAID because paid candidates still go through the budget and approval gate.
-
-### 5.3 `policy.py`
-
-```python
-class ModelRoutingStatus(StrEnum): ALLOWED = "ALLOWED"; DISCOVERED_ONLY = "DISCOVERED_ONLY"
-
-@dataclass(frozen=True, slots=True)
-class ModelListing:
-    provider: str
-    model: str
-    status: ModelRoutingStatus
-    policy_id: str | None     # None for DISCOVERED_ONLY
-    rank: int | None          # model_order index; None for DISCOVERED_ONLY
-
-def is_allowlisted(config: AppConfig, provider: str, model: str) -> bool
-    # True if any policy for this provider lists the model (regardless of enabled flags)
-def model_listing(config: AppConfig, provider: str, discovered: Iterable[str]) -> list[ModelListing]
-    # First: ALLOWED entries for every policy of `provider`, policies in provider_order order and then
-    #        policies not in provider_order in dict order, models in model_order order (listed even if not discovered).
-    # Then: discovered models not allowlisted, de-duplicated, sorted alphabetically, as DISCOVERED_ONLY.
-```
-
-`app/router/__init__.py` re-exports `route`, `next_after_failure`, `build_candidates`, and all types.
-
-## 6. Task state machine (`app/orchestrator/state_machine.py`)
-
-```python
-class TaskStatus(StrEnum): QUEUED, ROUTING, RUNNING, WAITING_APPROVAL, SUCCEEDED, FAILED, CANCELLED
-TERMINAL_STATUSES: frozenset[TaskStatus] = {SUCCEEDED, FAILED, CANCELLED}
-ALLOWED_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
-    QUEUED:           {ROUTING, CANCELLED},
-    ROUTING:          {RUNNING, WAITING_APPROVAL, FAILED, CANCELLED},
-    RUNNING:          {ROUTING, WAITING_APPROVAL, SUCCEEDED, FAILED, CANCELLED},   # RUNNING->ROUTING = request-time fallback
-    WAITING_APPROVAL: {RUNNING, ROUTING, FAILED, CANCELLED},
-    SUCCEEDED: frozenset(), FAILED: frozenset(), CANCELLED: frozenset(),
+COMMON_STATUS_MAP: Mapping[int, ErrorClass] = {
+    400: INVALID_REQUEST, 401: AUTH_FAILED, 403: AUTH_FAILED, 404: MODEL_UNAVAILABLE,
+    408: TRANSIENT_NETWORK, 413: CONTEXT_TOO_LARGE, 422: INVALID_REQUEST, 429: RATE_LIMITED,
+    500: PROVIDER_UNAVAILABLE, 502: PROVIDER_UNAVAILABLE, 503: PROVIDER_UNAVAILABLE,
+    504: TIMEOUT_UNKNOWN_OUTCOME,
 }
-class InvalidTransition(Exception):  # attributes: from_status, to_status
-def can_transition(current: TaskStatus, target: TaskStatus) -> bool
-def ensure_transition(current: TaskStatus, target: TaskStatus) -> None   # raises InvalidTransition
+# other 4xx -> INVALID_REQUEST; other 5xx -> PROVIDER_UNAVAILABLE; anything else -> UNKNOWN
+OPENAI_COMPAT_CODE_MAP: Mapping[str, ErrorClass] = {
+    "context_length_exceeded": CONTEXT_TOO_LARGE, "model_not_found": MODEL_UNAVAILABLE,
+    "rate_limit_exceeded": RATE_LIMITED, "insufficient_quota": QUOTA_EXHAUSTED,
+    "invalid_api_key": AUTH_FAILED,
+}
+REQUEST_ID_HEADERS = ("x-request-id", "request-id")
+
+def classify_status(status: int) -> ErrorClass   # COMMON_STATUS_MAP + fallbacks above
+def classify_transport_error(e: BaseException) -> ErrorClass   # check in this order:
+    # httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout, httpx.ProxyError -> TRANSIENT_NETWORK
+    # httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError,
+    #   builtin TimeoutError -> TIMEOUT_UNKNOWN_OUTCOME   (request may have been processed)
+    # anything else -> UNKNOWN
+def apply_metadata(cap: ModelCapability, meta: ModelMetadataConfig | None) -> ModelCapability
+    # non-None config values override; returns cap unchanged if meta is None
+
+class HttpProviderAdapter:
+    DEFAULT_BASE_URL: ClassVar[str]
+    HEALTH_PATH: ClassVar[str]                     # relative, e.g. "models"
+    HEALTH_PARAMS: ClassVar[Mapping[str, str]] = {}
+    ERROR_CODE_MAP: ClassVar[Mapping[str, ErrorClass]] = {}   # keys lowercase; matched on lowercased code
+    STATUS_OVERRIDES: ClassVar[Mapping[int, ErrorClass]] = {}
+
+    def __init__(self, provider_id: str, config: ProviderConfig, *,
+                 transport: httpx.AsyncBaseTransport | None = None,
+                 environ: Mapping[str, str] | None = None,
+                 clock: Callable[[], datetime] = utcnow,
+                 redactor: SecretRedactor | None = None) -> None
+    def __repr__(self) -> str      # f"{type(self).__name__}(provider_id=..., base_url=...)"; never the key
+    async def aclose(self) -> None; async def __aenter__/__aexit__
+    async def health_check(self) -> ProviderHealth           # NEVER raises
+    async def classify_error(self, error: Exception) -> ErrorClass   # NEVER raises
+    def error_from_response(self, response: httpx.Response) -> ProviderError
+    # subclass hooks:
+    def _auth_headers(self, api_key: str) -> dict[str, str]
+    def _parse_error_body(self, body: object) -> tuple[str | None, str, float | None]  # (code, message, retry_after_from_body); default = OpenAI-compatible (A10), retry None
+    async def _get_json(self, path: str, params: Mapping[str, str | int] | None = None) -> tuple[object, httpx.Response]
+```
+Behavior:
+- **Client.** The `httpx.AsyncClient` is created lazily on first use with these settings:
+  - `base_url=config.base_url or DEFAULT_BASE_URL`
+  - `timeout=httpx.Timeout(config.timeout_s)`
+  - `transport=transport`
+  - `follow_redirects=False`
+
+  Auth headers are passed **per request**, not as client defaults. `aclose` closes the client if one was created.
+- **`_get_json` steps.**
+  1. Call `resolve_secret`. If it returns None, raise `MissingCredentialError(message=f"credential missing: env {api_key_env}")`.
+  2. Send the GET. Catch `httpx.HTTPError` (transport) and raise `ProviderError(classify_transport_error(e), f"network: {type(e).__name__}") from None`. `from None` is mandatory so no request object with headers survives in `__cause__`/`__context__`.
+  3. A non-2xx response raises `error_from_response(resp)`.
+  4. On 2xx, `resp.json()`. A `ValueError` raises `MalformedResponseError` (`from None`).
+  5. Log one DEBUG line: `provider=<id> GET <path> status=<n>`. Never log headers or the body.
+- **`error_from_response` steps.**
+  1. Try `resp.json()`. On failure the body is `None`.
+  2. Get `(code, message, body_retry)` from `_parse_error_body`. A non-dict body gives `(None, "HTTP <status>", None)`.
+  3. Set `retry_after_s = parse_retry_after(resp.headers.get("retry-after"), clock())`; if that is None, use `body_retry`.
+  4. Set `request_id` to the first of `REQUEST_ID_HEADERS` present.
+  5. Classify. Precedence: `ERROR_CODE_MAP[code.lower()]` (if the code is present and mapped), then `STATUS_OVERRIDES[status]`, then `classify_status(status)`.
+  6. Redact the message: run it through `redactor.redact()` (if one is given), then also `.replace(api_key, REDACTED)` using the currently resolved key, then truncate to 300 chars.
+- **`classify_error(error)`.**
+  - `ProviderError` returns `error.error_class`.
+  - `httpx.HTTPStatusError` returns `error_from_response(error.response).error_class`.
+  - `httpx.HTTPError` or `TimeoutError` returns `classify_transport_error`.
+  - Everything else returns `UNKNOWN`.
+  - Any exception inside classification itself returns `UNKNOWN`.
+- **`health_check()`.** Calls `_get_json(HEALTH_PATH, HEALTH_PARAMS)`.
+  - Status mapping:
+    - 2xx with a dict body: HEALTHY, detail `"ok"`.
+    - `MissingCredentialError`: DOWN, `"credential missing: env <NAME>"`.
+    - `ProviderError` with AUTH_FAILED: DOWN, `"HTTP <status>"`.
+    - PROVIDER_UNAVAILABLE, TRANSIENT_NETWORK or TIMEOUT_UNKNOWN_OUTCOME: DOWN.
+    - RATE_LIMITED, QUOTA_EXHAUSTED, `MalformedResponseError` or a non-dict body: DEGRADED.
+    - Any other `ProviderError`: DEGRADED.
+    - Any other `Exception`: DOWN, detail `f"error: {type(e).__name__}"`.
+  - `checked_at=clock()`.
+  - Details never contain bodies or keys.
+
+### 4.4 Adapters
+
+Each one subclasses `HttpProviderAdapter`, and its constructor defaults `provider_id` to the name below (signature `(config, *, provider_id=<name>, transport=None, environ=None, clock=utcnow, redactor=None)`). All four must satisfy `isinstance(a, ProviderAdapter)`.
+- **Shape errors.** In `list_models`, a wrong top-level shape raises `MalformedResponseError`. Individual items that are not dicts, or lack a str `id`/`name`, are skipped.
+- **Numbers.** Numeric fields are accepted only as an `int > 0` that is not a `bool`; anything else becomes `None`.
+- **Metadata.** Every discovered capability is passed through `apply_metadata(cap, config.models.get(model_id))`.
+- **Allowlist.** `list_models` returns **all** discovered models, both allowlisted and not. The allowlist is applied downstream (§7).
+
+| Adapter (file) | provider_id | HEALTH_PATH | list_models | get_quota | Error specifics |
+|---|---|---|---|---|---|
+| `OpenRouterAdapter` (`openrouter.py`) | `openrouter` | `key` | `GET models` (A4) | `GET key`. If `limit` is a number: one record `(model=None, window="total", unit=USD, confidence=EXACT, limit, used=usage, remaining=limit_remaining, source="openrouter:key")`. If `limit` is null: one record with confidence UNKNOWN, `limit=None, remaining=None, used=usage`. If `data` is not a dict: `MalformedResponseError`. | `STATUS_OVERRIDES = {402: QUOTA_EXHAUSTED, 403: POLICY_REJECTED}`; `ERROR_CODE_MAP = {}`. OpenRouter codes are numeric, so status drives classification. |
+| `GeminiAdapter` (`gemini.py`) | `gemini` | `models` with `HEALTH_PARAMS={"pageSize": "1"}` | paginated per A5 (`GEMINI_MAX_PAGES = 10`; log WARNING if truncated) | returns `[]` and sends no request (no authoritative source, A5) | `_parse_error_body` per A6. If any details item has reason `API_KEY_INVALID`, return code `"API_KEY_INVALID"`; otherwise the code is `status`. `ERROR_CODE_MAP = {"api_key_invalid": AUTH_FAILED, "resource_exhausted": RATE_LIMITED, "unauthenticated": AUTH_FAILED, "permission_denied": AUTH_FAILED, "not_found": MODEL_UNAVAILABLE, "invalid_argument": INVALID_REQUEST, "unavailable": PROVIDER_UNAVAILABLE, "internal": PROVIDER_UNAVAILABLE, "deadline_exceeded": TIMEOUT_UNKNOWN_OUTCOME}`. |
+| `CerebrasAdapter` (`cerebras.py`) | `cerebras` | `models` | `GET models`. Items are `{"id"}` only, so capability flags default to False/None before config metadata is applied. | `GET models`, then `parse_rate_limit_headers(resp.headers, CEREBRAS_HEADER_DIMENSIONS, model=None)` (A8/A9). Absent headers give `[]`. | `ERROR_CODE_MAP = OPENAI_COMPAT_CODE_MAP` |
+| `GroqAdapter` (`groq.py`) | `groq` | `models` | `GET models`. Read `context_window` and `max_completion_tokens` when present. Skip items with `"active": false`. | same as Cerebras, with `GROQ_HEADER_DIMENSIONS` (A7) | `ERROR_CODE_MAP = OPENAI_COMPAT_CODE_MAP` |
+
+`CEREBRAS_HEADER_DIMENSIONS = {"requests-day": REQUESTS_PER_DAY, "tokens-minute": TOKENS_PER_MINUTE}`.
+`GROQ_HEADER_DIMENSIONS = {"requests": REQUESTS_PER_DAY, "tokens": TOKENS_PER_MINUTE}`.
+
+### 4.5 `app/providers/registry.py`
+```python
+ADAPTER_TYPES: Mapping[str, type[HttpProviderAdapter]] = {"openrouter": ..., "gemini": ..., "cerebras": ..., "groq": ...}
+def build_adapters(config: AppConfig, *, transport=None, environ=None, clock=utcnow,
+                   redactor: SecretRedactor | None = None) -> dict[str, HttpProviderAdapter]
+    # one adapter per ENABLED config.providers key that is in ADAPTER_TYPES, in config order;
+    # unknown provider keys: logger.warning("no adapter for provider %s") and skip
 ```
 
-Same-state transitions (for example `RUNNING -> RUNNING`) are invalid. Wrap the mapping in `types.MappingProxyType`.
-
-## 7. Database (`app/db/`)
-
-### 7.1 `connection.py`
+## 5. Cooldowns (`app/quota/cooldown.py`)
 
 ```python
-def open_database(path: str | os.PathLike[str], *, busy_timeout_ms: int = 5000) -> sqlite3.Connection
-@contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]
-    # "BEGIN IMMEDIATE"; COMMIT on success; ROLLBACK on exception and re-raise
-def db_size_bytes(conn: sqlite3.Connection) -> int   # PRAGMA page_count * PRAGMA page_size
+class CooldownManager:
+    def __init__(self, config: CooldownConfig, *, clock: Callable[[], datetime] = utcnow) -> None
+    def record_failure(self, provider: str, model: str | None, error_class: ErrorClass, *,
+                       retry_after_s: float | None = None, now: datetime | None = None) -> datetime | None
+    def record_success(self, provider: str, *, now: datetime | None = None) -> None
+    def set_cooldown(self, provider: str, model: str | None, until: datetime) -> None
+    def active(self, now: datetime | None = None) -> dict[tuple[str, str | None], datetime]
+    def is_cooling(self, provider: str, model: str | None, now: datetime | None = None) -> bool
 ```
+`now` defaults to `clock()` in every method.
 
-`open_database` behavior:
+Rules for `record_failure`. It returns the `until` it applied, or None if it applied none.
+- **`retry_after_s`.** A None or non-finite value means "not given".
+- **Duration.** `d = min(max(d, 0), max_cooldown_s)`. If `d == 0`, apply no cooldown and return None. `until = now + timedelta(seconds=d)`.
+- **Scope by error class.**
+  - `RATE_LIMITED` or `QUOTA_EXHAUSTED`: key `(provider, model)`, or `(provider, None)` if model is None. Duration is `retry_after_s` if given, else `rate_limit_default_s`.
+  - `PROVIDER_UNAVAILABLE`: key `(provider, None)`. Duration is `retry_after_s` if given, else `provider_unavailable_s`.
+  - `TRANSIENT_NETWORK` or `TIMEOUT_UNKNOWN_OUTCOME`:
+    1. Append `now` to the provider's failure deque (`deque(maxlen=network_failure_threshold)`).
+    2. Drop entries `<= now - network_failure_window_s`.
+    3. If the count is `>= threshold`, apply key `(provider, None)` for `retry_after_s` if given, else `network_failure_cooldown_s`, then clear the deque.
+    4. Otherwise return None.
+  - Every other class returns None and changes nothing.
+- **`set_cooldown` and every apply.** Keep the **later** of the existing and new `until`. The return value is the `until` stored after this rule.
+- **Logging.** Log INFO `cooldown provider=.. model=.. until=<iso> reason=<class>`.
 
-- Create the parent directories.
-- Call `sqlite3.connect(str(path), timeout=busy_timeout_ms/1000, isolation_level=None)` (autocommit, explicit transactions).
-- Set `row_factory = sqlite3.Row`.
-- Run these PRAGMAs: `journal_mode=WAL` (assert the returned value is `"wal"`, otherwise raise `RuntimeError`), `busy_timeout=<ms>`, `foreign_keys=ON`, `synchronous=NORMAL`.
-- Do **not** run migrations here.
+Other methods:
+- `record_success` clears that provider's network-failure deque. It does not lift active cooldowns.
+- `active` returns a copy containing only entries with `until > now`, and deletes expired entries. This is how expiry happens automatically.
+- `is_cooling` is True if `(provider, None)` or `(provider, model)` is active.
+- State is in-memory only; persistence across restarts is deferred.
 
-### 7.2 `migrations.py`
+## 6. Quota normalization, persistence, usage, estimation
 
+### 6.1 `app/quota/normalize.py`
 ```python
-@dataclass(frozen=True, slots=True)
-class Migration:
-    version: int
-    statements: tuple[str, ...]
-
-MIGRATIONS: tuple[Migration, ...]       # versions 1..N strictly increasing; this slice ships version 1 only
-LATEST_VERSION: int
-class SchemaTooNewError(RuntimeError): ...
-def current_version(conn) -> int         # 0 if the schema_version table does not exist
-def migrate(conn) -> int                 # returns the version after migrating
+WINDOW_SECONDS: Mapping[str, int] = {"minute": 60, "hour": 3600, "day": 86400}
+DIMENSION_SPECS: Mapping[QuotaDimension, tuple[str, QuotaUnit]]   # rpm->("minute",REQUESTS) ... tpd->("day",TOKENS), SPEND_USD->("total",USD)
+ESTIMATE_SOURCE_PREFIX = "estimate:"
+CONFIG_SOURCE_PREFIX = "config:"
+def dimension_of(record: QuotaRecord) -> QuotaDimension | None
+def validate_record(record: QuotaRecord) -> None   # raises ValueError
+def normalize(records: Iterable[QuotaRecord]) -> dict[tuple[str, str | None], dict[QuotaDimension, QuotaRecord | None]]
 ```
+`validate_record` raises `ValueError` for any of these:
+- `limit`, `used` or `remaining` is a bool, non-finite, or negative.
+- `source` is empty.
+- `observed_at` or `reset_at` is naive.
+- Confidence is EXACT or ESTIMATED and `remaining is None`.
+- Confidence is EXACT and the source starts with `ESTIMATE_SOURCE_PREFIX` or `CONFIG_SOURCE_PREFIX`. This guarantees an estimate can never be labelled EXACT.
 
-`migrate` behavior:
+`normalize` rules:
+- Every key `(provider, model)` gets **all 7 dimensions**. Missing dimensions are `None`, never 0.
+- Records with an unrecognised `(window, unit)` are dropped.
+- If several records share a dimension, keep the one with the greatest `observed_at`. On a tie, the later one in the input wins.
 
-- `CREATE TABLE IF NOT EXISTS schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`.
-- If the current version is greater than `LATEST_VERSION`, raise `SchemaTooNewError`.
-- Apply each pending migration in its own `transaction()`, executing each statement with `conn.execute` and then inserting its `schema_version` row.
-- **Never use `executescript`.** It issues an implicit COMMIT and breaks atomicity.
-- Running it twice is a no-op.
-
-Migration 1 statements are the exact table set below. Use `TEXT` for ids and timestamps.
-
-```sql
-CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, working_directory TEXT NOT NULL,
-  git_remote TEXT, policy_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)
-
-CREATE TABLE sessions (id TEXT PRIMARY KEY, opencode_session_id TEXT, project_id TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('OPEN','CLOSED')),
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, closed_at TEXT)
-
-CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
-  session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
-  discord_guild_id TEXT, discord_channel_id TEXT, discord_user_id TEXT NOT NULL, prompt TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('QUEUED','ROUTING','RUNNING','WAITING_APPROVAL','SUCCEEDED','FAILED','CANCELLED')),
-  selected_provider TEXT, selected_model TEXT,
-  cost_class TEXT CHECK (cost_class IS NULL OR cost_class IN ('FREE','PAID')),
-  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, last_event_at TEXT NOT NULL,
-  exit_code INTEGER, error_class TEXT)
-CREATE INDEX idx_tasks_status ON tasks(status)
-CREATE INDEX idx_tasks_finished_at ON tasks(finished_at)
-CREATE INDEX idx_tasks_session_id ON tasks(session_id)
-
-CREATE TABLE provider_credentials_metadata (provider TEXT PRIMARY KEY, api_key_env TEXT NOT NULL,
-  present INTEGER NOT NULL CHECK (present IN (0,1)), last_checked_at TEXT, last_auth_failure_at TEXT)
-
-CREATE TABLE provider_models (provider TEXT NOT NULL, model TEXT NOT NULL,
-  routing_status TEXT NOT NULL CHECK (routing_status IN ('ALLOWED','DISCOVERED_ONLY')),
-  supports_tool_calling INTEGER, supports_structured_output INTEGER, supports_vision INTEGER,
-  context_window INTEGER, max_output_tokens INTEGER,
-  discovered_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (provider, model))
-
-CREATE TABLE provider_model_policy (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT NOT NULL,
-  priority INTEGER NOT NULL, enabled INTEGER NOT NULL CHECK (enabled IN (0,1)),
-  cost_class TEXT NOT NULL CHECK (cost_class IN ('FREE','PAID')),
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE (provider, model))
-
-CREATE TABLE quota_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT,
-  quota_window TEXT NOT NULL, limit_value NUMERIC, used NUMERIC, remaining NUMERIC,
-  unit TEXT NOT NULL CHECK (unit IN ('REQUESTS','TOKENS','USD')),
-  confidence TEXT NOT NULL CHECK (confidence IN ('EXACT','ESTIMATED','UNKNOWN','EXHAUSTED','COOLDOWN')),
-  reset_at TEXT, observed_at TEXT NOT NULL, source TEXT NOT NULL)
-CREATE INDEX idx_quota_snapshots_observed_at ON quota_snapshots(observed_at)
-
-CREATE TABLE provider_events (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, model TEXT,
-  task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL, event_type TEXT NOT NULL,
-  http_status INTEGER, error_class TEXT, detail TEXT, created_at TEXT NOT NULL)
-CREATE INDEX idx_provider_events_created_at ON provider_events(created_at)
-
-CREATE TABLE approvals (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  session_id TEXT, discord_user_id TEXT, action_type TEXT NOT NULL, action_payload_hash TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('PENDING','APPROVED','DENIED','EXPIRED')),
-  requested_at TEXT NOT NULL, expires_at TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT)
-
-CREATE TABLE usage_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE, provider TEXT NOT NULL, model TEXT NOT NULL,
-  request_id TEXT, input_tokens INTEGER, output_tokens INTEGER, estimated_cost_usd REAL,
-  cost_class TEXT NOT NULL CHECK (cost_class IN ('FREE','PAID')), status TEXT NOT NULL, occurred_at TEXT NOT NULL)
-CREATE INDEX idx_usage_events_occurred_at ON usage_events(occurred_at)
-
-CREATE TABLE fallback_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, session_id TEXT,
-  attempt_no INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
-  error_class TEXT, http_status INTEGER, retry_after_ms INTEGER, started_at TEXT NOT NULL, finished_at TEXT,
-  quota_snapshot_id INTEGER REFERENCES quota_snapshots(id) ON DELETE SET NULL, UNIQUE (task_id, attempt_no))
-CREATE INDEX idx_fallback_attempts_started_at ON fallback_attempts(started_at)
-```
-
-No table has a column for raw API keys.
-
-### 7.3 `tasks.py`
-
+### 6.2 `app/db/quota.py`
 ```python
-@dataclass(frozen=True, slots=True)
-class TaskRecord:
-    id: str; project_id: str; session_id: str | None
-    discord_guild_id: str | None; discord_channel_id: str | None; discord_user_id: str
-    prompt: str; status: TaskStatus
-    selected_provider: str | None; selected_model: str | None; cost_class: CostClass | None
-    created_at: datetime; started_at: datetime | None; finished_at: datetime | None; last_event_at: datetime
-    exit_code: int | None; error_class: str | None
-
-class TaskNotFound(LookupError): ...
-class ConcurrentTransition(RuntimeError): ...
-
-class TaskRepository:
-    def __init__(self, conn: sqlite3.Connection) -> None
-    def create(self, *, project_id: str, prompt: str, discord_user_id: str,
-               discord_guild_id: str | None = None, discord_channel_id: str | None = None,
-               session_id: str | None = None, task_id: str | None = None,
-               now: datetime | None = None) -> TaskRecord
-        # id defaults to str(uuid.uuid4()); status QUEUED; created_at = last_event_at = now
-    def get(self, task_id: str) -> TaskRecord | None
-    def transition(self, task_id: str, target: TaskStatus, *, now: datetime | None = None,
-                   error_class: str | None = None, exit_code: int | None = None) -> TaskRecord
-    def list_unfinished(self) -> list[TaskRecord]   # non-terminal statuses, ordered by created_at, id
+class QuotaSnapshotRepository:
+    def __init__(self, conn) -> None
+    def insert(self, record: QuotaRecord) -> int                  # validate_record first; returns rowid
+    def insert_many(self, records: Sequence[QuotaRecord]) -> list[int]   # validate all first, then one transaction; all-or-nothing
+    def latest(self, now: datetime) -> list[QuotaRecord]
 ```
+- Field mapping to the existing migration-1 table: `QuotaRecord.limit` maps to `limit_value` and `QuotaRecord.window` to `quota_window`. All other fields map to columns of the same name. **No schema change.**
+- `latest` returns the newest row per `(provider, COALESCE(model,''), quota_window, unit)`, ordered by `observed_at`, then `id`. It excludes rows with `reset_at IS NOT NULL AND reset_at <= to_db(now)`. Results are ordered by provider, model (NULL first), quota_window, unit.
+- NUMERIC values come back as int or float, unchanged.
 
-`transition` runs inside `transaction()` and does the following:
-
-1. Read the current row. If it is missing, raise `TaskNotFound`.
-2. Call `ensure_transition(current, target)`, which raises `InvalidTransition` and leaves the row unchanged.
-3. Run `UPDATE ... WHERE id=? AND status=<current>`. If rowcount is 0, raise `ConcurrentTransition`.
-4. Always set `last_event_at=now`.
-5. When entering RUNNING, set `started_at` only if it is NULL.
-6. When entering a terminal status, set `finished_at=now`.
-7. If `error_class` or `exit_code` is given, set it. Otherwise leave it unchanged.
-8. Return the fresh record.
-
-`now` defaults to `utcnow()`. Naive datetimes raise `ValueError` via `to_db`. Discord IDs are stored as TEXT.
-
-### 7.4 `retention.py`
-
+### 6.3 `app/db/usage.py`
 ```python
-RETENTION_DAYS_DEFAULT = 60
-@dataclass(frozen=True, slots=True)
-class CleanupResult:
-    cutoff: datetime
-    deleted: dict[str, int]      # keys: usage_events, provider_events, fallback_attempts, quota_snapshots, tasks, sessions
-    db_size_bytes: int
-def run_retention_cleanup(conn, *, now: datetime | None = None, retention_days: int = 60,
-                          batch_size: int = 500, checkpoint: bool = True) -> CleanupResult
-def run_vacuum(conn) -> None     # executes VACUUM; never called by cleanup or the daemon in this slice
-```
-
-`run_retention_cleanup` rules:
-
-- Compute `cutoff = (now or utcnow()) - timedelta(days=retention_days)` **once**. Every statement in the run uses this same `to_db(cutoff)` value.
-- A **protected task** is any task whose status is not terminal, or whose `session_id` points to a session with `status='OPEN'`. Define one SQL fragment and reuse it:
-  ```sql
-  SELECT t.id FROM tasks t LEFT JOIN sessions s ON s.id = t.session_id
-  WHERE t.status NOT IN ('SUCCEEDED','FAILED','CANCELLED') OR s.status = 'OPEN'
-  ```
-- Process the tables in this order. Each one uses a batched loop: `DELETE FROM <t> WHERE id IN (SELECT id FROM <t> WHERE <cond> LIMIT :batch)`. Each batch runs in its own `transaction()`. Repeat until a batch deletes fewer than `batch_size` rows. The totals are the sum of the batches.
-  1. `usage_events`: `occurred_at < cutoff AND (task_id IS NULL OR task_id NOT IN (protected))`
-  2. `provider_events`: `created_at < cutoff AND (task_id IS NULL OR task_id NOT IN (protected))`
-  3. `fallback_attempts`: `started_at < cutoff AND task_id NOT IN (protected)`
-  4. `quota_snapshots`: `observed_at < cutoff`. Referencing attempts get NULL through the FK.
-  5. `tasks`: terminal status, `COALESCE(finished_at, created_at) < cutoff`, and the session is NULL or not OPEN. Approvals, usage events, and fallback attempts cascade. Provider events are set to NULL.
-  6. `sessions`: `status='CLOSED' AND COALESCE(closed_at, updated_at) < cutoff AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.session_id = sessions.id)`
-- If `checkpoint` is true and the total deleted is greater than 0, run `PRAGMA wal_checkpoint(TRUNCATE)` outside any transaction.
-- Never VACUUM here.
-- `db_size_bytes` comes from `connection.db_size_bytes(conn)`.
-- The function is idempotent: a second run with the same `now` deletes 0 rows from every table.
-- Validate `retention_days >= 1` and `batch_size >= 1`, raising `ValueError` otherwise.
-
-## 8. Runtime (`app/runtime/`)
-
-### 8.1 `interfaces.py` (stubs only, no Discord or OpenCode code)
-
-```python
-class ChatFrontend(Protocol):            # future Discord bot
-    async def start(self, controller: "AgentController") -> None: ...
-    async def stop(self) -> None: ...
-class NullFrontend:                      # logs "frontend disabled" on start; no-ops otherwise
+class UsageStatus(StrEnum): SUCCESS = "success"; ERROR = "error"; UNKNOWN_OUTCOME = "unknown_outcome"
 
 @dataclass(frozen=True, slots=True)
-class ExecutionResult:
-    exit_code: int | None
-    error_class: ErrorClass | None
-class AgentExecutor(Protocol):           # future OpenCode executor; not wired in this slice
-    async def run(self, *, task_id: str, provider: str, model: str, prompt: str,
-                  session_id: str | None) -> ExecutionResult: ...
-```
-
-### 8.2 `daemon.py`
-
-```python
-@dataclass(frozen=True, slots=True)
-class TaskSubmission:
-    project_id: str
-    prompt: str
-    discord_user_id: str
-    discord_guild_id: str | None = None
-    discord_channel_id: str | None = None
+class UsageEvent:
+    provider: str; model: str; cost_class: CostClass; status: UsageStatus; occurred_at: datetime
+    task_id: str | None = None; request_id: str | None = None
+    input_tokens: int | None = None; output_tokens: int | None = None; estimated_cost_usd: float | None = None
 
 @dataclass(frozen=True, slots=True)
-class ControllerEvent:
-    name: str
-    at: datetime
-    task_id: str | None = None
-    fields: Mapping[str, str | int | float | bool | None] = field(default_factory=dict)
+class UsageTotals:
+    requests: int; input_tokens: int; output_tokens: int
+    events_missing_tokens: int        # events where input_tokens IS NULL OR output_tokens IS NULL
+    earliest: datetime | None
 
-TaskHandler = Callable[["AgentController", TaskSubmission], Awaitable[None]]
+@dataclass(frozen=True, slots=True)
+class PaidSpend:
+    total_usd: float; missing_cost_events: int
 
-class AgentController:
-    def __init__(self, config: AppConfig, *, frontend: ChatFrontend | None = None,
-                 task_handler: TaskHandler | None = None,
-                 clock: Callable[[], datetime] = utcnow) -> None
-    conn: sqlite3.Connection | None   # set by start()
-    async def start(self) -> None
-    async def stop(self) -> None
-    async def run_forever(self) -> None
-    async def run_once(self) -> None
-    def request_stop(self) -> None
-    def submit_task(self, submission: TaskSubmission) -> bool
-    def emit(self, event: ControllerEvent) -> bool
-    async def run_cleanup_now(self) -> CleanupResult
-    def metrics(self) -> dict[str, int | str | None]
+class UsageRepository:
+    def __init__(self, conn) -> None
+    def record(self, event: UsageEvent) -> int
+    def totals(self, provider: str, *, model: str | None = None, since: datetime, until: datetime) -> UsageTotals
+    def paid_spend(self, *, since: datetime, until: datetime) -> PaidSpend
+    def daily_totals(self, now: datetime) -> list[tuple[str, str, UsageTotals]]   # (provider, model, totals) since UTC midnight, ordered by provider, model
 ```
+- **`record` validation.** Raise `ValueError` for any of these:
+  - token counts that are not None and not a non-negative int, or that are bools;
+  - a cost that is not None and not finite and `>= 0`;
+  - `cost_class == PAID` with `estimated_cost_usd is None`, because unknown paid cost is refused at write time;
+  - an empty provider or model;
+  - a naive `occurred_at`.
+- **`record` write.** Writes inside `transaction()`. A `task_id` that is not None must reference an existing task (FK); the `sqlite3.IntegrityError` propagates.
+- **Windows.** Both `totals` and `paid_spend` use the inclusive range `since <= occurred_at <= until`.
+- **`totals`.** `model=None` sums all models of the provider. `requests = COUNT(*)` (A13). Token sums treat NULL as 0.
+- **`paid_spend`.** `total_usd = SUM(estimated_cost_usd)` over `cost_class='PAID'`, using `COALESCE(..., 0.0)`. `missing_cost_events` counts PAID rows with NULL cost.
 
-`AgentController` behavior:
+### 6.4 `app/quota/estimator.py`
+```python
+ESTIMATE_SOURCE = "estimate:config-limit-minus-usage"
+def estimate_quota(config: AppConfig, usage: UsageRepository, now: datetime, *,
+                   exact: Sequence[QuotaRecord] = ()) -> list[QuotaRecord]
+```
+For each **enabled** provider (in config order) and each of its `limits` (in list order):
+1. Get `(window, unit)` from `DIMENSION_SPECS`. Skip this limit if `exact` contains a record with confidence EXACT for the same `(provider, model, window, unit)` and `reset_at is None or reset_at > now`.
+2. Compute `t = usage.totals(provider, model=lim.model, since=now - WINDOW_SECONDS[window], until=now)`.
+3. For REQUESTS: `used = t.requests`. For TOKENS: if `t.events_missing_tokens > 0`, emit a record with confidence **UNKNOWN**, `limit=lim.limit`, `used=None` and `remaining=None`, because missing token counts mean the number would be invented. Otherwise `used = input + output`.
+4. Set `remaining = max(lim.limit - used, 0)`. Emit `QuotaRecord(provider, lim.model, window, unit, ESTIMATED, observed_at=now, source=ESTIMATE_SOURCE, limit=lim.limit, used=used, remaining=remaining, reset_at=t.earliest + window_len if t.earliest else None)`.
 
-- **`__init__`.** Creates the bounded queues `asyncio.Queue(maxsize=runtime.task_queue_maxsize)` for submissions and `asyncio.Queue(maxsize=runtime.event_queue_maxsize)` for events. It creates no unbounded buffers. `frontend` defaults to `NullFrontend()`.
-- **`start()`.**
-  - Opens the DB with `open_database(database.path, busy_timeout_ms=...)` and runs `migrate()`.
-  - Creates exactly these asyncio tasks: the task worker, the event consumer, and the periodic cleanup loop. It does not use `run_once`; see below. It does not start subprocesses, threads that outlive a call, or helper daemons.
-  - Calls `frontend.start(self)`.
-  - Calling `start()` twice raises `RuntimeError`.
-- **Task worker.**
-  - Each submission is passed to `task_handler` (or the default handler). `task_done()` is always called.
-  - Handler exceptions are logged with `logger.exception` and emit `ControllerEvent("task_handler_error")`. The worker keeps running.
-  - The **default handler** calls `TaskRepository(conn).create(...)` from the submission and emits `ControllerEvent("task_queued", task_id=...)`.
-- **Event consumer.** Logs each event at INFO as `event=<name> task_id=<id> k=v ...` and calls `task_done()`.
-- **Cleanup loop.** Runs `run_cleanup_now()` immediately and then every `database.cleanup_interval_hours`. Exceptions are logged and do not crash the loop.
-- **`run_cleanup_now`.** Runs `await asyncio.to_thread(...)`. The thread function opens its **own** connection with `open_database`, calls `run_retention_cleanup(now=clock(), retention_days, batch_size)`, and closes it in `finally`. The method stores `last_cleanup_at` and emits a `ControllerEvent("retention_cleanup", fields={table: count..., "db_size_bytes": n})`.
-- **`submit_task`.** Calls `put_nowait`. It returns False if the queue is full and logs a warning. The submission is rejected, not buffered.
-- **`emit`.** Calls `put_nowait`. If the queue is full, it increments `event_dropped_count` and returns False.
-- **`stop()`.** Idempotent. It runs these steps in order:
-  1. Set the stop event.
-  2. Call `frontend.stop()`.
-  3. Wait up to `shutdown_timeout_s` for `task_queue.join()`.
-  4. Cancel the worker, consumer, and cleanup tasks and await them with `return_exceptions=True`. Log any remaining events with a best-effort drain.
-  5. Close the DB connection.
-- **`run_forever()`.** Calls `start()`, awaits the stop event, and then calls `stop()` in `finally`.
-- **`run_once()`.** Calls `start()`, then calls `request_stop()` once the first cleanup has completed. Use an internal `asyncio.Event` set by the cleanup loop after its first run. It then calls `stop()`. It must finish in well under 5 s with an empty DB.
-- **`metrics()`.** Returns these keys: `task_queue_depth`, `event_queue_depth`, `event_dropped_count`, `last_cleanup_at` (ISO string or None), and `sqlite_db_bytes` (None if the DB is not open).
-- **Logging.** Never log config objects wholesale. There are no secrets in them anyway, but keep logs lean.
+The estimator never emits EXACT. Every emitted record passes `validate_record`.
 
-## 9. CLI (`app/cli.py`, `app/__main__.py`)
+## 7. Router state (`app/quota/state.py`, `app/db/provider_models.py`, `app/router/types.py`)
+
+### 7.1 `app/router/types.py`
+Add `NoEligibleReason.ROUTER_STATE_UNAVAILABLE = "ROUTER_STATE_UNAVAILABLE"`. Change nothing else.
+
+### 7.2 `app/db/provider_models.py`
+```python
+class ProviderModelRepository:
+    def __init__(self, conn) -> None
+    def replace_discovered(self, config: AppConfig, provider: str, models: Sequence[ModelCapability], now: datetime) -> None
+    def allowed_capabilities(self, config: AppConfig, provider: str) -> list[ModelCapability]
+```
+`replace_discovered` runs in one transaction:
+1. Upsert each model (`ON CONFLICT(provider, model) DO UPDATE`). `routing_status` is ALLOWED if `is_allowlisted(config, provider, model)`, otherwise DISCOVERED_ONLY. Bools are stored as 0/1, `None` as NULL. Keep the existing `discovered_at` on conflict and set `updated_at=now`.
+2. Run `DELETE FROM provider_models WHERE provider=? AND updated_at <> ?(now)`, so models the provider no longer lists are dropped.
+
+`allowed_capabilities` returns stored rows of that provider that are currently allowlisted (re-checked against config, not the stored status). NULL flags become False. Rows are ordered by model.
+
+### 7.3 `app/quota/state.py`
+```python
+class RouterStateError(RuntimeError): ...
+
+@dataclass(frozen=True, slots=True)
+class ProviderObservation:
+    provider: str
+    health: ProviderHealth
+    models: tuple[ModelCapability, ...]
+    models_ok: bool
+    observed_at: datetime
+
+async def refresh_provider(adapter: ProviderAdapter, conn, config: AppConfig, *, now: datetime) -> ProviderObservation
+async def refresh_all(adapters: Mapping[str, ProviderAdapter], conn, config: AppConfig, *, now: datetime,
+                      environ: Mapping[str, str] | None = None) -> dict[str, ProviderObservation]
+def build_router_state(config: AppConfig, conn, cooldowns: CooldownManager,
+                       observations: Mapping[str, ProviderObservation], *, now: datetime,
+                       environ: Mapping[str, str] | None = None) -> RouterState
+def route_with_state(request: RouteRequest, config: AppConfig, state_factory: Callable[[], RouterState], *,
+                     attempts: Sequence[FailedAttempt] = ()) -> RouteDecision
+```
+**`refresh_provider`** runs these steps in sequence for one provider. No step lets an exception escape.
+- **Health.**
+  - Call `health = await adapter.health_check()`.
+  - If it raises anyway, use `ProviderHealth(DOWN, detail=f"error: {type(e).__name__}")`.
+- **Models.**
+  - Call `await adapter.list_models()`.
+  - On success, run `ProviderModelRepository.replace_discovered` and set `models_ok=True`.
+  - On an exception, log WARNING `provider=<p> list_models failed: <await adapter.classify_error(e)>`. Set `models=()` and `models_ok=False`.
+- **Quota.**
+  - Call `await adapter.get_quota()`, then `QuotaSnapshotRepository.insert_many`.
+  - On an exception, log a WARNING with the class name or error class only.
+- **Logging.** Log messages contain type names or ErrorClass values only, never `str(e)` of non-`ProviderError` exceptions.
+
+**`refresh_all`** refreshes only providers that are enabled, in `credentials_present(config, environ)`, and in `adapters`. It uses `asyncio.gather` and returns `{provider: observation}`.
+
+**`build_router_state`** is synchronous. It wraps everything so that any `ValueError`, `sqlite3.Error` or `TypeError` becomes `RouterStateError(f"cannot build router state: {e}") from e`.
+- `credentials_present=credentials_present(config, environ)`.
+- **`capabilities`.**
+  - For each provider in `config.providers`, take `obs.models` if an observation exists with `models_ok`. Otherwise take `ProviderModelRepository.allowed_capabilities(...)`, the last known capabilities from the DB.
+  - Keep only pairs where `is_allowlisted(config, provider, model)`, keyed `(provider, model)`. DISCOVERED_ONLY models never enter RouterState.
+- `health={p: obs.health.status for p, obs in observations.items()}`.
+- **`quota`.**
+  - Set `exact = [r for r in QuotaSnapshotRepository(conn).latest(now) if not r.source.startswith(ESTIMATE_SOURCE_PREFIX)]`.
+  - The quota list is `exact + estimate_quota(config, UsageRepository(conn), now, exact=exact)`.
+- `cooldowns=cooldowns.active(now)`.
+- **Spend.**
+  - Compute `day = UsageRepository.paid_spend(since=<UTC midnight of now>, until=now)` and `month = paid_spend(since=<UTC 1st of month 00:00>, until=now)`.
+  - If either has `missing_cost_events > 0`, raise `RouterStateError("paid usage event with unknown cost; refusing to route")`.
+  - Pass `total_usd` values **unclamped** to `RouterState(...)`. A negative or non-finite value then raises `ValueError` in `RouterState.__post_init__`, which is wrapped as `RouterStateError`; its message contains the field name `paid_spend_...`. Never clamp spend to 0, because that would hide spend.
+
+**`route_with_state`** calls `state_factory()`.
+- On `RouterStateError`: log ERROR `router state unavailable: <msg>` and return `NoEligibleProvider(NoEligibleReason.ROUTER_STATE_UNAVAILABLE, ())`.
+- Otherwise:
+  - If `attempts` is empty, return `route(request, config, state)`.
+  - If not, return `next_after_failure(request, attempts, config, state)`.
+- Other exceptions propagate.
+
+## 8. Redaction (`app/redaction.py`) and wiring
 
 ```python
-def main(argv: Sequence[str] | None = None) -> int
+REDACTED = "[REDACTED]"
+SENSITIVE_HEADER_NAMES = ("authorization", "proxy-authorization", "x-api-key", "x-goog-api-key", "api-key", "api_key", "apikey")
+class SecretRedactor:
+    def __init__(self, secrets: Iterable[str] = (), *, min_length: int = 6) -> None
+    def add(self, *secrets: str) -> None          # ignores values shorter than min_length (after strip); stores a frozenset, swapped atomically
+    def redact(self, text: str) -> str
+    def __repr__(self) -> str                      # f"SecretRedactor(<{n} secrets>)" only
+    @classmethod
+    def from_config(cls, config: AppConfig, environ: Mapping[str, str] | None = None) -> SecretRedactor   # uses collect_secret_values
+class RedactingFilter(logging.Filter):
+    def __init__(self, redactor: SecretRedactor) -> None
+    def filter(self, record: logging.LogRecord) -> bool   # always True
+def install_redaction(redactor: SecretRedactor, *, logger: logging.Logger | None = None) -> RedactingFilter
 ```
+`app/redaction.py` must not import `app.providers.*`, to avoid an import cycle. It may import `app.config.secrets`.
 
-- **Arguments:** `--config PATH` (default `config.yaml`). `--check` and `--once` are mutually exclusive.
-- Configure logging with `logging.basicConfig(level=INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")`.
-- **Config errors:** a `ConfigError` prints the message to stderr and returns `2`.
-- **`--check`:**
-  1. Load the config.
-  2. Open the DB, run `migrate`, then close it.
-  3. Print one line to stdout: `config OK; schema version <n>; database <path>`.
-  4. Return 0.
-- **`--once`:** runs `asyncio.run(controller.run_once())` and returns 0.
-- **No flag:** runs `asyncio.run(controller.run_forever())`.
-  - Try `loop.add_signal_handler(SIGINT/SIGTERM, controller.request_stop)` inside `run_forever`'s caller coroutine. Catch `NotImplementedError`, which happens on Windows, and rely on `KeyboardInterrupt`.
-  - `KeyboardInterrupt` returns 0.
-- **Other exceptions** are logged and return 1.
-- **`__main__.py`:** `from app.cli import main` then `raise SystemExit(main())`.
-- **`app/__init__.py`:** `__version__ = "0.1.0"`.
+- **`redact` steps.**
+  1. Replace every known secret with `REDACTED`, longest first.
+  2. Header and key patterns are case-insensitive. A sensitive header name, optionally quoted, followed by `:` or `=` and optional quotes and whitespace, then an optional `Bearer `/`Basic ` scheme, then a value `[^\s'",;&}\]]+`, has its value replaced with `REDACTED`. The name and scheme are kept.
+  3. A query param `([?&](?:key|api_key|apikey)=)[^&\s'"#]+` becomes `\1[REDACTED]`.
 
-## 10. Tests (all offline, no network, no env secrets required)
+  Examples:
+  - `Authorization: Bearer sk-abc` → `Authorization: Bearer [REDACTED]`
+  - `{'x-goog-api-key': 'AIza123'}` → `{'x-goog-api-key': '[REDACTED]'}`
+  - `https://h/v1?key=AIza123&x=1` → `https://h/v1?key=[REDACTED]&x=1`
+- **`RedactingFilter.filter` steps.**
+  1. Set `msg = record.getMessage()`. If that fails, use `str(record.msg)`.
+  2. Set `record.msg = redact(msg)` and `record.args = ()`.
+  3. If `record.exc_info`: set `record.exc_text = redact(logging.Formatter().formatException(record.exc_info))`, then `record.exc_info = None`.
+  4. If there is no `exc_info` but `record.exc_text` is set, redact it.
+  5. If `record.stack_info` is set, redact it.
+- **`install_redaction`.** Filters on a logger do **not** apply to records propagated from child loggers, so the filter goes on **handlers**. Add it to every handler of `logger` (default: the root logger) that does not already have a `RedactingFilter`, and return the filter.
+- **`app/cli.py`.**
+  - Right after `logging.basicConfig(...)`, create `redactor = SecretRedactor()` and call `install_redaction(redactor)`.
+  - After `load_config` succeeds, call `redactor.add(*collect_secret_values(config))`.
+- **Adapters.** They receive the redactor through `build_adapters(..., redactor=...)`. They always also redact their own resolved key (§4.3), even without a redactor.
 
-`conftest.py` fixtures:
+## 9. Small follow-ups from `.pipeline/review.md` (included because trivial)
 
-- `db` opens `tmp_path/"t.db"`, migrates, yields, and **closes** the connection. Windows cannot delete open SQLite or WAL files.
-- `make_config(**overrides)` builds an `AppConfig` via `parse_config` with:
-  - providers openrouter, gemini, cerebras, and groq;
-  - policies `openrouter-free` [openrouter/free], `gemini-free` [g-3.8, g-3.7], `cerebras-free` [c-a, c-b], `groq-free` [q-x, q-y], `openrouter-paid` [or-paid-1];
-  - provider order in that sequence.
-- A `full_state(now)` helper builds a `RouterState` with:
-  - all credentials present;
-  - capabilities for every configured pair (tool calling true, context 200k, max_output 32k);
-  - no quota, health, or cooldowns.
+1. **`app/db/connection.py` `transaction()`.**
+   - In the `except BaseException` branch, wrap `conn.execute("ROLLBACK")` in `try/except sqlite3.Error`.
+   - On failure, log WARNING `rollback failed: <type name>` and re-raise the **original** exception.
+   - Add `logger = logging.getLogger(__name__)`.
+2. **`app/runtime/daemon.py` `submit_task()`.** If `self._stopped` is set, log WARNING `controller stopped; submission rejected` and return False before `put_nowait`.
 
-Required test cases (one or more test functions each):
+Deferred, not in this slice: all router, retention and daemon **test-strengthening** follow-ups from review.md, and the TASKS.md T052 deferral note.
 
-- **test_config:**
-  - `config.example.yaml` loads.
-  - An empty file gives defaults (mode free-first-no-paid, budget 0, max attempts 3, retention 60).
-  - The confirmation alias maps to the paid-after-approval mode.
-  - An unknown provider_order id is rejected.
-  - Duplicate provider_order entries are rejected.
-  - A duplicate model within a policy is rejected.
-  - The same (provider, model) in two policies is rejected.
-  - A policy referencing an undefined provider is rejected.
-  - An empty model_order is rejected.
-  - `api_key_env: "sk-or-abc"` is rejected.
-  - Extra unknown keys are rejected.
-  - A negative budget is rejected.
-  - `max_fallback_attempts: 0` is rejected.
-  - A missing file raises ConfigError.
-  - `credentials_present` with a fake environ returns only providers with non-empty values.
-  - With the env var set to `"SECRET123"`, `"SECRET123"` appears nowhere in `repr(config)` or `config.model_dump_json()`.
-- **test_state_machine:**
-  - Every allowed transition passes.
-  - Every pair not in the table raises InvalidTransition, including self-transitions.
-  - Terminal states have no exits.
-- **test_db_migrations:**
-  - A fresh DB reaches LATEST_VERSION.
-  - `PRAGMA journal_mode` returns `wal`.
-  - `PRAGMA busy_timeout` equals the configured value.
-  - `PRAGMA foreign_keys` is 1.
-  - All 10 domain tables plus schema_version exist.
-  - Running `migrate` twice is a no-op with one schema_version row per version.
-  - A DB with a version above latest raises SchemaTooNewError.
-- **test_task_repository:**
-  - create gives QUEUED.
-  - The valid path QUEUED→ROUTING→RUNNING→SUCCEEDED sets started_at and finished_at.
-  - An invalid transition raises and leaves the row unchanged.
-  - Transitioning a missing task raises TaskNotFound.
-  - State survives closing and reopening the DB file (restart).
-  - `list_unfinished` excludes terminal tasks.
-  - The fallback path RUNNING→ROUTING→RUNNING keeps the original started_at.
-- **test_retention** (fixed `now`; insert rows directly with SQL):
-  - Old terminal tasks, their children, and old orphan telemetry are deleted.
-  - Recent rows remain.
-  - An old RUNNING task and its old fallback_attempts and usage_events remain.
-  - An old SUCCEEDED task in an OPEN session remains.
-  - An old CLOSED session with no tasks is deleted.
-  - An old CLOSED session that still has a protected task remains.
-  - A second run deletes 0 everywhere (idempotent).
-  - `batch_size=1` still deletes everything eligible.
-  - A row exactly at the cutoff is kept, because the comparison is strict `<`.
-  - `db_size_bytes > 0`.
-  - The cutoff equals now − 60 days.
-- **test_providers_fake:**
-  - isinstance ProviderAdapter holds.
-  - Every async method returns the configured data.
-  - classify_error maps FakeProviderError to its class and anything else to UNKNOWN.
-  - The ErrorClass partition is complete and disjoint.
-- **test_router** (T050/T051/T051A/T053/T081):
-  - All free candidates are healthy, so openrouter/free is selected.
-  - OpenRouter EXHAUSTED quota leads to gemini g-3.8 (T051 acceptance).
-  - g-3.8 in cooldown leads to g-3.7, never a third Gemini model, even if `capabilities` contains an unlisted `g-pro` that is healthy.
-  - Both Gemini models are ineligible, so cerebras c-a is selected.
-  - Swapping g-3.8 and g-3.7 in config changes the selection with no code change.
-  - Removing a model from config means it is never selected.
-  - Capability mismatch skips the candidate (vision required, only q-y supports it, so q-y is selected).
-  - large_context is enforced.
-  - Estimated tokens above the context window give CONTEXT_TOO_SMALL.
-  - Missing capability metadata gives MODEL_UNKNOWN.
-  - Missing credential, disabled provider, and disabled policy are each skipped with the right reason.
-  - Health DOWN is skipped and DEGRADED is allowed.
-  - A provider-wide cooldown skips every model of that provider.
-  - An expired cooldown or quota record (`until <= now`, `reset_at <= now`) does not filter.
-  - An EXACT REQUESTS record with remaining 0 is skipped.
-  - A TOKENS record with remaining below the estimate gives QUOTA_INSUFFICIENT.
-  - An UNKNOWN record does not filter.
-  - All free candidates are unavailable:
-    - in the default mode, the result is NoEligibleProvider(FREE_CAPACITY_EXHAUSTED) and the paid candidate is skipped with PAID_BLOCKED_BY_MODE (T084 zero-spend);
-    - FREE_ONLY behaves the same;
-    - paid-after-approval with budget 0 gives PAID_BUDGET_EXHAUSTED;
-    - with budget 5 and not approved, the result is PaidApprovalRequired containing or-paid-1;
-    - with budget 5 and `paid_approved=True`, the paid candidate is Selected;
-    - with `paid_requires_approval=False` and budget 5, the paid candidate is Selected;
-    - with a monthly cap exhausted, the result is PAID_BUDGET_EXHAUSTED.
-  - A free candidate is always chosen over paid even when the paid one is approved.
-  - Determinism: same inputs give equal results.
-  - `skipped` is in candidate order.
-- **test_router_fallback:**
-  - Attempts [openrouter/free RATE_LIMITED] lead to gemini g-3.8.
-  - Then [+ g-3.8 RATE_LIMITED] lead to g-3.7 (T051A acceptance).
-  - [+ g-3.7 QUOTA_EXHAUSTED] with max_fallback_attempts=5 leads to cerebras c-a.
-  - The default max of 3 stops with MAX_FALLBACK_ATTEMPTS_REACHED after 3 attempts.
-  - CONTEXT_TOO_LARGE on c-a leads to c-b.
-  - AUTH_FAILED on openrouter/free excludes the whole openrouter provider, including the paid policy.
-  - PROVIDER_UNAVAILABLE on gemini skips g-3.7.
-  - TIMEOUT_UNKNOWN_OUTCOME, INVALID_REQUEST, and UNKNOWN each give NON_FALLBACK_ERROR.
-  - Free-only mode with all free candidates failed never returns a paid candidate.
-  - Fallback to paid in paid-after-approval mode returns PaidApprovalRequired, not Selected.
-  - Empty attempts raise ValueError.
-- **test_router_policy:**
-  - `is_allowlisted` returns True for listed models and False for an unlisted one.
-  - `model_listing("gemini", discovered=["g-pro","g-3.8","g-lite","g-pro"])` returns g-3.8 and g-3.7 as ALLOWED with ranks 0 and 1, then g-lite and g-pro as DISCOVERED_ONLY.
-- **test_daemon** (config with a tmp DB path):
-  - `run_once` completes, the DB file exists at the latest schema version, and `last_cleanup_at` is set.
-  - submit_task is persisted as QUEUED via the default handler. Use start, submit, wait for queue join, check the DB, then stop.
-  - With `task_queue_maxsize=1` and a handler blocked on an `asyncio.Event`, the second extra submission returns False.
-  - With `event_queue_maxsize=1` and the consumer not draining, an emit that would overflow returns False and `event_dropped_count` increments. Test this on a controller that has not been started, so the queue is filled directly.
-  - A handler raising does not kill the worker; a following submission is still processed.
-  - stop is idempotent.
-  - Calling start twice raises.
-- **test_cli:**
-  - `main(["--config", p, "--check"]) == 0` and the stdout contains "config OK".
-  - A missing config returns 2.
-  - An invalid config returns 2.
-  - `subprocess.run([sys.executable, "-m", "app", "--config", p, "--once"], cwd=repo_root, timeout=60).returncode == 0`.
+## 10. Tests (all offline)
 
-## 11. Edge cases checklist (the implementation must handle all of these)
+### 10.1 `tests/conftest.py` additions
+- **No-network guard.** An autouse fixture: `monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", _blocked)`, where `_blocked` is an async function that raises `RuntimeError("real network call attempted")`.
+- **`SECRET`.** `SECRET = "sk-test-SECRET-0123456789"`.
+- **`secret_env()`.** Returns `{"OPENROUTER_API_KEY": SECRET + "-or", "GEMINI_API_KEY": SECRET + "-ge", "CEREBRAS_API_KEY": SECRET + "-ce", "GROQ_API_KEY": SECRET + "-gq"}`.
+- **`json_response(status, body, headers=None) -> httpx.Response`.**
+- **`provider_cfg(**kw) -> ProviderConfig`** helper.
 
-- **Ordering:** any unlisted model never becomes a candidate. The router never reorders, and filters only remove.
-- **Same provider in two policies:** the same provider under different policies (openrouter free and paid) shares provider-level cooldown, health, credential, and exclusion.
-- **Naive datetimes** passed to any DB write raise `ValueError`.
-- **`now` exactly equal** to a cooldown `until` or a quota `reset_at` means expired, not active.
-- **Retention cutoff exactly equal** to a row's timestamp means kept.
-- **Paid spend with budget 0:** paid can never be selected or prompted, regardless of `paid_approved`.
-- **Windows:** close every sqlite connection in tests and at daemon stop. `add_signal_handler` raises `NotImplementedError` on Windows and must be caught.
-- **No network:** no network imports or calls anywhere (no httpx, discord, or subprocess use in `app/`).
+Adapters are always used as `async with Adapter(cfg, transport=httpx.MockTransport(handler), environ=..., clock=lambda: NOW)`. Handlers record `request.headers` and `request.url` for assertions.
+
+### 10.2 Required cases
+
+**test_provider_http_common**
+- Parametrized `parse_duration` and `parse_number` cases from §4.2.
+- `parse_retry_after`:
+  - `"30"` gives 30.0.
+  - An HTTP-date 90 s after NOW gives 90.0.
+  - A date in the past gives 0.0.
+  - `"soon"` and None give None.
+- `parse_rate_limit_headers`:
+  - With Groq-style headers (mixed case), it produces EXACT RPD and TPM records, with correct `used` and `reset_at`.
+  - Remaining missing gives UNKNOWN.
+  - No headers gives `[]`.
+- **`classify_status`**, parametrized over 400, 401, 403, 404, 408, 413, 418, 422, 429, 500, 502, 503, 504, 507 and 302. Each expected class follows §4.3.
+- **`classify_transport_error`**, for each httpx exception listed plus `TimeoutError` and `ValueError`.
+- **`classify_error`** gives UNKNOWN for `ValueError`. It never raises, even for an exception whose `__str__` raises.
+
+**test_provider_openrouter / gemini / cerebras / groq.** Each file must cover:
+1. `isinstance(adapter, ProviderAdapter)`.
+2. **Auth header sent.**
+   - OpenRouter, Cerebras and Groq send `Authorization == f"Bearer {key}"`.
+   - Gemini sends `x-goog-api-key == key`, and `"key=" not in str(request.url)`.
+3. **`list_models` success.** Fields are parsed per §4.4. Config `models` metadata overrides discovered values. Non-dict items and items without an id are skipped. Gemini specifics:
+   - The `models/` prefix is stripped.
+   - Pagination follows `nextPageToken` across 2 pages.
+   - Models without `generateContent` are dropped.
+   - Pagination stops at 10 pages.
+4. **Unlisted models.** `list_models` returns an unlisted discovered model. `model_listing(...)` then marks it DISCOVERED_ONLY.
+5. **`health_check`.**
+   - 200 gives HEALTHY.
+   - 401 gives DOWN.
+   - 429 gives DEGRADED.
+   - 503 gives DOWN.
+   - A `ConnectError` raised from the handler gives DOWN.
+   - A non-JSON 200 gives DEGRADED.
+   - A missing env var gives DOWN with detail containing the env var name, and **no request is sent** (the handler call count is 0).
+6. **`get_quota`.**
+   - OpenRouter:
+     - A numeric limit gives an EXACT USD record.
+     - A null limit gives UNKNOWN with `remaining is None`.
+     - `data` as a list gives `MalformedResponseError`.
+   - Gemini returns `[]` and makes no request.
+   - Groq and Cerebras:
+     - Headers present give EXACT records with `model is None` and source `"<p>:response-headers"`.
+     - Headers absent give `[]`, never a zero.
+7. **Error classification**, through `classify_error` on the raised `ProviderError` and also on `httpx.HTTPStatusError(response=...)`. Each of the following is classified correctly:
+   - 429 with `Retry-After: 12` gives RATE_LIMITED, with `retry_after_s == 12` and `retry_after_ms == 12000`.
+   - 401 gives AUTH_FAILED.
+   - 5xx follows the common table.
+   - A malformed 2xx in `list_models` gives `MalformedResponseError`, and the class is UNKNOWN.
+   - A `ReadTimeout` gives TIMEOUT_UNKNOWN_OUTCOME.
+   - A `ConnectError` gives TRANSIENT_NETWORK.
+
+   Provider-specific cases:
+   - **OpenRouter:**
+     - 402 gives QUOTA_EXHAUSTED.
+     - 403 gives POLICY_REJECTED.
+   - **Gemini:**
+     - 429 `RESOURCE_EXHAUSTED` with a RetryInfo `"7s"` and no header gives RATE_LIMITED with `retry_after_s == 7`.
+     - 400 with details reason `API_KEY_INVALID` gives AUTH_FAILED.
+     - 404 `NOT_FOUND` gives MODEL_UNAVAILABLE.
+   - **Groq and Cerebras:**
+     - 400 code `context_length_exceeded` gives CONTEXT_TOO_LARGE.
+     - 404 `model_not_found` gives MODEL_UNAVAILABLE.
+     - 429 with a non-JSON body gives RATE_LIMITED, classified by status.
+8. **Secret safety.** Use a 401 whose body echoes the key, for example `{"error":{"message":"Incorrect API key provided: <key>"}}`. Then:
+   - The key is in none of: `str(err)`, `repr(err)`, `"".join(traceback.format_exception(err))`, `repr(adapter)`, and caplog text at DEBUG.
+   - `err.__cause__ is None`.
+   - The same holds for a `ConnectError` path whose message contains the key.
+
+**test_cooldown**
+- A 429 on `(gemini, g-3.8)` applies until NOW+60 s (the default). `is_cooling("gemini", "g-3.7")` is False.
+- Retry-After 10 gives NOW+10. A Retry-After of 99999 is clamped to `max_cooldown_s`. A Retry-After of 0 gives no cooldown. NaN uses the default.
+- PROVIDER_UNAVAILABLE is provider-wide. `active()` contains `("x", None)`.
+- Network failures:
+  - Two TRANSIENT_NETWORK failures give no cooldown; the third gives a provider-wide cooldown.
+  - Failures spaced wider than the window never trigger.
+  - `record_success` resets the count.
+- AUTH_FAILED, INVALID_REQUEST and UNKNOWN give no cooldown.
+- A shorter new cooldown does not shorten an existing one.
+- **Expiry.** `active(now=until)` excludes the entry (the boundary is expired) and prunes it.
+- **Router integration.** Pass `cooldowns=mgr.active(NOW)` into `full_state`. A g-3.8 cooldown routes to g-3.7 when openrouter has an EXHAUSTED quota record. After expiry, it routes to g-3.8 again.
+
+**test_quota_normalize**
+- `DIMENSION_SPECS` covers all 7 dimensions with unique `(window, unit)` pairs.
+- `normalize` with only an RPD record gives the other 6 dimensions as `None`.
+- The newest `observed_at` wins.
+- An unknown window is dropped.
+- `validate_record` rejects each of: a negative value, NaN, a bool, an empty source, naive datetimes, EXACT with remaining None, and EXACT with source `"estimate:x"` or `"config:x"`.
+
+**test_quota_repository** (uses the `db` fixture)
+- An insert followed by `latest` round-trips every field, including `model=None` and both int and float values.
+- `latest` returns only the newest per key.
+- A row with `reset_at == now` is excluded.
+- `insert_many` with one invalid record inserts nothing.
+- Data survives reopening the DB.
+
+**test_usage**
+- `record` and `totals`:
+  - Requests are counted across statuses.
+  - The model filter works, and `model=None` sums all models.
+  - The inclusive window bounds hold.
+  - `events_missing_tokens` is counted.
+  - `earliest` is correct.
+- Validation errors are raised for: a PAID event with None cost, a negative cost, inf cost, negative tokens, a bool token count, and a naive time.
+- An unknown `task_id` raises `sqlite3.IntegrityError`.
+- `paid_spend` ignores FREE events.
+- `daily_totals` excludes yesterday's events.
+
+**test_estimator**
+- Config gemini `limits=[{dimension: requests_per_day, limit: 5}]` with 3 events in the last 24 h and 1 event 25 h ago gives one ESTIMATED record: `used=3`, `remaining=2`, `window="day"`, `source=ESTIMATE_SOURCE`, and `reset_at == earliest + 24h`.
+- Usage over the limit gives `remaining == 0`, never negative.
+- A model-scoped limit counts only that model.
+- A TOKENS limit with an event missing tokens gives UNKNOWN with `remaining=None`.
+- A matching unexpired EXACT record in `exact` suppresses the estimate. An expired one does not.
+- A disabled provider gives no records.
+- No output record is ever EXACT.
+
+**test_router_state** (`db` fixture, real adapters over MockTransport)
+- **End to end.**
+  1. Gemini adapter `list_models` returns g-3.8, g-3.7 and g-pro.
+  2. Call `refresh_all(...)`, then `CooldownManager.record_failure("gemini", "g-3.8", RATE_LIMITED)`, then `build_router_state`.
+  3. `route` selects `gemini/g-3.7` when openrouter has an EXHAUSTED snapshot persisted.
+  4. `g-pro` is in `provider_models` as DISCOVERED_ONLY but is **not** a key of `state.capabilities`.
+
+  The test config gives other providers' models through observations or DB rows as needed.
+- Health 503 on cerebras gives `state.health["cerebras"] == DOWN`.
+- Discovery failure (500 on list_models) falls back to the last DB rows, and capabilities are still present.
+- A Gemini `requests_per_day` limit of 2 with 2 usage events gives an ESTIMATED remaining-0 record in `state.quota`. Routing skips Gemini with QUOTA_EXHAUSTED.
+- **Bad spend.**
+  - A PAID usage row with cost `-1.0`, inserted with raw SQL, makes `build_router_state` raise `RouterStateError` with `"paid_spend"` in the message, not `ValueError`.
+  - A PAID row with NULL cost, via raw SQL, also raises `RouterStateError`.
+  - `route_with_state(..., state_factory=lambda: build_router_state(...))` returns `NoEligibleProvider(ROUTER_STATE_UNAVAILABLE, ())`.
+- `route_with_state` with a non-empty `attempts` delegates to `next_after_failure`, giving the same result as calling it directly.
+- Paid spend today is summed from PAID rows of today only. A PAID row from yesterday counts toward the month total but not the day total. Pick NOW and "yesterday" in the same UTC month.
+
+**test_redaction**
+- The `redact` examples from §8 hold.
+- Secrets shorter than `min_length` are ignored.
+- Overlapping secrets are redacted longest first.
+- `repr(redactor)` does not contain the secret.
+- Run `logger.error("auth %s", f"Bearer {SECRET}")`, then `logger.exception(...)` inside `except` of `RuntimeError(f"bad key {SECRET}")`, through a `StringIO` handler with `install_redaction` applied. The output contains `[REDACTED]` and never `SECRET`.
+- The same holds with a child logger, which proves the filter is on the handler.
+- `install_redaction` twice does not add a second filter.
+- `SecretRedactor.from_config(make_config(), secret_env())` redacts all four keys.
+
+Each test must remove any handler or filter it adds to a logger in `finally`.
+
+**test_config (additions)**
+- Valid `limits`, `models`, `base_url`, `timeout_s` and `cooldown` load.
+- Rejected, each with `match=`:
+  - a `spend_usd` limit;
+  - a `limit` of 0, NaN or inf;
+  - duplicate `(model, dimension)`;
+  - an unknown dimension;
+  - a `base_url` of `"ftp://x"`;
+  - `timeout_s` 0;
+  - `cooldown.rate_limit_default_s` greater than `max_cooldown_s`;
+  - `network_failure_threshold` 0.
+- `config.example.yaml` still loads.
+- `collect_secret_values` returns resolved provider keys and the Discord token, and skips unset ones.
+
+**test_daemon (addition):** after `stop()`, `submit_task(...)` is False.
+
+**test_db_connection (new)**
+- `transaction()` commits on success and rolls back on exception.
+- With a stub connection whose `execute` raises `sqlite3.OperationalError` only for `"ROLLBACK"`, the **original** exception (for example `KeyError`) propagates, not the OperationalError.
+
+## 11. Edge cases checklist
+- Missing quota data is `None` or `[]`, never 0. Absent headers never create records. UNKNOWN records never filter in the router (slice-1 behavior).
+- Estimates are always ESTIMATED, or UNKNOWN when token counts are missing. `validate_record` rejects EXACT with an `estimate:` or `config:` source.
+- Source contains no limit numbers. Configured limits come only from `providers.<p>.limits`.
+- **Unlisted models.** `list_models` returns them. `provider_models` stores them as DISCOVERED_ONLY. `build_router_state` excludes them from `capabilities`.
+- **Retry-After.** It can be seconds or an HTTP-date, and it is clamped to `[0, max_cooldown_s]`. 0 means no cooldown. Non-finite values use the default.
+- **`now == until` or `now == reset_at`** is expired, consistent with slice 1.
+- **Keys.**
+  - Never in URLs (Gemini uses a header).
+  - Never in errors, because messages are redacted and `from None` is used.
+  - Never in reprs, logs, DB rows or dataclasses.
+  - A missing key sends no request.
+- **Errors.** `classify_error` and `health_check` never raise. `build_router_state` raises only `RouterStateError`.
+- **Spend.** It is never clamped. Negative, non-finite or unknown paid cost fails closed with `RouterStateError`, and then `ROUTER_STATE_UNAVAILABLE`.
+- **Windows.** Tests close every sqlite connection (`db` fixture) and every adapter client (`async with`).
+- **No network in tests.** The autouse guard blocks `AsyncHTTPTransport`.
 
 ## 12. Out of scope (do not implement)
-
 - Discord bot.
-- OpenCode executor or subprocesses.
-- Real provider HTTP adapters.
-- Quota refresh/estimation jobs.
-- Approvals flow/UI.
-- Persisting router decisions or fallback attempts from the daemon.
-- Discord model overrides.
-- VACUUM scheduling.
-- Resource benchmarks (T024).
-- WSL setup.
+- OpenCode executor.
+- Inference calls.
+- Approvals.
+- Quota refresh scheduler (T044).
+- Daemon wiring of adapters or routing (T054).
+- Persisting estimates or fallback_attempts.
+- Cooldown persistence across restarts.
+- Calendar-aligned (Pacific) daily resets.
+- `/usage` and `/models` rendering.
 - `.env.example`.
+- The review.md test-strengthening follow-ups listed in §9.
