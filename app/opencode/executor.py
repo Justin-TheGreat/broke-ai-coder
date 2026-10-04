@@ -107,8 +107,10 @@ class OpenCodeExecutor:
         endpoint: Callable[[], ServerEndpoint] | None = None,
         gateway_base_url: Callable[[], str | None] | None = None,
         environ: Mapping[str, str] | None = None,
+        unavailable_reason: Callable[[], str | None] | None = None,
     ) -> None:
         self._config = config
+        self._unavailable_reason = unavailable_reason
         self._endpoint = endpoint or (lambda: ServerEndpoint(config.server_url))
         self._gateway_base_url = gateway_base_url or (lambda: None)
         self._environ = environ
@@ -146,6 +148,12 @@ class OpenCodeExecutor:
         return argv
 
     async def health_check(self) -> ExecutorHealth:
+        if self._unavailable_reason is not None:
+            # Managed mode: never attach while our serve is not known-good (crash/backoff window,
+            # fatal error); the port may now belong to something else.
+            reason = self._unavailable_reason()
+            if reason is not None:
+                return ExecutorHealth(False, None, reason)
         endpoint = self._endpoint()
         return await check_opencode_health(
             endpoint.url,

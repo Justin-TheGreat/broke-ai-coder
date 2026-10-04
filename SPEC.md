@@ -297,6 +297,8 @@ The user pays nothing. Paid inference is not supported, not merely disabled:
 - The data layer cannot record paid usage: the cost class has only `FREE`, and the SQLite ledger rejects `PAID` rows.
 - When all free capacity is exhausted, the task stops and the user is told. It does not wait for approval to pay.
 
+The gateway only forwards plain text messages and function tools: it rejects with 400 any non-function tool or `tool_choice` type (provider-hosted tools such as Groq `browser_search`/`code_interpreter`) and any non-text content part (`file`, `image_url`, `input_audio`), because those can be billed outside the free plan.
+
 The structural layer is the key-holding LLM gateway (section 9 and section 11). OpenCode never holds a real provider key: all its model traffic goes to a gateway inside the daemon on `127.0.0.1`, which forwards only allowlisted free models (`routing.provider_order` policies on enabled providers), rewrites `model` to the upstream id, drops request keys that could select another or a paid model (for example OpenRouter `models`, `route`, `provider`, `plugins`, `transforms`), and rejects every other model with a stop error (no fallback, no substitution). OpenCode is configured with `enabled_providers: ["broke"]`, so every model it can resolve goes through the gateway. The config and credential checks in section 9 are accident detection on top of this.
 
 Free-tier status for Gemini and Groq is an account property, not a model property. Their accounts must have no billing method attached, so the provider rejects requests past the free limit instead of charging.
@@ -445,7 +447,7 @@ Keys are held only by the controller process (environment variables or a local s
 
 Residual risks:
 
-- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: run OpenCode as a separate OS user (T072).
+- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: run OpenCode as a separate OS user (T072). The same exposure covers ambient cloud credentials reachable through the allowed `HOME`/`XDG_*` (for example `~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens): do not keep such credentials for that user until T072.
 - **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
 - **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
 - **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.

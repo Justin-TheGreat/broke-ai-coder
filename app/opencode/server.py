@@ -16,6 +16,8 @@ substitution also applies to the inline config, so model ids with braces are rej
 
 Residual risk R1: the agent runs as the same OS user and can still read the daemon's secrets file
 and ``/proc/<pid>/environ``. Closing it needs a separate OS user (T072).
+Ambient cloud credentials reachable via the allowed HOME/XDG_* (~/.aws, gcloud ADC, Azure CLI,
+Copilot tokens) are in the same class.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import secrets
 import socket
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -94,8 +96,26 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _port_in_use(port: int) -> bool:
+    """True if something already listens on (or holds) 127.0.0.1:port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        if os.name == "posix":
+            # Tolerate our own TIME_WAIT leftovers; a live listener still fails the bind.
+            # Never set SO_REUSEADDR on Windows: there it allows binding over a live listener.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+    return False
+
+
 class _ServeFailed(Exception):
     """Internal: one launch attempt failed; the message is a redacted short detail."""
+
+
+class _PortInUse(_ServeFailed):
+    """Internal: the serve port is held by something else; retrying cannot help."""
 
 
 class OpenCodeServerManager:
@@ -123,6 +143,43 @@ class OpenCodeServerManager:
         self._stderr = bytearray()
         self._executable: str | None = None
         self._stopping = False
+        self._launch_listeners: list[Callable[[], None]] = []
+        self._fatal_error: str | None = None
+        self._ready = False
+
+    @property
+    def fatal_error(self) -> str | None:
+        return self._fatal_error
+
+    @fatal_error.setter
+    def fatal_error(self, value: str | None) -> None:
+        self._fatal_error = value
+        if value is not None:
+            self._ready = False
+
+    @property
+    def ready(self) -> bool:
+        """True only after a successful health wait; cleared on exit, reap, stop and fatal."""
+        return self._ready
+
+    def unavailable_reason(self) -> str | None:
+        """None when tasks may attach; else a short, secret-free reason."""
+        if self.ready:
+            return None
+        if self._fatal_error is not None:
+            return f"managed OpenCode server is down: {self._fatal_error}"[:_DETAIL_CAP]
+        return "managed OpenCode server is down: restarting"
+
+    def add_launch_listener(self, listener: Callable[[], None]) -> None:
+        """Called when our serve exits and at every (re)launch attempt (before the spawn)."""
+        self._launch_listeners.append(listener)
+
+    def _notify_launch(self) -> None:
+        for listener in self._launch_listeners:
+            try:
+                listener()
+            except Exception as e:
+                logger.warning("launch listener failed: %s", type(e).__name__)
 
     @property
     def endpoint(self) -> ServerEndpoint:
@@ -150,6 +207,7 @@ class OpenCodeServerManager:
 
     async def stop(self) -> None:
         self._stopping = True
+        self._ready = False
         monitor, self._monitor = self._monitor, None
         if monitor is not None:
             monitor.cancel()
@@ -181,6 +239,7 @@ class OpenCodeServerManager:
                 del self._stderr[: len(self._stderr) - keep]
 
     async def _reap(self) -> None:
+        self._ready = False
         proc, self._proc = self._proc, None
         if proc is not None:
             await kill_process_tree(proc, grace_s=self._oc.kill_grace_s)
@@ -191,7 +250,17 @@ class OpenCodeServerManager:
 
     async def _spawn(self) -> asyncio.subprocess.Process:
         assert self._executable is not None
-        port = self._oc.server_port or await asyncio.to_thread(_free_port)
+        self._notify_launch()
+        port = self._oc.server_port
+        if port:
+            if await asyncio.to_thread(_port_in_use, port):
+                raise _PortInUse(
+                    f"port {port} already in use - stop any manually started `opencode serve`"
+                )
+        else:
+            port = await asyncio.to_thread(_free_port)
+            if await asyncio.to_thread(_port_in_use, port):
+                raise _PortInUse(f"port {port} already in use")
         self._port = port
         cfg = build_opencode_config(
             self._app,
@@ -253,12 +322,28 @@ class OpenCodeServerManager:
                 auth=endpoint.auth(),
             )
             if health.healthy:
-                return
+                # Our server enforces the password: an unauthenticated probe must get 401. A
+                # foreign server (no auth) is rejected, and our child must still be alive.
+                anon = await check_opencode_health(
+                    endpoint.url,
+                    timeout_s=max(0.1, min(2.0, remaining)),
+                    transport=self._health_transport,
+                    auth=None,
+                )
+                if anon.detail == "HTTP 401" and proc.returncode is None:
+                    return
+                if anon.healthy:
+                    raise _PortInUse(
+                        f"port {self._port} is served by a server that does not enforce the "
+                        "password - stop any manually started `opencode serve`"
+                    )
             await asyncio.sleep(min(_HEALTH_POLL_S, max(0.0, remaining)))
 
     async def _launch(self) -> None:
         proc = await self._spawn()
         await self._wait_healthy(proc)
+        if proc.returncode is None:
+            self._ready = True
 
     async def _monitor_loop(self) -> None:
         backoff = _INITIAL_BACKOFF_S
@@ -271,6 +356,10 @@ class OpenCodeServerManager:
                     await proc.wait()
                 if self._stopping:
                     return
+                # Invalidate at the moment of the crash, not only at relaunch: the backoff
+                # window must not honour a cached "server config OK" for an unknown listener.
+                self._ready = False
+                self._notify_launch()
                 code = proc.returncode if proc is not None else None
                 logger.warning(
                     "opencode serve exited code=%s stderr=%s", code, self._stderr_detail()[-200:]
@@ -286,6 +375,11 @@ class OpenCodeServerManager:
                     try:
                         await self._launch()
                         break
+                    except _PortInUse as e:
+                        self.fatal_error = str(e)
+                        logger.error("opencode serve cannot restart, giving up: %s", e)
+                        await self._reap()
+                        return
                     except _ServeFailed as e:
                         logger.warning("opencode serve restart failed: %s", e)
                         await self._reap()

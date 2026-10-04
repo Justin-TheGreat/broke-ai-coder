@@ -723,7 +723,7 @@ Recommended network rules:
 
 Residual risks:
 
-- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: T072 (separate OS user).
+- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: T072 (separate OS user). The same exposure covers ambient cloud credentials reachable through the allowed `HOME`/`XDG_*` (for example `~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens): do not keep such credentials for that user until T072.
 - **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
 - **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
 - **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.

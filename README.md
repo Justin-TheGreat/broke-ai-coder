@@ -17,7 +17,7 @@ copy config.example.yaml config.yaml
 
 ```powershell
 .\.venv\Scripts\python -m app --check   # validate config and migrate the DB
-.\.venv\Scripts\python -m app --once    # start, run one cleanup, stop
+.\.venv\Scripts\python -m app --once    # start, run one cleanup, stop (needs no opencode binary)
 .\.venv\Scripts\python -m app           # run the daemon until Ctrl+C
 ```
 

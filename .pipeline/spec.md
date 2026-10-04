@@ -584,7 +584,7 @@ only and never values. `GET /config` failing or non-dict gives `(UNAVAILABLE, "G
   - T082: add the G1–G8 verification items.
 - **Residual risks (state exactly these, SPEC §11 + ARCHITECTURE §11):**
   - **R1:** the agent runs as the same OS user as the daemon and can read the secrets file and
-    `/proc/<pid>/environ`. Fix: T072, a separate OS user.
+    `/proc/<pid>/environ`. Fix: T072, a separate OS user. The same exposure covers ambient cloud credentials reachable through the allowed `HOME`/`XDG_*` (for example `~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens): do not keep such credentials for that user until T072.
   - **R2:** `opencode` run by the user outside the daemon with their own keys or config is
     outside this guarantee.
   - **R3:** managed or MDM system OpenCode configs outrank inline config (admin-only).

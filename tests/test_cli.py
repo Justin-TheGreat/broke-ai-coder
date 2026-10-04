@@ -23,7 +23,7 @@ def test_invalid_config_returns_2(tmp_path):
     assert main(["--config", str(p), "--check"]) == 2
 
 
-def test_once_subprocess(tmp_path):
+def test_once_subprocess_needs_no_opencode_binary(tmp_path):
     import subprocess
     import sys
 
@@ -40,13 +40,14 @@ def test_once_subprocess(tmp_path):
     assert r.returncode == 0, r.stderr
 
 
-def test_startup_error_prints_message_and_returns_3(tmp_path, capsys):
+def test_startup_error_prints_message_and_returns_3(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\n"
         "opencode:\n  command: [no-such-opencode-binary-xyz]\n"
     )
-    assert main(["--config", str(cfg), "--once"]) == 3
+    assert main(["--config", str(cfg)]) == 3
     err = capsys.readouterr().err
     assert "opencode executable not found" in err
     assert "Traceback" not in err

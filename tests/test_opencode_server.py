@@ -239,7 +239,7 @@ async def test_crash_triggers_restart(started_manager, tmp_path, monkeypatch):
     monkeypatch.setattr(server_mod, "_BACKOFF_RESET_S", 0.5)
     m = await started_manager(
         environ=make_environ(
-            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="0.5"
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
         )
     )
     assert serve_count(tmp_path) == 1
@@ -327,3 +327,259 @@ async def test_empty_allowlist_raises_startup_error(make_config, tmp_path):
         await m.start()
     await m.stop()
     assert serve_count(tmp_path) == 0
+
+
+# ---- foreign servers / port ownership --------------------------------------------------
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+async def start_foreign(port: int, *, status_unauth: int = 200):
+    """A plain server answering /global/health; status_unauth is returned without credentials."""
+    hits: list[bytes] = []
+
+    async def handle(reader, writer):
+        data = await reader.read(4096)
+        hits.append(data)
+        has_auth = b"authorization:" in data.lower()
+        status = 200 if (has_auth or status_unauth == 200) else status_unauth
+        body = b'{"healthy": true, "version": "x"}' if status == 200 else b"{}"
+        head = (
+            f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+        )
+        writer.write(head.encode() + body)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", port)
+    return server, hits
+
+
+async def test_occupied_fixed_port_fails_startup_and_never_spawns(started_manager, tmp_path):
+    port = free_port()
+    server, hits = await start_foreign(port)
+    try:
+        with pytest.raises(StartupError, match="already in use"):
+            await started_manager(server_port=port)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert serve_count(tmp_path) == 0  # our serve was never spawned
+    assert hits == []  # and nothing talked to the foreign server
+
+
+async def test_foreign_server_without_401_is_rejected_even_if_port_check_is_bypassed(
+    started_manager, tmp_path, monkeypatch
+):
+    """Defence in depth: a healthy server that ignores the password is not accepted."""
+    port = free_port()
+    server, _ = await start_foreign(port, status_unauth=200)
+    monkeypatch.setattr(server_mod, "_port_in_use", lambda p: False)
+    try:
+        with pytest.raises(StartupError, match="does not enforce the password"):
+            await started_manager(server_port=port, server_start_timeout_s=5)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_foreign_server_with_other_unauth_status_is_rejected(
+    started_manager, tmp_path, monkeypatch
+):
+    port = free_port()
+    server, _ = await start_foreign(port, status_unauth=403)
+    monkeypatch.setattr(server_mod, "_port_in_use", lambda p: False)
+    try:
+        with pytest.raises(StartupError, match="did not become healthy"):
+            await started_manager(
+                environ=make_environ(tmp_path, FAKE_OC_SERVE_SCENARIO="exit_immediately"),
+                server_port=port,
+                server_start_timeout_s=3,
+            )
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_restart_with_port_taken_gives_up_with_clear_error(
+    started_manager, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(server_mod, "_INITIAL_BACKOFF_S", 0.1)
+    port = free_port()
+    m = await started_manager(
+        environ=make_environ(
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
+        ),
+        server_port=port,
+    )
+    await wait_for(lambda: m._proc is None or m._proc.returncode is not None)
+    server = None
+    while server is None:  # grab the port as soon as our crashed serve releases it
+        try:
+            server, _ = await start_foreign(port)
+        except OSError:
+            await asyncio.sleep(0.05)
+    try:
+        await wait_for(lambda: m.fatal_error is not None)
+        assert "already in use" in m.fatal_error
+        await asyncio.wait_for(m._monitor, 5)  # the monitor stopped retrying
+        assert serve_count(tmp_path) == 1  # no further spawn attempts
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+async def test_launch_listener_called_on_every_launch(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(server_mod, "_INITIAL_BACKOFF_S", 0.1)
+    monkeypatch.setattr(server_mod, "_BACKOFF_RESET_S", 0.5)
+    calls: list[int] = []
+    m = OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
+        ),
+        password="pw-server-0123456789",
+    )
+    m.add_launch_listener(lambda: calls.append(1))
+    await m.start()
+    try:
+        assert len(calls) == 1
+        await wait_for(lambda: len(calls) >= 2)  # relaunch after the crash notifies again
+    finally:
+        await m.stop()
+
+
+# ---- readiness: crash-to-relaunch window and fatal error ---------------------------------
+
+
+def make_executor(m: OpenCodeServerManager):
+    from app.opencode.executor import OpenCodeExecutor
+
+    return OpenCodeExecutor(
+        m._oc, endpoint=lambda: m.endpoint, unavailable_reason=m.unavailable_reason
+    )
+
+
+async def grab_port(port: int, timeout: float = 10.0):
+    """Bind a foreign server as soon as our crashed serve releases the port.
+
+    Fails (instead of hanging) if the port never frees up, e.g. if the manager's
+    relaunch won the race and now holds it.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            return await start_foreign(port)
+        except OSError:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(f"port {port} never freed for the foreign server") from None
+            await asyncio.sleep(0.05)
+
+
+async def test_crash_window_clears_cache_and_health_is_unhealthy(
+    make_config, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(server_mod, "_INITIAL_BACKOFF_S", 30.0)  # stay in the window
+    port = free_port()
+    cache_valid = [True]
+    m = OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path, server_port=port),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
+        ),
+        password="pw-server-0123456789",
+    )
+    m.add_launch_listener(lambda: cache_valid.__setitem__(0, False))
+    executor = make_executor(m)
+    await m.start()
+    server = None
+    try:
+        assert m.ready and m.unavailable_reason() is None
+        cache_valid[0] = True  # the orchestrator cached a server-config OK at launch
+        assert (await executor.health_check()).healthy
+        await wait_for(lambda: not m.ready)  # the monitor saw the crash
+        assert cache_valid[0] is False  # invalidated at the crash, before any relaunch
+        server, hits = await grab_port(port)
+        health = await executor.health_check()
+        assert not health.healthy and "managed OpenCode server is down" in health.detail
+        assert hits == []  # the foreign server on the port was never contacted
+        assert serve_count(tmp_path) == 1  # nothing spawned (still in backoff)
+    finally:
+        await m.stop()
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+    assert not m.ready
+
+
+async def test_fatal_error_keeps_health_unhealthy_with_reason(make_config, tmp_path, monkeypatch):
+    # Backoff long enough that the foreign server always binds before the relaunch,
+    # even under full-suite load; the relaunch then finds the port taken -> fatal_error.
+    monkeypatch.setattr(server_mod, "_INITIAL_BACKOFF_S", 3.0)
+    port = free_port()
+    m = OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path, server_port=port),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
+        ),
+        password="pw-server-0123456789",
+    )
+    executor = make_executor(m)
+    await m.start()
+    server = None
+    try:
+        await wait_for(lambda: not m.ready)
+        server, hits = await grab_port(port)
+        assert serve_count(tmp_path) == 1  # grabbed before any relaunch
+        await wait_for(lambda: m.fatal_error is not None)
+        for _ in range(3):
+            health = await executor.health_check()
+            assert not health.healthy
+            assert "managed OpenCode server is down" in health.detail
+            assert "already in use" in health.detail
+            assert "pw-server" not in health.detail
+            await asyncio.sleep(0.1)
+        assert not m.ready
+        assert hits == [] and serve_count(tmp_path) == 1
+    finally:
+        await m.stop()
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+
+
+async def test_tasks_run_again_after_successful_relaunch(make_config, tmp_path, monkeypatch):
+    monkeypatch.setattr(server_mod, "_INITIAL_BACKOFF_S", 0.1)
+    monkeypatch.setattr(server_mod, "_BACKOFF_RESET_S", 0.5)
+    m = OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(
+            tmp_path, FAKE_OC_SERVE_SCENARIO="crash_after", FAKE_OC_SERVE_CRASH_AFTER_S="1.5"
+        ),
+        password="pw-server-0123456789",
+    )
+    executor = make_executor(m)
+    await m.start()
+    try:
+        assert (await executor.health_check()).healthy
+        await wait_for(lambda: serve_count(tmp_path) == 2)
+
+        async def healthy_again():
+            return m.ready and (await executor.health_check()).healthy
+
+        await wait_for(healthy_again)
+        assert m.fatal_error is None
+    finally:
+        await m.stop()
+    assert not m.ready

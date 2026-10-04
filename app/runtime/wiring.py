@@ -65,10 +65,17 @@ def build_runtime(
 
     manager: OpenCodeServerManager | None = None
     endpoint: Callable[[], ServerEndpoint]
-    if config.opencode.managed_server:
+    unavailable: Callable[[], str | None] | None = None
+    # --once only starts, cleans up and stops: it never runs a task, so it needs neither the
+    # managed serve (and the opencode binary) nor the gateway.
+    if config.opencode.managed_server and not once:
         manager = OpenCodeServerManager(config, gateway=gateway, redactor=redactor, environ=environ)
         redactor.add(manager.password)
+        manager.add_launch_listener(
+            lambda: orch_holder["orchestrator"].invalidate_server_config_cache()
+        )
         managed = manager
+        unavailable = managed.unavailable_reason
 
         def endpoint() -> ServerEndpoint:
             return managed.endpoint
@@ -85,6 +92,7 @@ def build_runtime(
         endpoint=endpoint,
         gateway_base_url=lambda: gateway.base_url,
         environ=environ,
+        unavailable_reason=unavailable,
     )
     orchestrator = Orchestrator(
         config, executor=executor, adapters=adapters, environ=environ, cooldowns=cooldowns
@@ -98,7 +106,7 @@ def build_runtime(
         from app.bot.discord_frontend import create_frontend
 
         frontend = create_frontend(config, redactor=redactor, environ=environ)
-    services: list[RuntimeService] = [gateway]
+    services: list[RuntimeService] = [] if once else [gateway]
     if manager is not None:
         services.append(manager)
     controller = AgentController(

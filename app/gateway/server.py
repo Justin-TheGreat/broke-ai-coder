@@ -90,6 +90,33 @@ def _json_error(
     return web.json_response(body, status=status, headers=headers)
 
 
+def _unsupported_value(body: Mapping[str, object]) -> tuple[str, str] | None:
+    """Only plain text and function tools may reach a provider.
+
+    Provider-hosted tools (e.g. Groq ``browser_search``/``code_interpreter``) and non-text content
+    parts (``file``, ``image_url``, ``input_audio``; OpenRouter file handling can use paid OCR) are
+    billed outside the free plan. Returns ``(message, code)``; the message never echoes content.
+    """
+    tools = body.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list) or any(
+            not isinstance(t, dict) or t.get("type") != "function" for t in tools
+        ):
+            return "only function tools are supported", "unsupported_tool_type"
+    choice = body.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") != "function":
+        return "only function tool_choice is supported", "unsupported_tool_type"
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list) and any(
+                not isinstance(p, dict) or p.get("type") != "text" for p in content
+            ):
+                return "only text content parts are supported", "unsupported_content_type"
+    return None
+
+
 def _valid_count(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -345,6 +372,10 @@ class LlmGateway:
                 "server_error",
                 "upstream_credential_missing",
             )
+
+        rejection = _unsupported_value(body)
+        if rejection is not None:
+            return _json_error(400, rejection[0], "invalid_request_error", rejection[1])
 
         dropped = [k for k in body if k not in ALLOWED_REQUEST_KEYS and k != "model"]
         if dropped:

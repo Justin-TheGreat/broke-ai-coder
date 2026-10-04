@@ -41,7 +41,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", default="config.yaml")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", action="store_true", help="validate config and migrate DB")
-    group.add_argument("--once", action="store_true", help="start, run one cleanup, stop")
+    group.add_argument(
+        "--once",
+        action="store_true",
+        help="start, run one cleanup, stop (no gateway or opencode serve)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

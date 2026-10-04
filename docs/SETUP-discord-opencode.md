@@ -145,7 +145,7 @@ cd ~/broke-ai-coder
 bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
 ```
 
-**Residual risk R1.** Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Even so, today OpenCode runs as the same Linux user as the controller, so a deliberately rogue agent could still read `secrets.env` and `/proc/<controller pid>/environ`. This change keeps OpenCode's config and environment key-free; it is not yet a guarantee against a malicious agent. The planned fix (next round, T072) is to run OpenCode as a separate Linux user with no access to the secrets file or the controller's `/proc`. Until then, keep account-level billing off as the second layer (Part B).
+**Residual risk R1.** Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Even so, today OpenCode runs as the same Linux user as the controller, so a deliberately rogue agent could still read `secrets.env` and `/proc/<controller pid>/environ`. This change keeps OpenCode's config and environment key-free; it is not yet a guarantee against a malicious agent. The planned fix (next round, T072) is to run OpenCode as a separate Linux user with no access to the secrets file or the controller's `/proc`. Ambient cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens) are reachable the same way through the allowed `HOME`/`XDG_*`, so do not keep any of them for the WSL user until T072. Until then, keep account-level billing off as the second layer (Part B).
 
 ### C5. Workspace for agent-editable repos
 Keep repos on the Linux filesystem (not `/mnt/c/...` or OneDrive — slow and sync conflicts). This matches `opencode.working_directory: /workspace` in `config.example.yaml`:
@@ -247,6 +247,7 @@ If startup fails the daemon prints one line and exits with status 3 (for example
 - [ ] `opencode --version` output
 - [ ] `opencode auth list` shows no providers (after `opencode auth logout`)
 - [ ] Daemon started without a startup error; the log shows the gateway listening and no `did not become healthy`
+- [ ] The WSL user holds no ambient cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, Copilot tokens) until T072
 - [ ] D3 smoke test worked (yes/no + any error text)
 - [ ] Exact model IDs chosen per provider, in order
 - [ ] Discord: bot invited to server (yes/no). IDs can stay in your local `config.yaml`; you don't need to send them.

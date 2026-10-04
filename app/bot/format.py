@@ -93,6 +93,9 @@ def _finished_text(fields: dict[str, object], task_id: str | None, redactor) -> 
             lines.append(f"Offending: {offending}")
     elif error_class == "OPENCODE_UNAVAILABLE":
         lines.append("OpenCode server is not reachable.")
+        detail = _s(fields.get("detail"))
+        if detail.startswith("managed OpenCode server is down"):
+            lines.append(detail)
     return safe_text("\n".join(lines), redactor)
 
 

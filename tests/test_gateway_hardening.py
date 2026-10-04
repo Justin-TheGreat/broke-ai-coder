@@ -489,3 +489,102 @@ async def test_gateway_token_scrubbed_even_without_a_redactor(make_config):
         assert TOKEN not in text and "[REDACTED]" in text
     finally:
         await gw.stop()
+
+
+# ---- value-level allowlist: only text + function tools -------------------------------------
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"tools": [{"type": "browser_search"}]},
+        {"tools": [{"type": "code_interpreter"}]},
+        {"tools": [{"type": "function", "function": {"name": "f"}}, {"type": "browser_search"}]},
+        {"tools": ["browser_search"]},
+        {"tools": {"type": "function"}},
+        {"tools": [{"function": {"name": "f"}}]},
+        {"tool_choice": {"type": "browser_search"}},
+        {"tool_choice": {"type": "code_interpreter"}},
+        {"messages": [{"role": "user", "content": [{"type": "file", "file": {"file_id": "x"}}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {}}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "input_audio"}]}]},
+        {"messages": [{"role": "user", "content": [{"type": "text", "text": "a"}, "raw"]}]},
+        {"messages": [{"role": "tool", "content": [{"type": "file"}]}]},
+    ],
+)
+async def test_non_function_tools_and_non_text_parts_rejected(make_harness, extra):
+    h = await make_harness()
+    r = await post(h, chat(**extra))
+    assert r.status == 400
+    err = (await r.json())["error"]
+    assert err["code"] in {"unsupported_tool_type", "unsupported_content_type"}
+    assert "browser_search" not in json.dumps(err) and "file_id" not in json.dumps(err)
+    assert h.requests == [] and h.events == []
+
+
+async def test_openrouter_file_part_rejected(make_harness):
+    h = await make_harness()
+    msgs = [{"role": "user", "content": [{"type": "file", "file": {"filename": "a.pdf"}}]}]
+    r = await post(h, {"model": "openrouter/openrouter/free", "messages": msgs})
+    assert r.status == 400 and h.requests == [] and h.events == []
+
+
+async def test_function_tools_text_parts_and_string_choice_still_pass(make_harness):
+    h = await make_harness()
+    msgs = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "tool", "content": "plain"},
+    ]
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+    for choice in ("auto", {"type": "function", "function": {"name": "f"}}):
+        r = await post(h, chat(messages=msgs, tools=tools, tool_choice=choice))
+        assert r.status == 200
+    assert len(h.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"messages": [{"role": "assistant", "content": [{"type": "file", "file": {}}]}]},
+        {"messages": [{"role": "assistant", "content": [{"type": "image_url"}], "tool_calls": []}]},
+        {"messages": [{"role": "user", "content": [{"type": "mystery_part"}]}]},
+        {"messages": [{"role": "user", "content": [{"text": "no type"}]}]},
+        {"messages": [{"role": "user", "content": [{"type": None}]}]},
+        {"messages": [{"role": "user", "content": [42]}]},
+        {"messages": [{"role": "user", "content": [None]}]},
+        {"messages": [{"role": "user", "content": [[{"type": "text", "text": "nested"}]]}]},
+        {
+            "messages": [
+                {"role": "user", "content": "ok"},
+                {"role": "tool", "content": [{"type": "x"}]},
+            ]
+        },
+        {"tools": [None]},
+        {"tools": [{"type": None}]},
+        {"tool_choice": {"function": {"name": "f"}}},
+        {"tool_choice": {"type": "browser_search"}, "tools": [{"type": "function"}]},
+    ],
+)
+async def test_more_unsupported_shapes_rejected_without_echo(make_harness, extra):
+    h = await make_harness()
+    r = await post(h, chat(**extra))
+    assert r.status == 400
+    text = json.dumps(await r.json())
+    for leaked in ("mystery_part", "nested", "no type", "browser_search", "file"):
+        assert leaked not in text.replace("unsupported_content_type", "").replace(
+            "only text content parts", ""
+        ).replace("unsupported_tool_type", "")
+    assert h.requests == [] and h.events == []
+
+
+async def test_empty_tools_none_tools_and_none_choice_pass(make_harness):
+    h = await make_harness()
+    for extra in (
+        {"tools": []},
+        {"tools": None},
+        {"tool_choice": "none"},
+        {"tool_choice": "required"},
+    ):
+        r = await post(h, chat(**extra))
+        assert r.status == 200, extra

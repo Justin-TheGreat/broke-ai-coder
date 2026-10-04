@@ -138,3 +138,44 @@ async def test_gateway_usage_sink_writes_rows_with_running_task(make_config, tmp
     finally:
         await rt.controller.stop()
         await close_runtime(rt)
+
+
+async def test_once_has_no_manager_and_no_services(make_config, tmp_path):
+    rt = build_runtime(
+        cfg(make_config, tmp_path, managed_server=True),
+        redactor=SecretRedactor(),
+        environ={},
+        once=True,
+    )
+    try:
+        assert rt.server_manager is None
+        assert rt.controller._services == []
+    finally:
+        await close_runtime(rt)
+
+
+async def test_manager_launch_invalidates_orchestrator_server_config_cache(make_config, tmp_path):
+    from datetime import UTC, datetime
+
+    rt = build_runtime(
+        cfg(make_config, tmp_path, managed_server=True), redactor=SecretRedactor(), environ={}
+    )
+    try:
+        assert rt.server_manager is not None
+        rt.orchestrator._server_config_ok_at = datetime.now(UTC)
+        rt.server_manager._notify_launch()
+        assert rt.orchestrator._server_config_ok_at is None
+    finally:
+        await close_runtime(rt)
+
+
+async def test_managed_executor_unhealthy_until_manager_ready(make_config, tmp_path):
+    rt = build_runtime(
+        cfg(make_config, tmp_path, managed_server=True), redactor=SecretRedactor(), environ={}
+    )
+    try:
+        health = await rt.executor.health_check()  # manager never started: no attach, no request
+        assert not health.healthy
+        assert "managed OpenCode server is down" in health.detail
+    finally:
+        await close_runtime(rt)

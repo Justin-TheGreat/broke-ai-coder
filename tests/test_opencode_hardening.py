@@ -95,10 +95,11 @@ async def test_stop_kills_whole_process_tree(started_manager, tmp_path):
     await wait_for(lambda: not _alive(pid), timeout=15)
 
 
-async def test_stored_credentials_added_later_block_restart_path_not_leak(
+async def test_stored_credentials_added_between_starts_block_explicit_start_without_leak(
     started_manager, tmp_path
 ):
-    # start fails closed when a bad auth.json appears before the next start()
+    # an explicit start() fails closed when a bad auth.json appears after the previous run.
+    # (The monitor restart path is covered by the per-task auth.json check, not this test.)
     m = await started_manager()
     await m.stop()
     store = tmp_path / "xdg" / "opencode"

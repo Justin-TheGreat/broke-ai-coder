@@ -377,6 +377,10 @@ class Orchestrator:
     def _stop_class(self) -> str | None:
         return FAIL_DAEMON_SHUTDOWN if self._shutting_down else None
 
+    def invalidate_server_config_cache(self) -> None:
+        """Forget the cached server-config OK (the managed serve was (re)launched)."""
+        self._server_config_ok_at = None
+
     async def _server_config_state(self) -> tuple[SmallModelCheck, str]:
         """Fail-closed server-config preflight; only OK results are cached (TTL)."""
         now = self._clock()
