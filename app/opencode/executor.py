@@ -37,6 +37,7 @@ import httpx
 
 from app.config.models import OpenCodeConfig
 from app.opencode.abort import abort_opencode_session
+from app.opencode.config_check import check_project_config_async, check_small_model
 from app.opencode.events import SESSION_ID_RE, OpenCodeError, classify_text, parse_event_line
 from app.opencode.health import check_opencode_health
 from app.opencode.process import kill_process_tree
@@ -49,6 +50,7 @@ from app.runtime.interfaces import (
     ExecutorEvent,
     ExecutorEventKind,
     ExecutorHealth,
+    SmallModelCheck,
 )
 from app.timeutil import utcnow
 
@@ -97,8 +99,10 @@ class OpenCodeExecutor:
         transport: httpx.AsyncBaseTransport | None = None,
         extra_env: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] = utcnow,
+        bot_token_env: str | None = None,
     ) -> None:
         self._config = config
+        self._bot_token_env = bot_token_env
         self._redactor = redactor
         self._transport = transport
         self._extra_env = dict(extra_env or {})
@@ -139,6 +143,19 @@ class OpenCodeExecutor:
             transport=self._transport,
         )
 
+    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck:
+        return await check_small_model(
+            self._config.server_url,
+            allowed,
+            timeout_s=self._config.health_timeout_s,
+            transport=self._transport,
+        )
+
+    async def check_project_models(
+        self, allowed: frozenset[str], project_dir: str
+    ) -> tuple[SmallModelCheck, str]:
+        return await check_project_config_async(project_dir, allowed)
+
     async def aclose(self) -> None:
         return None
 
@@ -151,6 +168,19 @@ class OpenCodeExecutor:
         )
 
     # ---- helpers ---------------------------------------------------
+
+    def _child_env(self) -> dict[str, str]:
+        """os.environ minus the Discord bot token and OpenCode config-injection variables.
+
+        Provider keys stay (OpenCode needs them). OPENCODE_CONFIG / OPENCODE_CONFIG_CONTENT are
+        removed so no out-of-band config can select a model (B13).
+        """
+        env = {**os.environ, **self._extra_env}
+        for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"):
+            env.pop(name, None)
+        if self._bot_token_env:
+            env.pop(self._bot_token_env, None)
+        return env
 
     def _clean(self, text: str) -> str:
         text = _ANSI_RE.sub("", text)
@@ -308,7 +338,7 @@ class OpenCodeExecutor:
         clean_prompt = sanitize_prompt(prompt)
         if clean_prompt is None:
             return _invalid()
-        if session_id is not None and not SESSION_ID_RE.match(session_id):
+        if session_id is not None and not SESSION_ID_RE.fullmatch(session_id):
             return _invalid()
 
         executable = shutil.which(self._config.command[0])
@@ -336,7 +366,7 @@ class OpenCodeExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=project_dir,
-                env={**os.environ, **self._extra_env},
+                env=self._child_env(),
                 limit=self._config.max_line_bytes,
                 **kwargs,
             )

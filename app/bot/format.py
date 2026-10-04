@@ -82,6 +82,16 @@ def _finished_text(fields: dict[str, object], task_id: str | None, redactor) -> 
         if session_short:
             hint += f" Continue with /code session:{session_short}"
         lines.append(hint)
+    elif error_class == "OPENCODE_UNSAFE_CONFIG":
+        lines.append(
+            "OpenCode's small_model (global opencode.json) or a project opencode.json model "
+            "key is not an allowlisted free model, so the task was not run. Set small_model "
+            "in the global opencode.json to an allowlisted free model (provider/model), and "
+            "do not set other model keys to anything else."
+        )
+        offending = _s(fields.get("config_detail"))
+        if offending:
+            lines.append(f"Offending: {offending}")
     elif error_class == "OPENCODE_UNAVAILABLE":
         lines.append("OpenCode server is not reachable.")
     return safe_text("\n".join(lines), redactor)

@@ -116,6 +116,7 @@ def _data(routing, providers=("a", "b")):
     return {
         "providers": {p: {"api_key_env": f"{p.upper()}_KEY"} for p in providers},
         "routing": routing,
+        "opencode": {"provider_map": {"a": "groq", "b": "google"}},
     }
 
 

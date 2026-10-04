@@ -14,6 +14,7 @@ from app.db.connection import open_database
 from app.db.migrations import migrate
 from app.db.sessions import SessionRepository
 from app.db.tasks import TaskRepository
+from app.opencode.config_check import allowed_small_models
 from app.opencode.executor import OpenCodeExecutor
 from app.orchestrator.orchestrator import CancelResult, Orchestrator
 from app.orchestrator.state_machine import TaskStatus
@@ -26,6 +27,7 @@ from app.runtime.interfaces import (
     ExecutorEvent,
     ExecutorEventKind,
     ExecutorHealth,
+    SmallModelCheck,
 )
 
 FAKE = str(Path(__file__).parent / "fakes" / "fake_opencode.py")
@@ -43,7 +45,16 @@ def failed(ec=ErrorClass.RATE_LIMITED, *, session=None, status=429, retry=None, 
     )
 
 
-def build(tmp_path, make_config, results, *, health=HEALTHY, routing=None, orchestrator=None):
+def build(
+    tmp_path,
+    make_config,
+    results,
+    *,
+    health=HEALTHY,
+    routing=None,
+    orchestrator=None,
+    small_model=SmallModelCheck.OK,
+):
     overrides = {
         "database": {"path": str(tmp_path / "o.db")},
         "opencode": {"working_directory": str(tmp_path)},
@@ -67,7 +78,7 @@ def build(tmp_path, make_config, results, *, health=HEALTHY, routing=None, orche
                 for m in pol.model_order
             ],
         )
-    executor = ScriptedExecutor(results, health)
+    executor = ScriptedExecutor(results, health, small_model)
     orch = Orchestrator(
         cfg, executor=executor, adapters=adapters, environ=secret_env(), clock=lambda: NOW
     )
@@ -445,7 +456,14 @@ async def test_real_executor_integration(tmp_path, make_config):
         opencode={"working_directory": str(tmp_path), "command": [sys.executable, FAKE]},
         routing={"max_fallback_attempts": 5},
     )
-    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={"healthy": True}))
+    safe = sorted(allowed_small_models(cfg))[0]
+
+    def handler(req):
+        if req.url.path == "/config":
+            return httpx.Response(200, json={"small_model": safe})
+        return httpx.Response(200, json={"healthy": True})
+
+    transport = httpx.MockTransport(handler)
     executor = OpenCodeExecutor(
         cfg.opencode,
         transport=transport,
@@ -480,3 +498,35 @@ async def test_real_executor_integration(tmp_path, make_config):
     assert lines[0][lines[0].index("--model") + 1] == "openrouter/openrouter/free"
     assert lines[1][lines[1].index("--session") + 1] == "ses_fake1"
     assert lines[1][lines[1].index("--model") + 1] == "google/g-3.8"
+
+
+async def test_unsafe_small_model_fails_closed(tmp_path, make_config):
+    cfg, ex, orch = build(tmp_path, make_config, [ok()], small_model=SmallModelCheck.UNSAFE)
+    async with started(cfg, orch) as c:
+        rec = submit(c)
+        await drain(c)
+        t = get(c, rec.id)
+        assert t.status == TaskStatus.FAILED and t.error_class == "OPENCODE_UNSAFE_CONFIG"
+        assert ex.calls == []
+        assert orch.cooldowns.active(NOW) == {}
+        assert FallbackAttemptRepository(c.conn).list_for_task(rec.id) == []
+
+
+async def test_small_model_config_unavailable_is_opencode_unavailable(tmp_path, make_config):
+    cfg, ex, orch = build(tmp_path, make_config, [ok()], small_model=SmallModelCheck.UNAVAILABLE)
+    async with started(cfg, orch) as c:
+        rec = submit(c)
+        await drain(c)
+        t = get(c, rec.id)
+        assert t.status == TaskStatus.FAILED and t.error_class == "OPENCODE_UNAVAILABLE"
+        assert ex.calls == []
+
+
+async def test_small_model_ok_is_cached_for_ttl(tmp_path, make_config):
+    cfg, ex, orch = build(tmp_path, make_config, [ok()])
+    async with started(cfg, orch) as c:
+        submit(c)
+        submit(c)
+        await drain(c)
+        assert len(ex.small_model_calls) == 1 and len(ex.calls) == 2
+        assert "openrouter/openrouter/free" in ex.small_model_calls[0]

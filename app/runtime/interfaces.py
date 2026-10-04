@@ -44,6 +44,12 @@ class ExecutionOutcome(StrEnum):
     EXECUTOR_UNAVAILABLE = "EXECUTOR_UNAVAILABLE"
 
 
+class SmallModelCheck(StrEnum):
+    OK = "OK"
+    UNSAFE = "UNSAFE"  # small_model missing or not an allowlisted free model
+    UNAVAILABLE = "UNAVAILABLE"  # GET /config failed
+
+
 class ExecutorEventKind(StrEnum):
     SESSION = "SESSION"  # session id first seen
     TOOL = "TOOL"  # tool_use event
@@ -86,6 +92,10 @@ class ExecutorHealth:
 
 class AgentExecutor(Protocol):
     async def health_check(self) -> ExecutorHealth: ...
+    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck: ...
+    async def check_project_models(
+        self, allowed: frozenset[str], project_dir: str
+    ) -> tuple[SmallModelCheck, str]: ...
 
     async def run(
         self,

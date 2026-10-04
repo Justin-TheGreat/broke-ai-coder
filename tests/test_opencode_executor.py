@@ -254,10 +254,11 @@ async def test_missing_project_dir(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only launcher check")
-async def test_cmd_launcher_refused(tmp_path):
+async def test_cmd_launcher_refused(tmp_path, monkeypatch):
     cmd = tmp_path / "oc.cmd"
     cmd.write_text("@echo off\r\n")
-    ex = OpenCodeExecutor(OpenCodeConfig(command=[str(cmd)]))
+    monkeypatch.setattr("app.opencode.executor.shutil.which", lambda _c: str(cmd))
+    ex = OpenCodeExecutor(OpenCodeConfig(command=["opencode"]))
     r = await run(ex, tmp_path)
     assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE
     assert ".cmd" in (r.detail or "")
@@ -272,6 +273,131 @@ async def test_invalid_prompts_do_not_spawn(tmp_path):
     r = await run(ex, tmp_path, session_id="-bad id")
     assert r.error_class == ErrorClass.INVALID_REQUEST
     assert not (tmp_path / "argv.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["ses_ok\n", "ses_ok\r\n", "ses_ok ", " ses_ok", "ses_ok\x00", "", "ses ok", "-ses", "a" * 129],
+)
+async def test_session_id_fullmatch_failures_rejected_before_spawn(tmp_path, bad):
+    r = await run(make_exec(tmp_path), tmp_path, session_id=bad)
+    assert r.outcome == ExecutionOutcome.FAILED
+    assert r.error_class == ErrorClass.INVALID_REQUEST
+    assert not (tmp_path / "argv.txt").exists()
+
+
+async def test_valid_session_id_still_spawns(tmp_path):
+    r = await run(make_exec(tmp_path), tmp_path, session_id="ses_ok-1")
+    assert r.outcome == ExecutionOutcome.SUCCEEDED
+    assert (tmp_path / "argv.txt").exists()
+
+
+async def test_session_id_trailing_newline_rejected_before_spawn(tmp_path):
+    r = await run(make_exec(tmp_path), tmp_path, session_id="ses_ok\n")
+    assert r.outcome == ExecutionOutcome.FAILED
+    assert r.error_class == ErrorClass.INVALID_REQUEST
+    assert not (tmp_path / "argv.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["cmd", "/c", "opencode"],
+        ["CMD.EXE", "/c", "opencode"],
+        ["powershell", "-Command", "opencode"],
+        ["C:\\Windows\\System32\\pwsh.exe", "opencode"],
+        ["/bin/bash", "-c", "opencode"],
+        ["sh", "-c", "opencode"],
+        ["zsh", "opencode"],
+        ["dash", "opencode"],
+        ["wsl", "opencode"],
+        ["env", "opencode"],
+        ["start", "opencode"],
+        ["opencode", "/usr/bin/env", "x"],
+        ["C:/tools/oc.cmd"],
+        ["oc.BAT"],
+        ["node", "run.ps1"],
+        ["CMD", "/c", "opencode"],
+        ["C:\\x\\cmd.exe", "/c", "opencode"],
+        ["C:\\WINDOWS\\SYSTEM32\\CMD.EXE", "/C", "opencode"],
+        ["Powershell.EXE", "-c", "opencode"],
+        ["C:/Program Files/PowerShell/7/pwsh.exe", "opencode"],
+        ["BASH.exe", "-c", "opencode"],
+        ["/usr/bin/env", "opencode"],
+        ["C:\\Windows\\System32\\wsl.exe", "opencode"],
+        ["start.exe", "opencode"],
+        ["opencode", "x.PS1"],
+        ["opencode", "C:\\a\\b.Bat"],
+        ["opencode", "c:/a/run.CMD"],
+        ["  cmd  ", "/c", "opencode"],
+    ],
+)
+def test_command_rejects_shells_and_scripts(command):
+    with pytest.raises(ValueError):
+        OpenCodeConfig(command=command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["opencode"],
+        ["opencode.exe", "serve"],
+        ["python", "-m", "x"],
+        ["python3.12"],
+        ["node", "x.js"],
+    ],
+)
+def test_command_allows_plain_launchers(command):
+    assert OpenCodeConfig(command=command).command == command
+
+
+async def test_bot_token_removed_but_parent_environ_unchanged(tmp_path, monkeypatch):
+    import os
+
+    monkeypatch.setenv("TEST_BOT_TOKEN_VAR", "tok")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    ex = OpenCodeExecutor(
+        OpenCodeConfig(command=[sys.executable, FAKE]),
+        extra_env={"X": "1"},
+        bot_token_env="TEST_BOT_TOKEN_VAR",
+    )
+    env = ex._child_env()
+    assert "TEST_BOT_TOKEN_VAR" not in env
+    assert env["OPENROUTER_API_KEY"] == "k" and env["X"] == "1"
+    assert os.environ["TEST_BOT_TOKEN_VAR"] == "tok"
+
+
+async def test_bot_token_stripped_even_if_extra_env_sets_it(tmp_path, monkeypatch):
+    ex = OpenCodeExecutor(
+        OpenCodeConfig(command=[sys.executable, FAKE]),
+        extra_env={"TEST_BOT_TOKEN_VAR": "tok"},
+        bot_token_env="TEST_BOT_TOKEN_VAR",
+    )
+    assert "TEST_BOT_TOKEN_VAR" not in ex._child_env()
+
+
+def test_command_allows_python_and_node():
+    assert OpenCodeConfig(command=[sys.executable, FAKE]).command[0] == sys.executable
+    assert OpenCodeConfig(command=["node", "C:/path/opencode/bin/opencode"])
+
+
+async def test_bot_token_not_passed_to_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("TEST_BOT_TOKEN_VAR", "tok-should-not-leak")
+    monkeypatch.setenv("TEST_PROVIDER_KEY_VAR", "keep")
+    config = OpenCodeConfig(command=[sys.executable, FAKE])
+    ex = OpenCodeExecutor(
+        config,
+        extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": "TEST_BOT_TOKEN_VAR"},
+        bot_token_env="TEST_BOT_TOKEN_VAR",
+    )
+    r = await run(ex, tmp_path)
+    assert r.output_tail.strip() == "present=False"
+    ex2 = OpenCodeExecutor(
+        config,
+        extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": "TEST_PROVIDER_KEY_VAR"},
+        bot_token_env="TEST_BOT_TOKEN_VAR",
+    )
+    assert (await run(ex2, tmp_path)).output_tail.strip() == "present=True"
 
 
 async def test_prompt_nul_stripped_and_dash_prefixed(tmp_path):

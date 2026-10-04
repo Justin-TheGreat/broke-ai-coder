@@ -175,6 +175,20 @@ opencode models google      # Gemini (AI Studio); if empty, see note below
 - Gemini note: OpenCode's provider docs only list Vertex AI explicitly. If `opencode models google` shows nothing, run `opencode models --refresh` and check `opencode auth login` for "Google". Tell me what you see — the round-3 spec will adapt.
 - **Write down the exact `provider/model` strings** you want for each allowlist (e.g. the two Gemini Flash IDs and two Groq). These replace the `<...>` placeholders in `config.yaml`.
 
+### D2b. Pin `small_model` to a free model (required)
+OpenCode makes small background calls (for example session title generation) with a separate `small_model`. If you do not set it, OpenCode picks a "cheaper" model from the provider by itself or falls back to the main model, and there is no switch to turn these calls off. That could silently hit a paid model, so the controller refuses to run any task unless the server's effective config (`GET /config`) has `small_model` set to exactly one of your allowlisted, enabled free models. Create or edit the GLOBAL `~/.config/opencode/opencode.json` (this is the scope of the running `opencode serve`; OpenCode's server has no per-request project selector, so `GET /config` reflects the directory the server was started in). Use the `provider/model` form that `opencode models` prints:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "small_model": "groq/<a-free-groq-model-from-your-allowlist>"
+}
+```
+
+For OpenRouter the value is `openrouter/openrouter/free` (OpenCode provider `openrouter` + model `openrouter/free`). Restart `opencode serve` after changing it.
+
+Project-level files are checked separately, from disk, before every task: `opencode.json`/`opencode.jsonc` and `*.json`/`*.jsonc` directly inside `.opencode/`, in the project directory and each parent up to the git root (or just the project directory if there is no `.git`). In those files `model`, `small_model`, `agent.<name>.model` and `mode.<name>.model` must either be absent or be one of your allowlisted free models; anything else, or a file that cannot be parsed, makes the task refuse. The same keys are validated in the `GET /config` response. The controller also removes `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` from the environment of the OpenCode processes it starts (start `opencode serve` yourself without them as well). If anything is missing or not allowlisted, tasks fail with `OPENCODE_UNSAFE_CONFIG` and the Discord reply tells you to fix it; nothing is run and no fallback happens.
+
 ### D3. One-off smoke test (proves keys + OpenCode work, uses free quota)
 
 ```bash

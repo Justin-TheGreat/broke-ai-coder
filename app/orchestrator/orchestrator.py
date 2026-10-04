@@ -21,6 +21,7 @@ from app.db.attempts import AttemptStatus, FallbackAttemptRepository
 from app.db.sessions import SessionRecord, SessionRepository, SessionStatus
 from app.db.tasks import ConcurrentTransition, TaskNotFound, TaskRecord, TaskRepository
 from app.db.usage import UsageEvent, UsageRepository, UsageStatus
+from app.opencode.config_check import allowed_small_models
 from app.orchestrator.prompt import PROMPT_MAX_CHARS, sanitize_prompt
 from app.orchestrator.state_machine import (
     TERMINAL_STATUSES,
@@ -46,6 +47,7 @@ from app.runtime.interfaces import (
     ExecutionResult,
     ExecutorEvent,
     ExecutorEventKind,
+    SmallModelCheck,
 )
 from app.timeutil import utcnow
 
@@ -56,6 +58,7 @@ __all__ = [
     "FAIL_DAEMON_SHUTDOWN",
     "FAIL_INTERRUPTED_BY_RESTART",
     "FAIL_OPENCODE_UNAVAILABLE",
+    "FAIL_OPENCODE_UNSAFE_CONFIG",
     "PROMPT_MAX_CHARS",
     "CancelResult",
     "Orchestrator",
@@ -66,6 +69,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 FAIL_OPENCODE_UNAVAILABLE = "OPENCODE_UNAVAILABLE"
+FAIL_OPENCODE_UNSAFE_CONFIG = "OPENCODE_UNSAFE_CONFIG"
 FAIL_INTERRUPTED_BY_RESTART = "INTERRUPTED_BY_RESTART"
 FAIL_DAEMON_SHUTDOWN = "DAEMON_SHUTDOWN"
 
@@ -119,6 +123,7 @@ class Orchestrator:
         self._environ = environ
         self._observations: dict[str, ProviderObservation] = {}
         self._last_refresh: datetime | None = None
+        self._small_model_ok_at: datetime | None = None
         self._controller: AgentController | None = None
         self._shutting_down = False
         self._cancel_event: asyncio.Event | None = None
@@ -374,6 +379,24 @@ class Orchestrator:
     def _stop_class(self) -> str | None:
         return FAIL_DAEMON_SHUTDOWN if self._shutting_down else None
 
+    async def _small_model_state(self) -> SmallModelCheck:
+        """Fail-closed small_model preflight; only OK results are cached (TTL)."""
+        now = self._clock()
+        ttl = self._config.orchestrator.small_model_check_ttl_s
+        if (
+            self._small_model_ok_at is not None
+            and ttl > 0
+            and (now - self._small_model_ok_at).total_seconds() < ttl
+        ):
+            return SmallModelCheck.OK
+        try:
+            result = await self._executor.check_small_model(allowed_small_models(self._config))
+        except Exception as e:
+            logger.warning("small_model check failed: %s", type(e).__name__)
+            return SmallModelCheck.UNAVAILABLE
+        self._small_model_ok_at = now if result == SmallModelCheck.OK else None
+        return result
+
     async def _maybe_refresh(self, controller: AgentController) -> None:
         assert controller.conn is not None
         now = self._clock()
@@ -527,6 +550,39 @@ class Orchestrator:
                 error_class=FAIL_OPENCODE_UNAVAILABLE,
                 session=session,
                 detail=detail,
+            )
+            return
+
+        sm = await self._small_model_state()
+        if sm != SmallModelCheck.OK:
+            unsafe = sm == SmallModelCheck.UNSAFE
+            self._finish(
+                controller,
+                task_id,
+                TaskStatus.FAILED,
+                error_class=FAIL_OPENCODE_UNSAFE_CONFIG if unsafe else FAIL_OPENCODE_UNAVAILABLE,
+                session=session,
+                detail="small_model not allowlisted" if unsafe else "GET /config failed",
+            )
+            return
+
+        # Per-task on-disk project config check (never cached across projects).
+        try:
+            pc, pc_detail = await self._executor.check_project_models(
+                allowed_small_models(cfg), project_dir
+            )
+        except Exception as e:
+            logger.warning("project config check failed: %s", type(e).__name__)
+            pc, pc_detail = SmallModelCheck.UNSAFE, "project config check failed"
+        if pc != SmallModelCheck.OK:
+            self._finish(
+                controller,
+                task_id,
+                TaskStatus.FAILED,
+                error_class=FAIL_OPENCODE_UNSAFE_CONFIG,
+                session=session,
+                detail="project config not allowlisted",
+                config_detail=pc_detail,
             )
             return
 

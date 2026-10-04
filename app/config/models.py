@@ -13,6 +13,9 @@ ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
 _CFG = ConfigDict(extra="forbid", frozen=True)
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_SHELL_NAMES = frozenset(
+    {"cmd", "powershell", "pwsh", "bash", "sh", "zsh", "dash", "wsl", "env", "start"}
+)
 _OPENCODE_PROVIDERS = frozenset({"openrouter", "google", "groq"})
 
 PAID_NOT_SUPPORTED = "paid inference is not supported: this project is free-only"
@@ -241,6 +244,13 @@ class OpenCodeConfig(BaseModel):
         out = [c.strip() for c in v]
         if any(not c for c in out):
             raise ValueError("command entries must be non-empty")
+        for c in out:
+            base = re.split(r"[\\/]", c)[-1].lower()
+            if base.endswith((".cmd", ".bat", ".ps1")):
+                raise ValueError("command must not use .cmd/.bat/.ps1 launchers")
+            stem = base[:-4] if base.endswith(".exe") else base
+            if stem in _SHELL_NAMES:
+                raise ValueError(f"command must not use a shell or interpreter wrapper ({stem})")
         return out
 
     @field_validator("provider_map")
@@ -291,6 +301,7 @@ class OrchestratorConfig(BaseModel):
     progress_min_interval_s: float = Field(10, ge=0, allow_inf_nan=False)
     session_idle_close_days: float = Field(7, gt=0, allow_inf_nan=False)
     require_tool_calling: bool = False
+    small_model_check_ttl_s: float = Field(30, ge=0, allow_inf_nan=False)
 
 
 class DatabaseConfig(BaseModel):
@@ -328,7 +339,14 @@ class AppConfig(BaseModel):
         for pid, pol in self.routing.policies.items():
             if pol.provider not in self.providers:
                 raise ValueError(f"policy {pid!r} references undefined provider {pol.provider!r}")
-            if self.opencode.provider_map.get(pol.provider, pol.provider) == "openrouter":
+            mapped = self.opencode.provider_map.get(pol.provider)
+            if mapped not in _OPENCODE_PROVIDERS:
+                raise ValueError(
+                    f"policy {pid!r}: provider {pol.provider!r} is not mapped in"
+                    f" opencode.provider_map to one of {sorted(_OPENCODE_PROVIDERS)};"
+                    f" {PAID_NOT_SUPPORTED}"
+                )
+            if mapped == "openrouter":
                 for m in pol.model_order:
                     if not is_free_openrouter_model(m):
                         raise ValueError(

@@ -579,7 +579,16 @@ def _real_orch(tmp_path, make_config, scenarios, *, redactor=None, env=None, ope
         "FAKE_OC_HEARTBEAT": str(tmp_path / "hb.txt"),
         **(env or {}),
     }
-    transport = httpx.MockTransport(lambda req: httpx.Response(200, json={"healthy": True}))
+    from app.opencode.config_check import allowed_small_models
+
+    safe = sorted(allowed_small_models(cfg))[0]
+
+    def handler(req):
+        if req.url.path == "/config":
+            return httpx.Response(200, json={"small_model": safe})
+        return httpx.Response(200, json={"healthy": True})
+
+    transport = httpx.MockTransport(handler)
     executor = OpenCodeExecutor(
         cfg.opencode, redactor=redactor, transport=transport, extra_env=extra
     )
@@ -769,13 +778,14 @@ async def test_oversized_text_flood_keeps_memory_bounded_and_counts_nothing_extr
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only launcher check")
-async def test_bat_launcher_refused_and_not_spawned(tmp_path):
+async def test_bat_launcher_refused_and_not_spawned(tmp_path, monkeypatch):
     from app.config.models import OpenCodeConfig
 
     marker = tmp_path / "ran.txt"
     bat = tmp_path / "oc.bat"
     bat.write_text(f"@echo off\r\necho x> {marker}\r\n")
-    ex = OpenCodeExecutor(OpenCodeConfig(command=[str(bat)]))
+    monkeypatch.setattr("app.opencode.executor.shutil.which", lambda _c: str(bat))
+    ex = OpenCodeExecutor(OpenCodeConfig(command=["opencode"]))
     r = await _run(ex, tmp_path)
     assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE
     assert not marker.exists()

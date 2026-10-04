@@ -1,19 +1,28 @@
-# Changes: R4 round
+# Changes: F1 review fixes (A, B, F18)
 
-## app/opencode/executor.py
-- Both `_abort_session` calls in `OpenCodeExecutor.run` (cancel/timeout path and shielded outer-CancelledError path) now pass `state.session_id or session_id`. A resumed session (`--session`) is aborted even before OpenCode prints its first event. `abort_opencode_session` still re-validates the id with fullmatch.
-- Module docstring "Known gap" narrowed to brand-new sessions only.
+## Fix A: allowlist scope
+- `app/config/models.py`: `AppConfig` validation rejects any routing policy whose provider is not mapped in `opencode.provider_map` (defaults included) to openrouter/google/groq.
+- `app/opencode/config_check.py` `allowed_small_models`: only enabled policies on enabled providers mapped to those three.
 
-## tests/test_opencode_abort.py
-Four new tests, using `session_id="ses_known1"`:
-- `hang_no_session` + cancel: exactly one POST to `/session/ses_known1/abort`.
-- `hang_no_session` + timeout: same.
-- `hang_no_session` + outer task cancellation: same.
-- `hang` (stdout reports `ses_fake1`) + cancel: exactly one POST, to `/session/ses_fake1/abort` (observed id preferred).
+## Fix B: project-scope on-disk check (B13)
+- `config_check.py`: `strip_jsonc`, `check_project_config(_async)`. Scans project dir and parents up to and including the git root (project dir only if no `.git`): `opencode.json`, `opencode.jsonc`, `.opencode/*.json|jsonc`. Unparseable, non-object or non-readable files are UNSAFE. Detail names file path and key path only.
+- `executor.py`: new `check_project_models(allowed, project_dir)`; `_child_env` strips `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT`.
+- `interfaces.py`: `AgentExecutor.check_project_models`. `tests/fakes/fake_executor.py` implements it (`project_check`, `project_calls`).
+- `orchestrator.py`: after the existing `/config` check, runs the project check every task (uncached); UNSAFE gives `OPENCODE_UNSAFE_CONFIG` with `config_detail` field; an exception also fails closed.
+- `app/bot/format.py`: unsafe text mentions global small_model and project model keys, and appends "Offending: <file: key>".
 
-## Verification
-- `pytest -q`: 761 passed, 1 xfailed. `ruff check .` clean. `ruff format --check .` clean.
-- Mutation check: reverting both calls to `state.session_id` makes the 3 `hang_no_session` resumed-session tests fail (28 passed, 3 failed in test_opencode_abort.py). The fix was restored afterwards.
+## F18
+- `_bad_model_key` is applied to the `GET /config` response: `model`, `agent.*.model`, `mode.*.model` optional but allowlisted if present; `small_model` still required.
 
-## Tester focus
-None beyond the above; nothing else was changed.
+## Docs/spec
+- `docs/SETUP-discord-opencode.md` D2b (global file, project rules, env stripping), `config.example.yaml` comment, `.pipeline/spec.md` B12 update + new B13.
+
+## Tests
+- New `tests/test_project_config_check.py` (anthropic repro, disabled policy/provider, JSONC, per-project isolation, `.opencode/*`, git-root bounds, unparseable, F18 keys, child env, orchestrator never spawns).
+- `tests/test_config.py::_data` now maps providers a/b (needed by the new load rule).
+- Results: 922 passed, 1 xfailed; ruff check/format clean; `-m app --check` OK.
+
+## Suggested mutation checks
+- A: in `allowed_small_models` replace `mapped not in _FREE_PROVIDERS` with `False` (or drop the load-time check in `models.py`): the anthropic and disabled-provider tests must fail.
+- B: make `_scope_dirs` return `[start]` only, or have the orchestrator skip `check_project_models`: the parent/git-root and orchestrator-never-spawns tests must fail. Also remove the `pop` of `OPENCODE_CONFIG_CONTENT`: the child env test must fail.
+- F18: delete the `_bad_model_key(body, allowed)` call in `check_small_model`: `test_config_response_other_model_keys_unsafe` must fail.

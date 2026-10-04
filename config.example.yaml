@@ -47,11 +47,19 @@ opencode:
   output_tail_chars: 4000
   stderr_tail_bytes: 4096
   continue_prompt: "Continue the previous task from where it stopped. Do not repeat steps that already completed."
+  # SAFETY: OpenCode's background `small_model` must be set in the GLOBAL
+  # ~/.config/opencode/opencode.json ("provider/model") to one of the allowlisted free models
+  # below, e.g. "groq/<model>" or "openrouter/openrouter/free" (checked via GET <server_url>/config).
+  # Project opencode.json / .opencode/*.json files (project dir up to the git root) are also
+  # checked per task: model, small_model, agent.*.model, mode.*.model must be allowlisted or
+  # absent. Otherwise tasks fail closed with OPENCODE_UNSAFE_CONFIG.
+  # Every routing policy provider must be mapped in provider_map to openrouter/google/groq.
 orchestrator:
   provider_refresh_interval_s: 300
   progress_min_interval_s: 10
   session_idle_close_days: 7
   require_tool_calling: false
+  small_model_check_ttl_s: 30   # cache a passing small_model check this long
 database:
   path: data/agent-controller.db
   busy_timeout_ms: 5000

@@ -9,6 +9,7 @@ from app.runtime.interfaces import (
     ExecutionResult,
     ExecutorEvent,
     ExecutorHealth,
+    SmallModelCheck,
 )
 
 HEALTHY = ExecutorHealth(True, "0.0-test", "ok")
@@ -17,7 +18,17 @@ Item = ExecutionResult | Callable[..., Awaitable[ExecutionResult]]
 
 
 class ScriptedExecutor:
-    def __init__(self, results: list[Item], health: ExecutorHealth = HEALTHY) -> None:
+    def __init__(
+        self,
+        results: list[Item],
+        health: ExecutorHealth = HEALTHY,
+        small_model: SmallModelCheck = SmallModelCheck.OK,
+        project_check: SmallModelCheck = SmallModelCheck.OK,
+    ) -> None:
+        self.project_check = project_check
+        self.project_calls: list[str] = []
+        self.small_model = small_model
+        self.small_model_calls: list[frozenset[str]] = []
         self._results = list(results)
         self._health = health
         self.calls: list[dict[str, Any]] = []
@@ -26,6 +37,16 @@ class ScriptedExecutor:
     async def health_check(self) -> ExecutorHealth:
         self.health_calls += 1
         return self._health
+
+    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck:
+        self.small_model_calls.append(allowed)
+        return self.small_model
+
+    async def check_project_models(
+        self, allowed: frozenset[str], project_dir: str
+    ) -> tuple[SmallModelCheck, str]:
+        self.project_calls.append(project_dir)
+        return self.project_check, "fake.json: key 'model' is not an allowlisted model"
 
     async def run(
         self,

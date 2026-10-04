@@ -32,7 +32,9 @@ def build_runtime(
     once: bool = False,
 ) -> Runtime:
     adapters = build_adapters(config, environ=environ, redactor=redactor)
-    executor = OpenCodeExecutor(config.opencode, redactor=redactor)
+    executor = OpenCodeExecutor(
+        config.opencode, redactor=redactor, bot_token_env=config.discord.bot_token_env
+    )
     orchestrator = Orchestrator(config, executor=executor, adapters=adapters, environ=environ)
     frontend: ChatFrontend
     if once:

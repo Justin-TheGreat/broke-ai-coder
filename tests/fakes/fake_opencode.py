@@ -152,6 +152,10 @@ def main() -> int:
         sys.stdout.flush()
         success()
         return 0
+    if scenario == "env_dump":
+        name = os.environ.get("FAKE_OC_BOT_VAR", "")
+        emit({"type": "text", "sessionID": SID, "part": {"text": f"present={name in os.environ}"}})
+        return 0
     if scenario == "secret_echo":
         secret = os.environ.get("FAKE_OC_SECRET", "")
         emit({"type": "text", "sessionID": SID, "part": {"text": f"token is {secret}"}})
