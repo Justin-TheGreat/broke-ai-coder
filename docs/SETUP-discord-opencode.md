@@ -2,14 +2,14 @@
 
 > For broke-ai-coder (round 3 prerequisites). Checked against OpenCode docs on 2026-10-01.
 > Never paste a token or API key into Discord, Claude chat, Git, or `config.yaml`.
-> Secrets live only in one WSL env file (Part C).
+> Secrets live only in one WSL env file (Part C), loaded only for the controller's start command.
 
 What you will end up with:
 
 ```text
 WSL Ubuntu-24.04
 ├── ~/.config/broke-ai-coder/secrets.env   (chmod 600: bot token + provider keys)
-├── opencode serve on 127.0.0.1:4096       (localhost only)
+├── opencode serve on 127.0.0.1:4096       (started and restarted by the controller, password-protected)
 ├── /workspace/                            (repos the agent may edit)
 └── ~/broke-ai-coder/                      (the controller, cloned from GitHub)
 Discord
@@ -73,8 +73,10 @@ With billing absent everywhere, hitting a limit just returns a 429 error and the
 | Provider | Where to create the key | Env var(s) |
 |---|---|---|
 | OpenRouter | <https://openrouter.ai/settings/keys> | `OPENROUTER_API_KEY` |
-| Gemini (AI Studio) | <https://aistudio.google.com/apikey> | `GEMINI_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` (same value; the controller reads the first, OpenCode the second) |
+| Gemini (AI Studio) | <https://aistudio.google.com/apikey> | `GEMINI_API_KEY` only |
 | Groq | <https://console.groq.com/keys> | `GROQ_API_KEY` |
+
+These keys are for the **controller only**. Never give them to OpenCode: do not run `opencode auth login`, and do not export them in a shell where you run `opencode` yourself. The controller holds them in a loopback gateway; OpenCode only gets a random per-run token that unlocks your allowlisted free models on 127.0.0.1.
 
 While in each dashboard, note the free-tier limits it shows (RPM/RPD/TPM). They go in `providers.<p>.limits` in `config.yaml` later; nothing is hard-coded in the app.
 
@@ -126,18 +128,24 @@ Contents (replace the placeholders; no quotes or spaces around `=`):
 export DISCORD_BOT_TOKEN=paste-here
 export OPENROUTER_API_KEY=paste-here
 export GEMINI_API_KEY=paste-here
-export GOOGLE_GENERATIVE_AI_API_KEY=paste-same-gemini-key-here
 export GROQ_API_KEY=paste-here
 ```
 
-Load it in every shell, then verify **names only** (never `echo` the values):
+Load it **only in the daemon's start command** (Part E), never in `~/.bashrc`. Check the file shows 4 lines and print **names only** (never print the values):
 
 ```bash
-echo 'source ~/.config/broke-ai-coder/secrets.env' >> ~/.bashrc
-source ~/.bashrc
-env | grep -oE '^(DISCORD_BOT_TOKEN|OPENROUTER_API_KEY|GEMINI_API_KEY|GOOGLE_GENERATIVE_AI_API_KEY|GROQ_API_KEY)='
-# expect 5 lines
+grep -c '^export ' ~/.config/broke-ai-coder/secrets.env     # expect 4
+cut -d= -f1 ~/.config/broke-ai-coder/secrets.env             # names only
 ```
+
+Start the controller with the file loaded for that one command (this is also what a tmux window or service unit should run):
+
+```bash
+cd ~/broke-ai-coder
+bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
+```
+
+**Residual risk R1.** Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Even so, today OpenCode runs as the same Linux user as the controller, so a deliberately rogue agent could still read `secrets.env` and `/proc/<controller pid>/environ`. This change keeps OpenCode's config and environment key-free; it is not yet a guarantee against a malicious agent. The planned fix (next round, T072) is to run OpenCode as a separate Linux user with no access to the secrets file or the controller's `/proc`. Until then, keep account-level billing off as the second layer (Part B).
 
 ### C5. Workspace for agent-editable repos
 Keep repos on the Linux filesystem (not `/mnt/c/...` or OneDrive — slow and sync conflicts). This matches `opencode.working_directory: /workspace` in `config.example.yaml`:
@@ -161,65 +169,45 @@ opencode --version
 
 (Alternative if the script fails: install Node.js LTS, then `npm install -g opencode-ai`.)
 
-### D2. Confirm OpenCode sees your providers
-Because the keys are environment variables, OpenCode should detect them without `/connect`:
+### D2. Give OpenCode no keys
+OpenCode is given **no** provider keys and no stored credentials. The controller launches it with a minimal environment and an inline config whose only provider is the built-in gateway.
 
 ```bash
 opencode auth list
-opencode models openrouter | grep -i free
-opencode models groq
-opencode models google      # Gemini (AI Studio); if empty, see note below
 ```
 
-- If a provider is missing, run `opencode auth login` and pick it (stored in `~/.local/share/opencode/auth.json`). Prefer the env-var route so the controller and OpenCode share one source.
-- Gemini note: OpenCode's provider docs only list Vertex AI explicitly. If `opencode models google` shows nothing, run `opencode models --refresh` and check `opencode auth login` for "Google". Tell me what you see — the round-3 spec will adapt.
-- **Write down the exact `provider/model` strings** you want for each allowlist (e.g. the two Gemini Flash IDs and two Groq). These replace the `<...>` placeholders in `config.yaml`.
+- If this lists any provider, run `opencode auth logout` for **each** one. The daemon refuses to start while `~/.local/share/opencode/auth.json` (or `$XDG_DATA_HOME/opencode/auth.json`) holds any provider entry.
+- Remove any `provider`, `model`, `small_model` or `enabled_providers` entries from `~/.config/opencode/opencode.json`. The controller sets them itself (D2b).
+- Take the model ids for `config.yaml` (`routing.policies.*.model_order`) from each provider's dashboard or models API, **not** from `opencode models`, which no longer lists your providers. OpenRouter must be `openrouter/free` or end in `:free`.
 
-### D2b. Pin `small_model` to a free model (required)
-OpenCode makes small background calls (for example session title generation) with a separate `small_model`. If you do not set it, OpenCode picks a "cheaper" model from the provider by itself or falls back to the main model, and there is no switch to turn these calls off. That could silently hit a paid model, so the controller refuses to run any task unless the server's effective config (`GET /config`) has `small_model` set to exactly one of your allowlisted, enabled free models. Create or edit the GLOBAL `~/.config/opencode/opencode.json` (this is the scope of the running `opencode serve`; OpenCode's server has no per-request project selector, so `GET /config` reflects the directory the server was started in). Use the `provider/model` form that `opencode models` prints:
+### D2b. `model` and `small_model` are pinned by the controller
+OpenCode makes small background calls (for example session title generation) with a separate `small_model`. The controller pins `model` and `small_model` itself through `OPENCODE_CONFIG_CONTENT` (optionally choose the small one with `gateway.small_model: "<provider>/<model>"` in `config.yaml`), together with `enabled_providers: ["broke"]`, so only the gateway provider can resolve. There is no manual edit.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "small_model": "groq/<a-free-groq-model-from-your-allowlist>"
-}
-```
+Before every task the controller checks `GET /config` of its own server (exactly that gateway-only shape) and that no OpenCode credentials are stored. It also checks project files on disk: `opencode.json`/`opencode.jsonc` and `*.json`/`*.jsonc` directly inside `.opencode/`, in the project directory and every parent up to the filesystem root. Project files must not contain `provider`, `enabled_providers` or `disabled_providers`, and `model`, `small_model`, `agent.<name>.model`, `mode.<name>.model` and `command.<name>.model` must be absent or of the form `broke/<provider>/<model>` from your allowlist. Anything else (or an unparseable file) makes the task fail with `OPENCODE_UNSAFE_CONFIG`; nothing is run and no fallback happens.
 
-For OpenRouter the value is `openrouter/openrouter/free` (OpenCode provider `openrouter` + model `openrouter/free`). Restart `opencode serve` after changing it.
-
-Project-level files are checked separately, from disk, before every task: `opencode.json`/`opencode.jsonc` and `*.json`/`*.jsonc` directly inside `.opencode/`, in the project directory and each parent up to the git root (or just the project directory if there is no `.git`). In those files `model`, `small_model`, `agent.<name>.model` and `mode.<name>.model` must either be absent or be one of your allowlisted free models; anything else, or a file that cannot be parsed, makes the task refuse. The same keys are validated in the `GET /config` response. The controller also removes `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` from the environment of the OpenCode processes it starts (start `opencode serve` yourself without them as well). If anything is missing or not allowlisted, tasks fail with `OPENCODE_UNSAFE_CONFIG` and the Discord reply tells you to fix it; nothing is run and no fallback happens.
-
-### D3. One-off smoke test (proves keys + OpenCode work, uses free quota)
+### D3. Smoke test (uses free quota)
+With no keys in OpenCode, a manual `opencode run` cannot work, so test through the controller:
 
 ```bash
 mkdir -p /workspace/hello && cd /workspace/hello && git init -q
-opencode run --model groq/<a-groq-model-id-from-D2> "Create hello.py that prints hello, then run it."
-ls; cat hello.py
 ```
 
-### D4. Run the headless server (localhost only)
+Start the daemon (Part E), then in Discord run `/code` on project `default` (`/workspace` in the example config) or, for `/workspace/hello`, add it under `opencode.projects` and use `/code project:hello`, asking for "Create hello.py that prints hello, then run it."
+
+### D4. The controller runs `opencode serve` for you
+Do **not** run `opencode serve` yourself. The daemon starts it on `127.0.0.1:<opencode.server_port>` (default 4096) with a random Basic-auth password, a daemon-owned working directory (`opencode.server_directory`), a key-free environment and the inline gateway config. It restarts it with backoff if it crashes. Stop any old tmux `opencode serve` session:
 
 ```bash
-tmux new -s opencode
-opencode serve --hostname 127.0.0.1 --port 4096
-# detach with Ctrl+b then d; reattach with: tmux attach -t opencode
-```
-
-Check it from a second Ubuntu shell:
-
-```bash
-curl -s http://127.0.0.1:4096/global/health
-# expect: {"healthy":true,"version":"..."}
-cd /workspace/hello
-opencode run --attach http://127.0.0.1:4096 --model groq/<same-model-id> "Add a docstring to hello.py"
+tmux kill-session -t opencode 2>/dev/null; pgrep -af 'opencode serve' || true
 ```
 
 Security rules (SPEC §11):
-- Never use `--hostname 0.0.0.0` and never port-forward 4096 on your router.
-- If you ever need it reachable beyond localhost (e.g. Tailscale), first set `OPENCODE_SERVER_PASSWORD` (and optionally `OPENCODE_SERVER_USERNAME`) in `secrets.env` to turn on HTTP Basic auth.
+- The server and the gateway bind to `127.0.0.1` only. Never port-forward them.
+- The gateway token and server password are random per run and visible to the agent. That is acceptable: they only unlock allowlisted free models on localhost.
+- `opencode.managed_server: false` (daemon does not start `serve`, uses `opencode.server_url` without a password) exists for tests and debugging only and is unsupported for production: an externally started server cannot pass the gateway-only preflight.
 
 ### D5. Keep it running
-- WSL shuts down when no Windows terminal is attached and nothing is running; leaving the tmux session open in a terminal is enough for now.
+- Keep the controller itself running in a terminal or tmux window; it supervises `opencode serve`.
 - Automatic start on reboot is task T102 and will be done in a later round (systemd user service or Task Scheduler).
 
 ---
@@ -240,24 +228,27 @@ cp config.example.yaml config.yaml     # config.yaml holds IDs only, never secre
 
 Edit `config.yaml`:
 - `discord.allowed_user_ids / allowed_guild_ids / allowed_channel_ids` ← Part A5 (as strings or numbers per the config schema).
-- `routing.policies.*.model_order` ← the model IDs from D2.
+- `routing.policies.*.model_order` ← the model IDs from each provider's dashboard (D2).
 - Optional `providers.<p>.limits` ← numbers from Part B dashboards.
 
 Then:
 
 ```bash
 .venv/bin/python -m app --check --config config.yaml
+bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
 ```
+
+If startup fails the daemon prints one line and exits with status 3 (for example `OpenCode has stored provider credentials for: ...` or `opencode serve did not become healthy: ...`); see Troubleshooting.
 
 ---
 
 ## Checklist — send me these when done (no secrets)
 
 - [ ] `opencode --version` output
-- [ ] `curl http://127.0.0.1:4096/global/health` output
+- [ ] `opencode auth list` shows no providers (after `opencode auth logout`)
+- [ ] Daemon started without a startup error; the log shows the gateway listening and no `did not become healthy`
 - [ ] D3 smoke test worked (yes/no + any error text)
 - [ ] Exact model IDs chosen per provider, in order
-- [ ] Whether `opencode models google` listed Gemini models
 - [ ] Discord: bot invited to server (yes/no). IDs can stay in your local `config.yaml`; you don't need to send them.
 - [ ] `python -m app --check` output from WSL
 
@@ -267,10 +258,16 @@ Do **not** send: the Discord bot token, any API key, or the contents of `secrets
 
 | Symptom | Fix |
 |---|---|
-| `opencode: command not found` | `source ~/.bashrc`, or open a new Ubuntu shell |
-| Provider missing in `opencode auth list` | `source ~/.config/broke-ai-coder/secrets.env`; check var name spelling |
+| `opencode: command not found` | `source ~/.bashrc`, or open a new Ubuntu shell. The daemon prints `opencode executable not found` and exits 3 |
+| `OpenCode has stored provider credentials for: ...` (exit 3, or task `OPENCODE_UNSAFE_CONFIG`) | Run `opencode auth logout` for each listed provider; OpenCode must hold no provider keys |
+| `OpenCode credential store unreadable: <path>` | `auth.json` is not valid JSON or not readable; fix or delete it |
+| `opencode serve did not become healthy: ...` (exit 3) | See the exit code and stderr tail in the message; check `opencode.command`, that `opencode.server_port` is not already used (stop any old tmux `opencode serve`), and `opencode.server_start_timeout_s` |
+| `no enabled allowlisted models; check routing.provider_order/policies` | Enable at least one policy listed in `routing.provider_order` whose provider is enabled |
+| Tasks fail with `OPENCODE_UNSAFE_CONFIG` | Remove `provider`/`enabled_providers`/`disabled_providers` and non-`broke/...` model keys from project `opencode.json` files, and run `opencode auth logout` |
+| Gateway returns 503 `upstream_credential_missing` | The daemon was started without `secrets.env` loaded; use the start command in C4/E |
 | 401 from a provider | Key copied wrong or revoked — regenerate in that dashboard, update `secrets.env` |
-| 429 in smoke test | Free-tier limit hit — try another provider's model; this is what the router fallback handles |
-| `curl` to 4096 refused | `tmux attach -t opencode` — server not running or crashed |
+| 429 in smoke test | Free-tier limit hit — the gateway answers 429 and the router falls back to the next free provider |
+| Health `curl` to 4096 returns 401 | Expected: the managed server needs its random password; check the controller log instead |
 | Bot token leaked | Developer Portal → Bot → **Reset Token**, update `secrets.env` |
+| Keys exported in `~/.bashrc` | Remove the `source ...secrets.env` line (residual risk R1) and open a new shell |
 | Slash commands not visible on iPhone | Expected until round 3 registers them; then fully quit and reopen Discord |

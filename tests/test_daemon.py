@@ -210,3 +210,90 @@ async def test_cleanup_closes_idle_sessions(tmp_path):
         assert repo.get(old.id).status == SessionStatus.CLOSED
     finally:
         await c.stop()
+
+
+# ---- runtime services ----------------------------------------------------------------------
+
+
+class RecordingService:
+    def __init__(self, name, log, ctrl_ref, fail_start=False, fail_stop=False):
+        self.name, self.log, self.ctrl_ref = name, log, ctrl_ref
+        self.fail_start, self.fail_stop = fail_start, fail_stop
+
+    async def start(self):
+        c = self.ctrl_ref[0]
+        assert c.conn is not None and c._tasks == []  # DB ready, workers not started yet
+        self.log.append(f"start:{self.name}")
+        if self.fail_start:
+            raise RuntimeError("boom")
+
+    async def stop(self):
+        c = self.ctrl_ref[0]
+        assert c.conn is not None  # conn is closed only after services stop
+        assert c._tasks == []  # workers were cancelled first
+        self.log.append(f"stop:{self.name}")
+        if self.fail_stop:
+            raise RuntimeError("stop-boom")
+
+
+class RecordingFrontend:
+    def __init__(self, log):
+        self.log = log
+
+    async def start(self, controller):
+        self.log.append("frontend:start")
+
+    async def stop(self):
+        self.log.append("frontend:stop")
+
+    async def on_event(self, event):
+        return None
+
+
+async def test_services_start_before_frontend_and_stop_after_workers_in_reverse(tmp_path):
+    log, ref = [], []
+    services = [RecordingService("a", log, ref), RecordingService("b", log, ref)]
+    c = AgentController(cfg_for(tmp_path), frontend=RecordingFrontend(log), services=services)
+    ref.append(c)
+    await c.start()
+    assert log == ["start:a", "start:b", "frontend:start"]
+    await c.stop()
+    assert log == [
+        "start:a",
+        "start:b",
+        "frontend:start",
+        "frontend:stop",
+        "stop:b",
+        "stop:a",
+    ]
+    assert c.conn is None
+
+
+async def test_failing_second_service_stops_first_and_closes_conn(tmp_path):
+    log, ref = [], []
+    services = [
+        RecordingService("a", log, ref),
+        RecordingService("b", log, ref, fail_start=True),
+        RecordingService("c", log, ref),
+    ]
+    c = AgentController(cfg_for(tmp_path), frontend=RecordingFrontend(log), services=services)
+    ref.append(c)
+    with pytest.raises(RuntimeError, match="boom"):
+        await c.start()
+    # only the service that started is stopped; the frontend never started
+    assert log == ["start:a", "start:b", "stop:a"]
+    assert c.conn is None
+
+
+async def test_service_stop_failure_does_not_prevent_other_stops(tmp_path):
+    log, ref = [], []
+    services = [
+        RecordingService("a", log, ref),
+        RecordingService("b", log, ref, fail_stop=True),
+    ]
+    c = AgentController(cfg_for(tmp_path), services=services)
+    ref.append(c)
+    await c.start()
+    await c.stop()
+    assert log[-2:] == ["stop:b", "stop:a"]
+    assert c.conn is None

@@ -25,6 +25,7 @@ async def abort_opencode_session(
     *,
     timeout_s: float,
     transport: httpx.AsyncBaseTransport | None = None,
+    auth: httpx.Auth | None = None,
 ) -> bool:
     """Return True when the server answered 2xx. Never raises."""
     if session_id is None or SESSION_ID_RE.fullmatch(session_id) is None:
@@ -32,7 +33,11 @@ async def abort_opencode_session(
     url = server_url.rstrip("/") + ABORT_PATH_TEMPLATE.format(session_id=session_id)
     try:
         async with httpx.AsyncClient(
-            transport=transport, timeout=timeout_s, follow_redirects=False
+            transport=transport,
+            timeout=timeout_s,
+            follow_redirects=False,
+            trust_env=False,
+            auth=auth,
         ) as client:
             response = await client.post(url)
         return response.is_success

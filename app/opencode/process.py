@@ -4,13 +4,35 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
+from pathlib import Path
+from typing import Any
+
+from app.runtime.interfaces import StartupError
 
 logger = logging.getLogger(__name__)
 
 _TASKKILL_TIMEOUT_S = 10.0
+
+
+def resolve_executable(command: str) -> str:
+    """Resolve ``command`` on PATH. Raises StartupError when missing or a .cmd/.bat launcher."""
+    executable = shutil.which(command)
+    if executable is None:
+        raise StartupError("opencode executable not found")
+    if sys.platform == "win32" and Path(executable).suffix.lower() in (".cmd", ".bat"):
+        raise StartupError("refusing .cmd/.bat launcher; set opencode.command")
+    return executable
+
+
+def spawn_kwargs() -> dict[str, Any]:
+    """Process-group kwargs so ``kill_process_tree`` can reach the whole tree."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
 
 
 def _killpg(pid: int, sig: int) -> None:

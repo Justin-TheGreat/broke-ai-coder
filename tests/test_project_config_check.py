@@ -10,15 +10,17 @@ from pathlib import Path
 import httpx
 import pytest
 from conftest import NOW, _base_config_dict, secret_env
+from oc_helpers import GATEWAY_URL, good_config
 
 from app.config.loader import ConfigError, parse_config
 from app.db.tasks import TaskRepository
 from app.opencode.config_check import (
-    allowed_small_models,
     check_project_config,
-    check_small_model,
+    check_server_config,
+    opencode_model_ids,
     strip_jsonc,
 )
+from app.opencode.endpoint import ServerEndpoint
 from app.opencode.executor import OpenCodeExecutor
 from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.state_machine import TaskStatus
@@ -27,8 +29,8 @@ from app.providers.fake import FakeProviderAdapter
 from app.runtime.daemon import AgentController, TaskSubmission
 from app.runtime.interfaces import SmallModelCheck
 
-OK = "groq/q-x"
-ALLOWED = frozenset({OK, "openrouter/openrouter/free"})
+OK = "broke/groq/q-x"
+ALLOWED = frozenset({OK, "broke/openrouter/openrouter/free"})
 FAKE = str(Path(__file__).parent / "fakes" / "fake_opencode.py")
 
 
@@ -46,26 +48,26 @@ def _anthropic_data():
     return data
 
 
-def test_unmapped_provider_rejected_at_load():
+def test_unsupported_provider_rejected_at_load():
     # The exact repro: provider "anthropic" / model "claude-opus-4" must not load at all.
-    with pytest.raises(ConfigError, match="not mapped"):
+    with pytest.raises(ConfigError, match="free-only"):
         parse_config(_anthropic_data())
 
 
 def test_anthropic_never_reaches_allowlist(make_config):
-    assert "anthropic/claude-opus-4" not in allowed_small_models(make_config())
+    assert not any("anthropic" in m for m in opencode_model_ids(make_config()))
 
 
 def test_allowlist_excludes_disabled_policy_and_provider(make_config):
-    full = allowed_small_models(make_config())
-    assert "groq/q-x" in full and "google/g-3.8" in full
+    full = opencode_model_ids(make_config())
+    assert "broke/groq/q-x" in full and "broke/gemini/g-3.8" in full
     cfg = make_config(providers={"groq": {"enabled": False, "api_key_env": "GROQ_API_KEY"}})
-    out = allowed_small_models(cfg)
-    assert not any(m.startswith("groq/") for m in out) and "google/g-3.8" in out
+    out = opencode_model_ids(cfg)
+    assert not any(m.startswith("broke/groq/") for m in out) and "broke/gemini/g-3.8" in out
     pol = _base_config_dict()["routing"]["policies"]
     pol["gemini-free"]["enabled"] = False
-    out2 = allowed_small_models(make_config(routing={"policies": pol}))
-    assert not any(m.startswith("google/") for m in out2) and "groq/q-x" in out2
+    out2 = opencode_model_ids(make_config(routing={"policies": pol}))
+    assert not any(m.startswith("broke/gemini/") for m in out2) and "broke/groq/q-x" in out2
 
 
 # ---- JSONC -----------------------------------------------------------------------------
@@ -148,13 +150,15 @@ def test_bad_model_keys_unsafe(tmp_path, rel, data, key):
     assert status == SmallModelCheck.UNSAFE and key in detail and rel.split("/")[-1] in detail
 
 
-def test_parent_dirs_up_to_git_root_checked_not_above(tmp_path):
+def test_parent_dirs_all_the_way_to_root_are_checked(tmp_path):
     root = tmp_path / "repo"
     (root / ".git").mkdir(parents=True)
     proj = root / "pkg" / "sub"
     proj.mkdir(parents=True)
-    write(tmp_path / "opencode.json", {"model": "openai/gpt-4o"})  # above the git root
     assert check(proj)[0] == SmallModelCheck.OK
+    write(tmp_path / "opencode.json", {"model": "openai/gpt-4o"})  # above the git root
+    assert check(proj)[0] == SmallModelCheck.UNSAFE
+    (tmp_path / "opencode.json").unlink()
     write(root / "pkg" / "opencode.json", {"small_model": "openai/gpt-4o"})
     assert check(proj)[0] == SmallModelCheck.UNSAFE
     (root / "pkg" / "opencode.json").unlink()
@@ -162,18 +166,35 @@ def test_parent_dirs_up_to_git_root_checked_not_above(tmp_path):
     assert check(proj)[0] == SmallModelCheck.UNSAFE
 
 
-def test_without_git_only_project_dir_checked(tmp_path):
+def test_without_git_parent_files_are_still_checked(tmp_path):
     proj = tmp_path / "p"
     proj.mkdir()
     write(tmp_path / "opencode.json", {"model": "openai/gpt-4o"})
-    assert check(proj)[0] == SmallModelCheck.OK
+    status, detail = check(proj)
+    assert status == SmallModelCheck.UNSAFE and "model" in detail
+
+
+@pytest.mark.parametrize("key", ["provider", "enabled_providers", "disabled_providers"])
+def test_project_file_must_not_configure_providers(tmp_path, key):
+    write(tmp_path / "opencode.json", {key: {"x": {"options": {"apiKey": "sk-leak"}}}})
+    status, detail = check(tmp_path)
+    assert status == SmallModelCheck.UNSAFE
+    assert f"key '{key}' is not allowed in project config" in detail
+    assert "sk-leak" not in detail
+
+
+def test_project_command_section_model_checked(tmp_path):
+    write(tmp_path / "opencode.json", {"command": {"x": {"model": "anthropic/claude"}}})
+    status, detail = check(tmp_path)
+    assert status == SmallModelCheck.UNSAFE and "command.x.model" in detail
+    assert "claude" not in detail
 
 
 def test_jsonc_file_with_comments_parses(tmp_path):
     write(
         tmp_path / "opencode.jsonc",
-        '{\n // c\n "small_model": "groq/q-x", /* b */\n'
-        ' "agent": {"a": {"model": "groq/q-x",},},\n}',
+        '{\n // c\n "small_model": "broke/groq/q-x", /* b */\n'
+        ' "agent": {"a": {"model": "broke/groq/q-x",},},\n}',
     )
     assert check(tmp_path)[0] == SmallModelCheck.OK
 
@@ -193,12 +214,18 @@ def test_unreadable_non_file_unsafe(tmp_path):
 
 
 async def probe(body):
-    return await check_small_model(
-        "http://127.0.0.1:4096",
-        ALLOWED,
+    out, _ = await check_server_config(
+        ServerEndpoint("http://127.0.0.1:4096"),
+        opencode_model_ids(parse_config(_base_config_dict())),
+        gateway_base_url=GATEWAY_URL,
         timeout_s=1,
         transport=httpx.MockTransport(lambda r: httpx.Response(200, json=body)),
     )
+    return out
+
+
+def server_body(**extra):
+    return {**good_config(parse_config(_base_config_dict())), **extra}
 
 
 @pytest.mark.parametrize(
@@ -208,34 +235,46 @@ async def probe(body):
         {"model": 3},
         {"agent": {"a": {"model": "openai/gpt-4o"}}},
         {"mode": {"a": {"model": "openai/gpt-4o"}}},
+        {"command": {"a": {"model": "openai/gpt-4o"}}},
         {"agent": []},
     ],
 )
 async def test_config_response_other_model_keys_unsafe(extra):
-    assert await probe({"small_model": OK, **extra}) == SmallModelCheck.UNSAFE
+    assert await probe(server_body(**extra)) == SmallModelCheck.UNSAFE
 
 
 async def test_config_response_other_keys_optional_and_small_required():
-    assert await probe({"small_model": OK}) == SmallModelCheck.OK
-    ok = {"small_model": OK, "model": OK, "agent": {"a": {"model": OK}, "b": {}}}
+    assert await probe(server_body()) == SmallModelCheck.OK
+    ok = server_body(model=OK, agent={"a": {"model": OK}, "b": {}})
     assert await probe(ok) == SmallModelCheck.OK
-    assert await probe({"model": OK}) == SmallModelCheck.UNSAFE
+    body = server_body()
+    del body["small_model"]
+    assert await probe(body) == SmallModelCheck.UNSAFE
 
 
-# ---- child env ---------------------------------------------------------------------------
+# ---- child env (allowlist) ---------------------------------------------------------------
 
 
-def test_child_env_strips_config_injection_vars(monkeypatch, make_config):
-    monkeypatch.setenv("OPENCODE_CONFIG", "/x/oc.json")
-    monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", '{"model":"openai/gpt-4o"}')
-    monkeypatch.setenv("GROQ_API_KEY", "keep")
+def test_child_env_has_no_config_injection_vars_or_keys(make_config):
+    environ = {
+        "PATH": "/bin",
+        "OPENCODE_CONFIG": "/x/oc.json",
+        "OPENCODE_CONFIG_CONTENT": '{"model":"openai/gpt-4o"}',
+        "OPENCODE_CONFIG_DIR": "/x",
+        "GROQ_API_KEY": "secret-groq",
+        "DISCORD_BOT_TOKEN": "tok",
+    }
     ex = OpenCodeExecutor(
         make_config().opencode,
-        extra_env={"OPENCODE_CONFIG_CONTENT": "{}", "OPENCODE_CONFIG": "y"},
+        environ=environ,
+        extra_env={"OPENCODE_CONFIG_CONTENT": "{}"},
     )
     env = ex._child_env()
-    assert "OPENCODE_CONFIG" not in env and "OPENCODE_CONFIG_CONTENT" not in env
-    assert env["GROQ_API_KEY"] == "keep"
+    assert env["PATH"] == "/bin"
+    for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "GROQ_API_KEY", "DISCORD_BOT_TOKEN"):
+        assert name not in env
+    # the executor's explicit extra_env is the only way to add variables
+    assert env["OPENCODE_CONFIG_CONTENT"] == "{}"
 
 
 # ---- orchestrator: executor never spawned on UNSAFE -------------------------------------
@@ -250,16 +289,17 @@ async def _run(tmp_path, make_config, project_files):
         opencode={"working_directory": str(tmp_path / "proj"), "command": [sys.executable, FAKE]},
     )
     argv = tmp_path / "argv.txt"
-    safe = sorted(allowed_small_models(cfg))[0]
+    safe = good_config(cfg)
 
     def handler(req):
         if req.url.path == "/config":
-            return httpx.Response(200, json={"small_model": safe})
+            return httpx.Response(200, json=safe)
         return httpx.Response(200, json={"healthy": True})
 
     executor = OpenCodeExecutor(
         cfg.opencode,
         transport=httpx.MockTransport(handler),
+        gateway_base_url=lambda: GATEWAY_URL,
         extra_env={"FAKE_OC_SCENARIOS": "success", "FAKE_OC_ARGV_FILE": str(argv)},
     )
     adapters = {
@@ -317,7 +357,9 @@ def test_jsonc_url_values_are_not_comments(tmp_path):
     assert parsed["$schema"] == "https://opencode.ai/config.json"
     assert parsed["provider"]["x"]["options"]["baseURL"] == "https://api.example.com/v1//z"
     write(tmp_path / "opencode.jsonc", text)
-    assert check(tmp_path)[0] == SmallModelCheck.OK
+    # parses fine; rejected only because project files may not configure providers
+    status, detail = check(tmp_path)
+    assert status == SmallModelCheck.UNSAFE and "key 'provider'" in detail
 
 
 def test_jsonc_url_config_with_bad_model_still_unsafe(tmp_path):
@@ -336,14 +378,6 @@ def test_detail_names_file_and_key_path_not_value(tmp_path):
     status, detail = check(tmp_path)
     assert status == SmallModelCheck.UNSAFE
     assert "z.json" in detail and "agent.b.model" in detail and "secret-paid" not in detail
-
-
-def test_child_env_strips_bot_token_keeps_provider_keys(monkeypatch, make_config):
-    monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
-    monkeypatch.setenv("GROQ_API_KEY", "keep")
-    ex = OpenCodeExecutor(make_config().opencode, bot_token_env="DISCORD_BOT_TOKEN")
-    env = ex._child_env()
-    assert "DISCORD_BOT_TOKEN" not in env and env["GROQ_API_KEY"] == "keep"
 
 
 async def test_unsafe_project_config_no_attempt_no_cooldown(tmp_path, make_config):
@@ -373,16 +407,17 @@ async def _run_full(tmp_path, make_config, steps):
         opencode={"working_directory": str(proj), "command": [sys.executable, FAKE]},
     )
     argv = tmp_path / "argv.txt"
-    safe = sorted(allowed_small_models(cfg))[0]
+    safe = good_config(cfg)
 
     def handler(req):
         if req.url.path == "/config":
-            return httpx.Response(200, json={"small_model": safe})
+            return httpx.Response(200, json=safe)
         return httpx.Response(200, json={"healthy": True})
 
     executor = OpenCodeExecutor(
         cfg.opencode,
         transport=httpx.MockTransport(handler),
+        gateway_base_url=lambda: GATEWAY_URL,
         extra_env={"FAKE_OC_SCENARIOS": "success", "FAKE_OC_ARGV_FILE": str(argv)},
     )
     adapters = {
@@ -416,13 +451,3 @@ async def _run_full(tmp_path, make_config, steps):
         return tasks, argv.exists(), n, orch.cooldowns.active(NOW), True
     finally:
         await c.stop()
-
-
-def test_allowlist_excludes_provider_mapped_to_paid_even_if_config_mutated(make_config):
-    # Defense in depth: bypass load validation by mutating the map after load.
-    cfg = make_config()
-    cfg.opencode.provider_map["groq"] = "anthropic"
-    out = allowed_small_models(cfg)
-    assert not any(m.startswith(("anthropic/", "groq/")) for m in out)
-    del cfg.opencode.provider_map["groq"]
-    assert not any(m.startswith("groq/") for m in allowed_small_models(cfg))

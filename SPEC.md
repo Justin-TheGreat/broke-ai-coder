@@ -297,6 +297,8 @@ The user pays nothing. Paid inference is not supported, not merely disabled:
 - The data layer cannot record paid usage: the cost class has only `FREE`, and the SQLite ledger rejects `PAID` rows.
 - When all free capacity is exhausted, the task stops and the user is told. It does not wait for approval to pay.
 
+The structural layer is the key-holding LLM gateway (section 9 and section 11). OpenCode never holds a real provider key: all its model traffic goes to a gateway inside the daemon on `127.0.0.1`, which forwards only allowlisted free models (`routing.provider_order` policies on enabled providers), rewrites `model` to the upstream id, drops request keys that could select another or a paid model (for example OpenRouter `models`, `route`, `provider`, `plugins`, `transforms`), and rejects every other model with a stop error (no fallback, no substitution). OpenCode is configured with `enabled_providers: ["broke"]`, so every model it can resolve goes through the gateway. The config and credential checks in section 9 are accident detection on top of this.
+
 Free-tier status for Gemini and Groq is an account property, not a model property. Their accounts must have no billing method attached, so the provider rejects requests past the free limit instead of charging.
 
 ## 7. Quota model
@@ -363,9 +365,17 @@ OpenCode remains the coding-agent runtime. The control plane does not reimplemen
 Supported integration pattern:
 
 ```text
-opencode serve
-opencode run --attach <server> --model <provider/model> "<prompt>"
+agent-controller (daemon)
+  ├─ LLM gateway on 127.0.0.1:<ephemeral>        holds the provider keys
+  └─ opencode serve --hostname 127.0.0.1 --port <opencode.server_port>   launched by the daemon
+opencode run --attach <server> --model broke/<provider>/<model> "<prompt>"
 ```
+
+The daemon launches and supervises `opencode serve` (restart with backoff on crash). The server gets a random Basic-auth password, a daemon-owned working directory (`opencode.server_directory`), an allowlisted environment with no provider key, bot token or `OPENCODE_*` variable, and an inline config (`OPENCODE_CONFIG_CONTENT`) with `enabled_providers: ["broke"]`, the gateway as the only provider (`@ai-sdk/openai-compatible`, `baseURL` = the loopback gateway, `apiKey` = a random per-run gateway token), the allowlisted models, and `model` / `small_model` pinned to `broke/<provider>/<model>`. The model passed to `opencode run` is `broke/<provider>/<model>`, where `<provider>/<model>` is the gateway model id.
+
+Before every task the daemon requires: no stored OpenCode credentials (`opencode auth` storage empty), `GET /config` of its server showing exactly the gateway-only shape above, and project `opencode.json` / `.opencode/*.json` files (project dir up to the filesystem root) without `provider`, `enabled_providers` or `disabled_providers` and with model keys only of the form `broke/...` from the allowlist. Otherwise the task fails closed with `OPENCODE_UNSAFE_CONFIG`.
+
+`opencode.managed_server: false` (use `opencode.server_url` without a password) is for tests and debugging only and is unsupported for production.
 
 OpenCode currently supports headless server mode and non-interactive `opencode run`, including `--model`, `--session`, and `--attach`. It also supports provider/model configuration and custom OpenAI-compatible providers. The implementation should prefer documented OpenCode interfaces rather than relying on private internals.
 
@@ -431,11 +441,14 @@ A task must be resumable after a bot restart when the OpenCode session is still 
 
 API keys must never be stored in Discord messages or Git.
 
-Preferred storage order:
+Keys are held only by the controller process (environment variables or a local secret store, loaded only in the daemon's start command, never from `~/.bashrc`). OpenCode credential storage is forbidden: OpenCode must hold no provider key, and the daemon refuses to start or run tasks while `opencode auth` storage contains any provider entry. The gateway token and the `opencode serve` password are random per run; they are visible to the agent, which is acceptable because they only unlock allowlisted free models on localhost.
 
-1. OS/WSL environment variables or local secret store.
-2. OpenCode credential storage where appropriate.
-3. Encrypted application config only if necessary.
+Residual risks:
+
+- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: run OpenCode as a separate OS user (T072).
+- **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
+- **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
+- **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.
 
 ### Network
 
@@ -550,7 +563,8 @@ agent-controller
   ├─ quota manager
   ├─ model router
   ├─ provider adapters
-  ├─ LLM gateway/proxy (if enabled)
+  ├─ LLM gateway (key-holding, 127.0.0.1)
+  ├─ managed opencode serve
   └─ SQLite ledger
 ```
 
@@ -654,9 +668,27 @@ discord:
   allowed_channel_ids: []
 
 opencode:
-  server_url: http://127.0.0.1:4096
+  server_url: http://127.0.0.1:4096     # only when managed_server is false
   working_directory: /workspace
+  managed_server: true                  # false = tests/debug only
+  server_port: 4096                     # 0 = free port
+  server_directory: data/opencode-server
+  server_start_timeout_s: 30
+  server_restart_max_backoff_s: 60
+  env_passthrough: []                   # extra env names for OpenCode; key-like names rejected
+
+gateway:
+  port: 0                               # 127.0.0.1 only; 0 = ephemeral
+  max_request_bytes: 16777216
+  max_response_bytes: 33554432          # non-streaming bodies
+  max_error_body_bytes: 65536
+  upstream_connect_timeout_s: 10
+  upstream_read_timeout_s: 300
+  max_concurrent_requests: 4
+  small_model: null                     # gateway model id; default = first allowlisted
 ```
+
+`opencode.provider_map` was removed: OpenCode reaches providers only through the gateway. Policy providers must be `openrouter`, `gemini` or `groq`; model ids must not contain `{`, `}` or whitespace.
 
 Model-policy rules:
 

@@ -28,7 +28,9 @@ def test_once_subprocess(tmp_path):
     import sys
 
     cfg = tmp_path / "c.yaml"
-    cfg.write_text(f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\n")
+    cfg.write_text(
+        f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\nopencode:\n  managed_server: false\n"
+    )
     r = subprocess.run(
         [sys.executable, "-m", "app", "--config", str(cfg), "--once"],
         cwd=ROOT,
@@ -36,3 +38,15 @@ def test_once_subprocess(tmp_path):
         capture_output=True,
     )
     assert r.returncode == 0, r.stderr
+
+
+def test_startup_error_prints_message_and_returns_3(tmp_path, capsys):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\n"
+        "opencode:\n  command: [no-such-opencode-binary-xyz]\n"
+    )
+    assert main(["--config", str(cfg), "--once"]) == 3
+    err = capsys.readouterr().err
+    assert "opencode executable not found" in err
+    assert "Traceback" not in err

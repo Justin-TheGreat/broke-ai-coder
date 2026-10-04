@@ -206,24 +206,33 @@ Provider-specific implementations handle:
 - dashboard/API quota discovery
 - error parsing
 
-### 4.6 OpenCode Runtime
+### 4.6 OpenCode Runtime and the LLM gateway
 
-Run as a local headless server:
+The daemon launches and supervises `opencode serve` itself (`app/opencode/server.py`) and runs a key-holding LLM gateway (`app/gateway/server.py`). OpenCode never holds a real provider key.
 
-```bash
-opencode serve --hostname 127.0.0.1 --port 4096
+```text
+Discord ─> controller daemon
+             │ holds provider keys (env), cooldowns, usage ledger
+             ├─ LLM gateway  127.0.0.1:<ephemeral>/v1   token = random per run
+             │     ▲  POST /v1/chat/completions (Bearer <gateway token>)
+             ├─ opencode serve  127.0.0.1:<server_port>   Basic auth = random per run
+             │     cwd = opencode.server_directory, env = allowlist (no keys)
+             │     OPENCODE_CONFIG_CONTENT: enabled_providers ["broke"], provider broke ─┐
+             │                                                                          │
+             └─ opencode run --attach ... --model broke/<provider>/<model>  (per task) ─┘
+                                                                         │
+   gateway: allowlist check ─ cooldown check ─ real key ─ https ──> OpenRouter / Gemini / Groq
 ```
 
-The orchestrator can run/attach tasks using the documented CLI:
+The gateway accepts only `broke/<provider>/<model>` ids that are in `routing.provider_order` policies (enabled policy, enabled supported provider), rewrites `model` to the upstream id, forwards a fixed set of body keys, sends the request to that provider's chat URL only, never follows redirects, passes upstream errors through (redacted, 3xx mapped to 502), records one `usage_events` row per upstream request tagged with the running task, and records rate-limit/quota/unavailable cooldowns. The orchestrator still routes and falls back per attempt using the same `CooldownManager`.
+
+The orchestrator runs/attaches tasks with the documented CLI:
 
 ```bash
-opencode run \
-  --attach http://127.0.0.1:4096 \
-  --model <provider/model> \
-  "<prompt>"
+opencode run --attach http://127.0.0.1:<port> --model broke/<provider>/<model> "<prompt>"
 ```
 
-This keeps OpenCode responsible for the coding-agent loop while the orchestrator chooses the provider/model before each task.
+(`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` are given to that CLI process through its environment.) Before each task the orchestrator verifies the server's `GET /config` is gateway-only and that OpenCode credential storage is empty. This keeps OpenCode responsible for the coding-agent loop while the orchestrator chooses the provider/model before each task.
 
 ## 5. Routing algorithm
 
@@ -693,24 +702,33 @@ Discord Internet
 Discord Bot
        │  authorization
        ▼
-Agent Orchestrator
-       │  local-only API
-       ▼
-OpenCode
+Controller daemon  ── holds ALL provider keys
+   │  LLM gateway (127.0.0.1, allowlisted free models only)
+   ▼
+OpenCode  ── UNTRUSTED FOR KEYS: no key in its env, config or credential store
        │
        ▼
 OS shell / repositories
                  TRUSTED
 ```
 
-API keys are stored only on the trusted PC environment.
+OpenCode is untrusted for keys. The gateway holds them, so even a misbehaving agent can only reach allowlisted free models through it. Provider keys are stored only on the trusted PC environment and loaded only in the daemon's start command.
 
 Recommended network rules:
 
-- OpenCode listens on `127.0.0.1`.
+- OpenCode and the gateway listen on `127.0.0.1`; `opencode serve` uses a random Basic-auth password.
 - Discord bot uses outbound Gateway/HTTPS connections.
 - Tailscale may be used for private administration, not public exposure.
 - No router port forwarding.
+
+Residual risks:
+
+- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: T072 (separate OS user).
+- **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
+- **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
+- **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.
+
+The gateway token and server password are visible to the agent. That is acceptable: they only unlock allowlisted free models on localhost.
 
 ## 11.1 Daemon resource observability
 
@@ -735,7 +753,10 @@ These metrics describe only the controller process and its SQLite file. They are
 | Discord disconnected | Existing OpenCode task continues; state persisted |
 | Bot restarted | Reload task state from SQLite |
 | OpenCode restarted | Mark running session uncertain and require recovery logic |
+| `opencode serve` crashes | The daemon restarts it with backoff (1, 2, 4 ... `server_restart_max_backoff_s`); tasks fail `OPENCODE_UNAVAILABLE` meanwhile |
+| `opencode serve` cannot start (stored credentials, missing binary, never healthy) | Daemon start fails with a one-line `StartupError` (exit 3) |
 | Provider 429 | Update quota/cooldown and try next eligible provider |
+| Gateway upstream 429 | Gateway passes it through with `Retry-After` and sets the provider/model cooldown; further requests for that model get 429 without an upstream call |
 | Provider 401 | Disable provider until credential is fixed |
 | All free exhausted | Report `FREE_CAPACITY_EXHAUSTED` and stop; never spend |
 | Tool approval times out | Deny action |

@@ -373,7 +373,7 @@ async def test_nothing_outside_allowlist_or_paid_is_ever_selected(tmp_path, make
         for call in ex.calls:
             assert (call["provider"], call["model"]) in allowed
         rows = c.conn.execute("SELECT DISTINCT cost_class FROM usage_events").fetchall()
-        assert [r[0] for r in rows] == ["FREE"]
+        assert all(r[0] == "FREE" for r in rows)  # the gateway is the only usage writer
         assert (
             c.conn.execute("SELECT COUNT(*) FROM tasks WHERE cost_class <> 'FREE'").fetchone()[0]
             == 0
@@ -390,8 +390,7 @@ async def test_unknown_exit_class_stops_without_replay(tmp_path, make_config):
         t = get(c, rec.id)
         assert t.status == TaskStatus.FAILED and t.error_class == "UNKNOWN"
         assert len(ex.calls) == 1
-        statuses = [r[0] for r in c.conn.execute("SELECT status FROM usage_events ORDER BY id")]
-        assert statuses[-1] == "unknown_outcome"
+        assert c.conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
         assert len(FallbackAttemptRepository(c.conn).list_for_task(rec.id)) == 1
 
 
@@ -579,18 +578,22 @@ def _real_orch(tmp_path, make_config, scenarios, *, redactor=None, env=None, ope
         "FAKE_OC_HEARTBEAT": str(tmp_path / "hb.txt"),
         **(env or {}),
     }
-    from app.opencode.config_check import allowed_small_models
+    from oc_helpers import GATEWAY_URL, good_config
 
-    safe = sorted(allowed_small_models(cfg))[0]
+    safe = good_config(cfg)
 
     def handler(req):
         if req.url.path == "/config":
-            return httpx.Response(200, json={"small_model": safe})
+            return httpx.Response(200, json=safe)
         return httpx.Response(200, json={"healthy": True})
 
     transport = httpx.MockTransport(handler)
     executor = OpenCodeExecutor(
-        cfg.opencode, redactor=redactor, transport=transport, extra_env=extra
+        cfg.opencode,
+        redactor=redactor,
+        transport=transport,
+        extra_env=extra,
+        gateway_base_url=lambda: GATEWAY_URL,
     )
     adapters = {
         pol.provider: FakeProviderAdapter(
@@ -784,7 +787,7 @@ async def test_bat_launcher_refused_and_not_spawned(tmp_path, monkeypatch):
     marker = tmp_path / "ran.txt"
     bat = tmp_path / "oc.bat"
     bat.write_text(f"@echo off\r\necho x> {marker}\r\n")
-    monkeypatch.setattr("app.opencode.executor.shutil.which", lambda _c: str(bat))
+    monkeypatch.setattr("app.opencode.process.shutil.which", lambda _c: str(bat))
     ex = OpenCodeExecutor(OpenCodeConfig(command=["opencode"]))
     r = await _run(ex, tmp_path)
     assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE

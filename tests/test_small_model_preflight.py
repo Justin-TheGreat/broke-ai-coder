@@ -10,12 +10,15 @@ from pathlib import Path
 
 import httpx
 import pytest
-from conftest import NOW, SECRET, secret_env
+from conftest import NOW, SECRET, _base_config_dict, secret_env
+from oc_helpers import GATEWAY_URL, good_config
 
 from app.bot import format as fmt
+from app.config.loader import parse_config
 from app.db.attempts import FallbackAttemptRepository
 from app.db.tasks import TaskRepository
-from app.opencode.config_check import allowed_small_models, check_small_model
+from app.opencode.config_check import check_server_config, opencode_model_ids
+from app.opencode.endpoint import ServerEndpoint
 from app.opencode.executor import OpenCodeExecutor
 from app.orchestrator.orchestrator import Orchestrator
 from app.orchestrator.state_machine import TaskStatus
@@ -26,16 +29,37 @@ from app.runtime.daemon import AgentController, ControllerEvent, TaskSubmission
 from app.runtime.interfaces import SmallModelCheck
 
 FAKE = str(Path(__file__).parent / "fakes" / "fake_opencode.py")
-ALLOWED = frozenset({"groq/llama-x", "openrouter/openrouter/free"})
+
+
+def _cfg():
+    return parse_config(_base_config_dict())
+
+
+CFG = _cfg()
+ALLOWED = opencode_model_ids(CFG)
+SAFE = sorted(ALLOWED)[0]
+
+
+def body_with_small(value):
+    body = good_config(CFG)
+    if value is None:
+        body.pop("small_model")
+    else:
+        body["small_model"] = value
+    return body
 
 
 async def probe(handler, allowed=ALLOWED):
-    return await check_small_model(
-        "http://127.0.0.1:4096", allowed, timeout_s=1, transport=httpx.MockTransport(handler)
+    return await check_server_config(
+        ServerEndpoint("http://127.0.0.1:4096"),
+        allowed,
+        gateway_base_url=GATEWAY_URL,
+        timeout_s=1,
+        transport=httpx.MockTransport(handler),
     )
 
 
-# ---- check_small_model unit-level ------------------------------------------------------
+# ---- check_server_config small_model lookalikes -----------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -43,74 +67,53 @@ async def probe(handler, allowed=ALLOWED):
     [
         "",
         " ",
-        "GROQ/llama-x",
-        "groq/LLAMA-X",
-        " groq/llama-x",
-        "groq/llama-x\n",
-        "groq/llama-x\t",
-        "groq/llama-x2",
-        "groq/llama",
-        "groq/llama-x/extra",
-        "gemini/llama-x",
-        "google/llama-x",
-        "openrouter/llama-x",
-        "groq/openrouter/free",
-        "openrouter/free",
-        "openrouter/openrouter/free:paid",
-        "openrouter/openrouter/free ",
-        "openrouter/openrouter/FREE",
-        "openrouter/anthropic/claude-3.5-sonnet",
+        "BROKE/groq/q-x",
+        "broke/groq/Q-X",
+        " broke/groq/q-x",
+        "broke/groq/q-x\n",
+        "broke/groq/q-x\t",
+        "broke/groq/q-x2",
+        "broke/groq/q",
+        "broke/groq/q-x/extra",
+        "groq/q-x",
+        "google/q-x",
+        "broke/groq/openrouter/free",
+        "broke/openrouter/free",
+        "broke/openrouter/openrouter/free:paid",
+        "broke/openrouter/openrouter/FREE",
+        "broke/openrouter/anthropic/claude-3.5-sonnet",
         "openrouter/openai/gpt-4o",
-        ["groq/llama-x"],
-        {"a": "groq/llama-x"},
+        ["broke/groq/q-x"],
+        {"a": "broke/groq/q-x"},
         True,
         0,
     ],
 )
 async def test_unsafe_lookalikes_and_paid_ids(value):
-    out = await probe(lambda r: httpx.Response(200, json={"small_model": value}))
+    out, _ = await probe(lambda r: httpx.Response(200, json=body_with_small(value)))
     assert out == SmallModelCheck.UNSAFE
 
 
 @pytest.mark.parametrize("value", sorted(ALLOWED))
 async def test_each_allowed_value_ok(value):
-    out = await probe(lambda r: httpx.Response(200, json={"small_model": value}))
+    out, _ = await probe(lambda r: httpx.Response(200, json=body_with_small(value)))
     assert out == SmallModelCheck.OK
 
 
 async def test_empty_allowlist_is_always_unsafe():
-    out = await probe(lambda r: httpx.Response(200, json={"small_model": "x/y"}), frozenset())
+    out, _ = await probe(lambda r: httpx.Response(200, json=body_with_small(SAFE)), frozenset())
     assert out == SmallModelCheck.UNSAFE
-
-
-@pytest.mark.parametrize("status", [201, 204, 301, 401, 403, 404, 500, 503])
-async def test_non_200_is_unavailable_even_with_good_body(status):
-    out = await probe(lambda r: httpx.Response(status, json={"small_model": "groq/llama-x"}))
-    assert out == SmallModelCheck.UNAVAILABLE
-
-
-@pytest.mark.parametrize("body", [None, "groq/llama-x", 5, [], [{"small_model": "groq/llama-x"}]])
-async def test_non_dict_json_is_unavailable(body):
-    assert await probe(lambda r: httpx.Response(200, json=body)) == SmallModelCheck.UNAVAILABLE
-
-
-async def test_timeout_is_unavailable():
-    def slow(r):
-        raise httpx.ReadTimeout("slow")
-
-    assert await probe(slow) == SmallModelCheck.UNAVAILABLE
 
 
 def test_allowed_models_match_every_enabled_candidate(make_config):
     cfg = make_config()
-    pmap = cfg.opencode.provider_map
     expected = {
-        f"{pmap.get(p.provider, p.provider)}/{m}"
+        f"broke/{p.provider}/{m}"
         for p in cfg.routing.policies.values()
         if p.enabled
         for m in p.model_order
     }
-    assert expected and allowed_small_models(cfg) == expected
+    assert expected and opencode_model_ids(cfg) == expected
 
 
 # ---- Discord text ----------------------------------------------------------------------
@@ -131,7 +134,7 @@ def test_unsafe_config_text_guides_user_and_leaks_nothing():
         redactor=SecretRedactor([SECRET]),
     )
     assert out is not None
-    assert "small_model" in out and "opencode.json" in out
+    assert "gateway" in out and "opencode auth logout" in out
     assert "not reachable" not in out
     assert SECRET not in out
 
@@ -170,6 +173,7 @@ class Harness:
         self.executor = OpenCodeExecutor(
             self.cfg.opencode,
             transport=httpx.MockTransport(handler),
+            gateway_base_url=lambda: GATEWAY_URL,
             extra_env={
                 "FAKE_OC_SCENARIOS": "success",
                 "FAKE_OC_ARGV_FILE": str(self.argv),
@@ -198,7 +202,7 @@ class Harness:
 
     @property
     def safe(self):
-        return sorted(allowed_small_models(self.cfg))[0]
+        return SAFE
 
     @contextlib.asynccontextmanager
     async def started(self):
@@ -227,7 +231,7 @@ class Harness:
 
 
 def ok_response(h):
-    return httpx.Response(200, json={"small_model": h.safe})
+    return httpx.Response(200, json=good_config(h.cfg))
 
 
 def _raise_connect(h):
@@ -245,8 +249,8 @@ def _raise_connect(h):
         lambda s: s + "\n",
         lambda s: s + "x",
         lambda s: s[:-1],
-        lambda s: s.split("/", 1)[1],
-        lambda s: "wrongprov/" + s.split("/", 1)[1],
+        lambda s: s.split("/", 1)[1],  # drops the gateway prefix
+        lambda s: "wrongprov/" + s.split("/", 1)[1],  # wrong provider prefix
         lambda s: "openrouter/anthropic/claude-3.5-sonnet",
         lambda s: "openrouter/openai/gpt-4o",
         lambda s: 7,
@@ -255,9 +259,7 @@ def _raise_connect(h):
 )
 async def test_bad_small_model_fails_closed_without_spawn(tmp_path, make_config, mutate):
     def resp(h):
-        value = mutate(h.safe)
-        body = {} if value is None else {"small_model": value}
-        return httpx.Response(200, json=body)
+        return httpx.Response(200, json=body_with_small(mutate(h.safe)))
 
     h = Harness(tmp_path, make_config, resp)
     async with h.started() as c:
@@ -273,7 +275,7 @@ async def test_bad_small_model_fails_closed_without_spawn(tmp_path, make_config,
     "response",
     [
         lambda h: httpx.Response(500),
-        lambda h: httpx.Response(404, json={"small_model": h.safe}),
+        lambda h: httpx.Response(404, json=good_config(h.cfg)),
         lambda h: httpx.Response(200, content=b"not json"),
         lambda h: httpx.Response(200, json=["x"]),
         _raise_connect,
@@ -320,7 +322,7 @@ async def test_cached_ok_expires_then_unsafe_config_fails(tmp_path, make_config)
 
     def resp(h):
         if state["bad"]:
-            return httpx.Response(200, json={"small_model": "openrouter/openai/gpt-4o"})
+            return httpx.Response(200, json=body_with_small("openrouter/openai/gpt-4o"))
         return ok_response(h)
 
     h = Harness(tmp_path, make_config, resp, ttl=30)

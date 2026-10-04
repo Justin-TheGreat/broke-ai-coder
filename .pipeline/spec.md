@@ -1,1002 +1,620 @@
-# Spec: slice 3: OpenCode executor, orchestrator, Discord frontend, daemon wiring (offline-testable)
+# Spec: key-holding LLM gateway + controller-managed `opencode serve` (branch feat/llm-gateway)
 
-This slice covers these tasks:
-- T022, T023 and T063: the OpenCode executor, session resume and cancel.
-- T012, T020, T054 and T055: the orchestrator, fallback and unknown-outcome handling.
-- T010, T011, T013 and T090-T092: the Discord frontend, kept minimal.
-- CLI wiring, one doc fix, and the trivial security follow-ups.
+Goal: OpenCode never holds a real provider API key. All model traffic goes to a gateway inside
+the controller daemon. The gateway holds the keys and forwards ONLY allowlisted free models.
 
-Branch: `feat/discord-opencode`. The source docs are `SPEC.md`, `ARCHITECTURE.md` and `TASKS.md`. The project is FREE-ONLY. Do not add or reference any paid mode, budget or approval. `CostClass` has only `FREE`.
+Run everything with `.venv/Scripts/python` (pytest, `-m ruff check .`, `-m ruff format --check .`,
+`-m app --check --config config.example.yaml`). No real network in tests.
 
-Conventions from slices 1 and 2 still apply. Copy them from the named files:
-- Put `from __future__ import annotations` at the top of every module.
-- Use frozen slotted dataclasses (`app/router/types.py`) and `StrEnum`.
-- Pydantic models use `_CFG = ConfigDict(extra="forbid", frozen=True)` (`app/config/models.py`).
-- Get loggers with `logging.getLogger(__name__)`. Do not use `print` outside `app/cli.py`.
-- Repositories take a `sqlite3.Connection`, write inside `transaction(conn)` and use `to_db`/`from_db` (copy `app/db/tasks.py`).
-- Classification never raises (copy `HttpProviderAdapter.classify_error`/`health_check` in `app/providers/http.py`).
-- Logs carry only class names and ErrorClass values. Never log prompts, output, tokens or keys.
+## OPEN QUESTIONS — RESOLVED by the user on 2026-10-04
 
-## OPEN QUESTIONS
+All three: implement the stated defaults exactly. Q1: default now (no separate-user code; docs stop sourcing secrets.env from ~/.bashrc and load it only in the daemon start command; document residual risk R1); running OpenCode as a dedicated Linux user (T072) is planned for the NEXT round, so mention it as the planned fix for R1. Q2: pin only `model` and `small_model`. Q3: `managed_server: false` is tests/debug only.
 
-None blocking. Every uncertain external detail is listed under Assumptions (§0.2) and lives as a constant or config default in one place. Implement them as written.
+### Original questions (for reference)
 
-## 0. Environment, assumptions, decisions
+1. **Same-OS-user leak (important, needs the user's decision).** The OpenCode agent's shell runs
+   as the same Linux user as the daemon. It can therefore still read
+   `~/.config/broke-ai-coder/secrets.env` and `/proc/<daemon pid>/environ`. Removing keys from
+   the daemon's own `os.environ` does not help: /proc shows the original environment block.
+   - This change makes OpenCode's config and environment key-free. It is not yet a guarantee
+     against a deliberately rogue agent.
+   - Closing the gap needs OpenCode to run as a separate OS user with no read access to the
+     secrets file or the daemon's /proc (T072).
+   - Default here: no code for that. Document it as residual risk R1 (section 9). In the docs,
+     stop sourcing secrets.env from `~/.bashrc`; load it only in the daemon's start command.
+     Account-level no-billing stays a required second layer.
+2. **Agent model pinning.** The decision asked to pin the default agent models. That is NOT done
+   here: if `agent.build.model` takes precedence over `opencode run --model` (unverified), it
+   would break routing.
+   - Free-only still holds: `enabled_providers: ["broke"]` limits every resolvable model to the
+     gateway provider, and the gateway rejects anything not allowlisted.
+   - Subagents without a model inherit the invoking agent's model (OpenCode docs).
+   - Pinned: `model` and `small_model` only. Revisit at T082.
+3. **`opencode.managed_server: false`.** Default meaning: the daemon does not launch `serve` and
+   uses `opencode.server_url` without a password. The gateway still runs and the preflight
+   (section 6) still requires the gateway-only config. The gateway token is random per run, so
+   an externally started server cannot pass the preflight.
+   - Net effect: the flag is for tests and debugging only. Document it as unsupported for
+     production.
 
-### 0.1 Environment
-- Use `.venv/Scripts/python` only (it is Python 3.14). Do not use the bare `python`.
-- Add `"discord.py>=2.5,<3"` to `[project] dependencies` in `pyproject.toml`, then run `.venv/Scripts/python -m pip install -e ".[dev]"`. Installing needs the network. If discord.py does not install on 3.14, stop and report it. Do not vendor it or work around it.
-- Gate: `.venv/Scripts/python -m pytest`, `-m ruff check .` and `-m ruff format --check .` (this is `scripts/check.ps1`). All 635 existing tests must stay green. The 2 strict xfails stay as they are.
-- Tests must never contact Discord, run a real `opencode`, or use the network:
-  - httpx goes through `MockTransport` (the conftest guard already blocks real transports).
-  - The executor runs `tests/fakes/fake_opencode.py` through `sys.executable`.
-  - No test calls `discord.Client.start/login/connect`.
-- Never open or read `discord.txt` or `provider_api.txt` in the repo root. They are git-ignored secret files.
+## Assumptions (record in module docstrings; verify at T082)
 
-### 0.2 Assumptions (state each one in a module docstring or comment at the place given)
+- G1. `@ai-sdk/openai-compatible` sends `Authorization: Bearer <options.apiKey>` and calls
+  `POST {baseURL}/chat/completions`. Streaming is SSE (`data: {json}` lines and
+  `data: [DONE]`). The final chunk may carry `usage` (`prompt_tokens`, `completion_tokens`).
+- G2. Gemini's OpenAI-compatible endpoint is `{gemini base_url}/openai/chat/completions`, i.e.
+  `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`, with
+  `Authorization: Bearer <key>`. Its error bodies may not match the native shape; classification
+  then falls back to the status code.
+- G3. OpenRouter and Groq: `{base_url}/chat/completions` with Bearer auth.
+- G4. `opencode run --attach` authenticates to a password-protected server using
+  `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` from its own environment.
+- G5. The `limit` field of a custom-provider model is optional.
+- G6. Stored credentials live at `$XDG_DATA_HOME/opencode/auth.json`, defaulting to
+  `~/.local/share/opencode/auth.json`. The file is a JSON object keyed by provider id.
+- G7. `GET /config` returns the merged config, including `enabled_providers` and `provider`.
+  `OPENCODE_CONFIG_CONTENT` outranks global and project files. Managed or MDM system configs
+  outrank it (residual risk R3).
+- G8. `{env:` / `{file:` substitution also applies to `OPENCODE_CONFIG_CONTENT`. For that reason
+  model ids containing `{` or `}` are rejected at config load.
 
-| # | Assumption | Where |
-|---|---|---|
-| B1 | `opencode run --format json` writes one JSON object per stdout line. Each object has `"type"` (str), and the types we use are `step_start`, `step_finish`, `text`, `tool_use` and `error`. Other types are ignored. The session id is the top-level `"sessionID"` (fallback: `part.sessionID`). | `app/opencode/events.py` |
-| B2 | `text` events carry `part.text` (str). `tool_use` events carry `part.tool` (str), `part.state.status` (str) and, for tools `edit`/`write`/`patch`, `part.state.input.filePath` (str). `step_finish` events carry `part.tokens.input`/`part.tokens.output` (ints). | `events.py` |
-| B3 | `error` events carry `error: {name: str, data: {message?: str, statusCode?: int, responseHeaders?: {str: str}, responseBody?: str}}`. The known names are `ProviderAuthError`, `APIError`, `MessageOutputLengthError`, `MessageAbortedError` and `UnknownError`. | `events.py` |
-| B4 | OpenCode may retry 429s internally without emitting an event. The only bound on that is `opencode.run_timeout_s`. A timeout is an unknown outcome. | `executor.py` |
-| B5 | OpenCode's model argument is `<opencode_provider>/<model>`. OpenCode splits on the **first** `/`, so `openrouter` + `openrouter/free` becomes `openrouter/openrouter/free`. | `executor.py` |
-| B6 | The default provider map is `{"openrouter": "openrouter", "gemini": "google", "groq": "groq"}`. Gemini in AI Studio is the `google` provider in OpenCode (the setup doc uses `GOOGLE_GENERATIVE_AI_API_KEY` and `opencode models google`). It can be overridden with `opencode.provider_map`. An unmapped provider id is passed through unchanged. | `OpenCodeConfig` default |
-| B7 | `GET {server_url}/global/health` returns `{"healthy": true, "version": "<str>"}`. The server runs without auth on localhost, so Basic auth (`OPENCODE_SERVER_PASSWORD`) is not supported in this slice. | `app/opencode/health.py` |
-| B8 | With `--attach`, the process cwd selects the project directory, so the executor sets `cwd` to the project directory. | `executor.py` |
-| B9 | `opencode run` reads piped stdin when stdin is not a TTY, so stdin is always `DEVNULL`. | `executor.py` |
-| B10 | Each `step_finish` event is one LLM request. For quota estimates, an attempt counts `max(steps, 1)` requests. | orchestrator |
-| B12 | `GET {server_url}/config` returns OpenCode's effective merged config object (HTTP 200 JSON dict), which includes `small_model` ("provider/model") when set. OpenCode runs background calls (e.g. title generation) with `small_model`; when unset it picks a cheaper model from the provider or falls back to the main model, and the calls cannot be disabled. Before each task the orchestrator requires `small_model` to equal an allowlisted, enabled routing candidate in OpenCode form (provider_map applied), cached on success for `orchestrator.small_model_check_ttl_s`. Missing/other value: task FAILED `OPENCODE_UNSAFE_CONFIG` (no cooldown, no fallback). Request failure or non-dict/non-200: treated as `OPENCODE_UNAVAILABLE`. The same allowlist applies to `model`, `agent.<n>.model`, `mode.<n>.model` when present in the response (non-string or other value = UNSAFE). The allowlist only contains models of enabled policies on enabled providers mapped (provider_map) to openrouter/google/groq; config load rejects policies whose provider is not so mapped. `GET /config` reflects the server's start directory only (no documented per-request directory selector; checked 2026-10-04). | `app/opencode/config_check.py`, `app/config/models.py` |
-| B13 | OpenCode merges configs, later overriding earlier: global `~/.config/opencode/opencode.json`, `OPENCODE_CONFIG` path, project `opencode.json` in the project root, `.opencode` directories, `OPENCODE_CONFIG_CONTENT` (inline). Because `/config` cannot be scoped per project, before every task (uncached) the orchestrator checks on disk, for the task's project dir and each parent up to and including the git root (or only the project dir when no `.git` is found), `opencode.json`, `opencode.jsonc` and `*.json`/`*.jsonc` directly in `.opencode/`. JSON/JSONC (comments and trailing commas tolerated); unparseable or non-object files are UNSAFE. `model`, `small_model`, `agent.*.model`, `mode.*.model` must be allowlisted strings if present. UNSAFE = task FAILED `OPENCODE_UNSAFE_CONFIG` with the file path and key path (never the value) in the Discord reply. `OPENCODE_CONFIG` and `OPENCODE_CONFIG_CONTENT` are stripped from the OpenCode child environment. Residual gap: a server started with those variables set, or files outside the scanned locations, are not seen. | `app/opencode/config_check.py`, `executor.py`, `orchestrator.py` |
-| B11 | `POST {server_url}/session/{id}/abort` stops the server-side agent loop of that OpenCode session. With `--attach` the loop runs in the server, so killing the CLI client is not enough. The executor sends it best effort (never raises, class-name-only logging, session id validated with `fullmatch` before use in the URL) on cancel, timeout and outer cancellation, once a session id is known. Gap: before the first event with a session id, nothing can be aborted. | `app/opencode/abort.py`, `executor.py` |
+## 1. Dependency
 
-### 0.3 Decisions
-1. **Empty Discord allowlists mean DENY ALL.** A command is authorized only when the user id is in `allowed_user_ids`, the guild id is in `allowed_guild_ids` and the channel id is in `allowed_channel_ids`. Any empty list denies everyone. DMs (guild None) are always denied. Auth runs before anything else, including the defer.
-2. **One task runs at a time.** The existing single worker loop runs tasks one after another. Others wait in the bounded queue. This avoids concurrent edits to the same repo.
-3. **The task row is created at submit time.** `/code` creates the QUEUED row synchronously, so it can return the task id in the ack. The worker loads the row by id.
-4. **Fallback continues the session, never blindly replays:**
-   - If the failed attempt captured an OpenCode session id, the next attempt runs `--session <id>` with `opencode.continue_prompt`. The original prompt is not re-sent.
-   - If no session id was ever captured and the attempt saw zero `tool_use` events, the original prompt is re-sent without `--session`, because no side effect was observed.
-   - If no session id was captured but `tool_use` events were seen, the task stops with error_class `UNKNOWN` (outcome unknown, no replay).
-5. **Unknown outcomes stop the task:**
-   - A timeout gives `TIMEOUT_UNKNOWN_OUTCOME`.
-   - A non-zero exit with no classifiable error gives `UNKNOWN`.
-   - Both are already in `STOP_ERRORS`, so the router returns `NON_FALLBACK_ERROR`.
-   - The task fails with that error class, and the final message tells the user they can continue with `/code session:<id>`.
-6. **Executor infrastructure failures are not provider failures.** These cases return outcome `EXECUTOR_UNAVAILABLE`:
-   - the executable is missing;
-   - the executable resolves to `.cmd`/`.bat`;
-   - the working directory is missing;
-   - spawning raises OSError;
-   - the OpenCode health check fails before the first attempt.
+`pyproject.toml`: add `"aiohttp>=3.9,<4"` to `dependencies`. 3.14.3 is installed.
 
-   The task then fails with error_class `OPENCODE_UNAVAILABLE`. No cooldown is applied and no fallback happens.
-7. **`.cmd`/`.bat` executables are refused on Windows.** Passing a user prompt through cmd.exe allows metacharacter injection. The user must set `opencode.command` to a real executable (for example `["node", "C:/path/opencode/bin/opencode"]`) or run in WSL. Production runs in WSL anyway.
-8. **Prompt hygiene:**
-   - Strip NUL characters and surrounding whitespace.
-   - Reject an empty prompt or one longer than `PROMPT_MAX_CHARS = 4000`, with INVALID_REQUEST before routing.
-   - If the prompt starts with `-`, prefix one space so yargs does not parse it as a flag.
-   - The prompt is passed as a single argv element. No shell is used.
-9. **Session ids from OpenCode are validated** against `^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$` before they are stored or passed back on argv. An invalid id is ignored.
-10. **`tool_calling` is not required by default.** `orchestrator.require_tool_calling: false`, because the Gemini and Groq adapters cannot discover tool support without config metadata. The allowlist is the operator's control.
-11. **Restart recovery is conservative.** On start:
-    - every `ROUTING`/`RUNNING`/`WAITING_APPROVAL` task becomes `FAILED` with error_class `INTERRUPTED_BY_RESTART`;
-    - every `QUEUED` task becomes `CANCELLED` with the same error_class;
-    - nothing is replayed.
-12. **Shutdown cancels the work:**
-    - `controller.stop()` calls `orchestrator.begin_shutdown()`.
-    - The running task's cancel event is set, its process tree is killed, and it ends `CANCELLED` with error_class `DAEMON_SHUTDOWN`.
-    - Tasks still queued are marked `CANCELLED` (`DAEMON_SHUTDOWN`) without running.
-13. **A missing Discord token does not crash the daemon.** If `discord.bot_token_env` does not resolve, the daemon starts with `NullFrontend` and logs at WARNING: `discord frontend disabled: env DISCORD_BOT_TOKEN is not set` (the env var **name**, never a value). `--once` always uses `NullFrontend`.
-14. **Discord replies:**
-    - Every reply passes through `SecretRedactor.redact`, then is truncated to `DISCORD_MAX_CHARS = 1900` with the suffix `\n…(truncated)`.
-    - Triple backticks inside user or OpenCode text are neutralized (```` ``` ```` becomes `` `\u200b`` ``).
-    - Messages are sent with `allowed_mentions=discord.AllowedMentions.none()`.
-15. **Commands sync per guild** to each id in `allowed_guild_ids`, which is instant. Nothing is synced globally.
-16. **Sessions:**
-    - A new `/code` without `session` creates a `sessions` row (OPEN).
-    - `/code session:<ref>` continues an OPEN session. Its first attempt uses `--session <opencode_session_id>` with the user's new prompt. If the session has no OpenCode id yet, the attempt runs without `--session`.
-    - On a terminal task, the session stays OPEN when it has an `opencode_session_id`; otherwise it is closed.
-    - Each cleanup run closes OPEN sessions that have been idle longer than `orchestrator.session_idle_close_days` and have no unfinished task.
-    - The orchestrator calls `SessionRepository.touch` at each provider selection and at each terminal transition.
-17. **Short refs:** `/cancel` and `/code session:` accept a full id or a unique prefix of ≥ 6 chars matching `^[0-9a-f-]{6,36}$`. Anything else is rejected before any SQL runs. An ambiguous prefix gets the reply "ambiguous id".
+## 2. Config (`app/config/models.py`, tests in `tests/test_config.py`)
 
-## 1. Files
+- Add `GATEWAY_PROVIDER_ID = "broke"` and `SUPPORTED_PROVIDERS = frozenset({"openrouter", "gemini", "groq"})`.
+  These are the keys of `app/providers/registry.ADAPTER_TYPES`. Do not import the registry; that
+  would create an import cycle.
+- **Remove `OpenCodeConfig.provider_map`** and `_OPENCODE_PROVIDERS`.
+  - Add a `mode="before"` validator to `OpenCodeConfig`. If `provider_map` is present, raise
+    `"opencode.provider_map was removed: OpenCode reaches providers only through the built-in gateway"`.
+    Copy the pattern from `PolicyConfig._reject_cost_class`.
+  - `AppConfig._providers_defined` changes:
+    - A policy provider must be in `SUPPORTED_PROVIDERS`. Otherwise raise with `PAID_NOT_SUPPORTED`.
+    - The OpenRouter free rule applies when `pol.provider == "openrouter"`.
+- `PolicyConfig._models_valid`: also reject any model containing `{`, `}` or whitespace (G8).
+- `OpenCodeConfig` changes:
+  - `server_url`: when it is `http://`, the hostname must be in `_LOCAL_HOSTS` (folds in F10).
+    It is only used when `managed_server` is false.
+  - New fields:
+    - `managed_server: bool = True`
+    - `server_port: int = Field(4096, ge=0, le=65535)`. 0 means pick a free port.
+    - `server_directory: str = "data/opencode-server"`. This is the cwd of `serve`; the daemon
+      creates it.
+    - `server_start_timeout_s: float = Field(30, gt=0, le=300, allow_inf_nan=False)`
+    - `server_restart_max_backoff_s: float = Field(60, gt=0, le=600, allow_inf_nan=False)`
+    - `env_passthrough: list[str] = []`. Extra env var names passed to OpenCode. Each must match
+      `ENV_NAME_PATTERN`. Reject names that:
+      - start with `OPENCODE_`, `AWS_` or `AZURE_`;
+      - end with `_API_KEY`;
+      - equal `GOOGLE_APPLICATION_CREDENTIALS`.
+- New `GatewayConfig` with `_CFG`; add it to `AppConfig` as `gateway: GatewayConfig = Field(default_factory=GatewayConfig)`:
+  - `port: int = Field(0, ge=0, le=65535)`. 0 means ephemeral.
+  - `max_request_bytes: int = Field(16_777_216, ge=65_536, le=67_108_864)`
+  - `max_response_bytes: int = Field(33_554_432, ge=65_536, le=134_217_728)`. Non-streaming
+    bodies only.
+  - `max_error_body_bytes: int = Field(65_536, ge=1024, le=1_048_576)`
+  - `upstream_connect_timeout_s: float = Field(10, gt=0, le=60, allow_inf_nan=False)`
+  - `upstream_read_timeout_s: float = Field(300, gt=0, le=1800, allow_inf_nan=False)`
+  - `max_concurrent_requests: int = Field(4, ge=1, le=64)`
+  - `small_model: str | None = None`. A gateway model id. If None, the first gateway model is used.
+- `AppConfig` additions:
+  - `def gateway_models(self) -> dict[str, tuple[str, str]]`. Ordered map of gateway model id
+    `f"{provider}/{model}"` to `(provider, model)`. Built by iterating `routing.provider_order`
+    only (the same candidates as `app/router/router.build_candidates`), then each policy's
+    `model_order`. Include a model only if:
+    - the policy is enabled;
+    - the provider exists, is enabled, and is in `SUPPORTED_PROVIDERS`.
+  - In the after-validator:
+    - every `env_passthrough` name must differ from every provider `api_key_env` and from
+      `discord.bot_token_env`;
+    - if `gateway.small_model` is set, it must be a key of `gateway_models()`.
+  - An empty `gateway_models()` is allowed at load. The gateway then serves no models.
+- Tests: provider_map rejected with the message; unsupported policy provider rejected; `{` in a
+  model rejected; passthrough rules; small_model not allowlisted rejected; `gateway_models`
+  order and exclusion of disabled policy, disabled provider, and policies not in `provider_order`.
 
-Create:
-```text
-app/opencode/__init__.py          (only the future import)
-app/opencode/events.py            pure JSON-line parsing + error classification
-app/opencode/process.py           kill_process_tree
-app/opencode/health.py            OpenCode server health check
-app/opencode/executor.py          OpenCodeExecutor (AgentExecutor impl)
-app/db/sessions.py                SessionRepository
-app/db/attempts.py                FallbackAttemptRepository
-app/orchestrator/orchestrator.py  Orchestrator
-app/bot/__init__.py               (only the future import)
-app/bot/auth.py                   authorize()
-app/bot/format.py                 pure formatting
-app/bot/commands.py               BotBackend protocol, snapshots, pure command handlers
-app/bot/backend.py                ControllerBackend (BotBackend over controller/orchestrator)
-app/bot/discord_frontend.py       thin discord.py adapter + create_frontend()
-app/runtime/wiring.py             build/close the real component graph
-tests/fakes/__init__.py           (empty)
-tests/fakes/fake_opencode.py      fake CLI (§9.1)
-tests/fakes/fake_executor.py      ScriptedExecutor (§9.2)
-tests/test_opencode_events.py
-tests/test_opencode_executor.py
-tests/test_opencode_health.py
-tests/test_sessions_attempts_repo.py
-tests/test_orchestrator.py
-tests/test_bot_auth.py
-tests/test_bot_format.py
-tests/test_bot_commands.py
-tests/test_discord_frontend.py
-tests/test_wiring.py
-```
-Modify:
-```text
-pyproject.toml                    add discord.py dependency
-app/config/models.py              OpenCodeConfig fields, OrchestratorConfig, base_url http rule
-app/config/secrets.py             resolve_secret strips
-app/providers/http.py             truncate request_id
-app/runtime/interfaces.py         ExecutionOutcome/ExecutionResult/ExecutorEvent/ExecutorHealth/AgentExecutor/ChatFrontend.on_event
-app/runtime/daemon.py             TaskSubmission fields, enqueue_task, cancel_task, orchestrator hookup, on_event fan-out, idle-session close
-app/db/tasks.py                   set_selection, attach_session, find_by_ref, list_recent
-app/db/provider_models.py         list_model_ids
-app/cli.py                        run real graph via wiring
-config.example.yaml               new opencode/orchestrator keys (values = defaults)
-docs/SETUP-discord-opencode.md    remove the feat/providers-quota checkout line
-tests/test_config.py, tests/test_daemon.py   add tests (§10)
-```
-Keep the existing fixtures in `tests/conftest.py` intact. Add a helper there only if it is shared.
+## 3. Provider adapters (`app/providers/http.py`, `gemini.py`)
 
-## 2. Config (`app/config/models.py`)
+- `HttpProviderAdapter`:
+  - `CHAT_PATH: ClassVar[str] = "chat/completions"`.
+  - Add `def chat_url(self) -> str`, returning `self.base_url.rstrip("/") + "/" + self.CHAT_PATH`.
+  - Add `def chat_headers(self) -> dict[str, str] | None`, returning
+    `{"Authorization": f"Bearer {key}"}`, or None when the key is missing.
+  - Make `error_from_response` usable by the gateway as is. It is already public.
+- `GeminiAdapter`: `CHAT_PATH = "openai/chat/completions"` (G2). Do not override `chat_headers`:
+  Bearer is correct for the compat endpoint.
+- Tests: add to `tests/test_provider_http_common.py`. Check `chat_url` for all three default
+  base URLs and a custom base_url, and `chat_headers` None when the key is missing.
 
-### 2.1 `OpenCodeConfig` (extend it; keep the existing two fields and their defaults)
+## 4. Gateway: new package `app/gateway/` (`__init__.py`, `server.py`)
+
 ```python
-server_url: str = "http://127.0.0.1:4096"  # validator: must start with http:// or https://
-working_directory: str = "/workspace"
-command: list[str] = Field(
-    default_factory=lambda: ["opencode"], min_length=1
-)  # entries stripped, non-empty
-provider_map: dict[str, str] = Field(
-    default_factory=lambda: {"openrouter": "openrouter", "gemini": "google", "groq": "groq"}
-)  # keys/values stripped, non-empty, values must not contain "/"
-projects: dict[str, str] = Field(
-    default_factory=dict
-)  # name -> directory; name matches ^[A-Za-z0-9_.-]{1,64}$; "default" is reserved (rejected as a key)
-run_timeout_s: float = Field(1800, gt=0, le=86400, allow_inf_nan=False)
-kill_grace_s: float = Field(5, gt=0, le=60, allow_inf_nan=False)
-health_timeout_s: float = Field(5, gt=0, le=60, allow_inf_nan=False)
-max_line_bytes: int = Field(1_048_576, ge=1024, le=16_777_216)
-output_tail_chars: int = Field(4000, ge=200, le=20000)
-stderr_tail_bytes: int = Field(4096, ge=256, le=65536)
-continue_prompt: str = "Continue the previous task from where it stopped. Do not repeat steps that already completed."  # stripped, non-empty
-```
-Add `def project_directory(self, project: str) -> str | None`. It returns `working_directory` for `"default"`, `projects.get(project)` otherwise, and None when the project is unknown.
-
-### 2.2 New `OrchestratorConfig`, added as `AppConfig.orchestrator` (default_factory)
-```python
-provider_refresh_interval_s: float = Field(
-    300, ge=0, allow_inf_nan=False
-)  # 0 = refresh before every task
-progress_min_interval_s: float = Field(10, ge=0, allow_inf_nan=False)
-session_idle_close_days: float = Field(7, gt=0, allow_inf_nan=False)
-require_tool_calling: bool = False
-```
-
-### 2.3 Trivial review follow-ups
-- `ProviderConfig._base_url_valid`: keep the https/http prefix check. Additionally, reject `http://` unless `urllib.parse.urlsplit(v).hostname` is in `{"localhost", "127.0.0.1", "::1"}`. The message is `base_url must use https:// (http:// only for localhost)`.
-- `app/config/secrets.py` `resolve_secret`: return `value.strip()`. A whitespace-only value is still None.
-- `app/providers/http.py` `error_from_response`: truncate `request_id` to 100 chars (`request_id[:100] if request_id else None`).
-
-### 2.4 `config.example.yaml`
-- Add the new `opencode` keys and an `orchestrator:` section. Show the default values, with commented `projects` and `provider_map` examples.
-- Comment that empty Discord allowlists deny everyone.
-- `tests/test_cli.py::test_check_example_config` must still pass.
-
-## 3. Runtime interfaces (`app/runtime/interfaces.py`)
-
-Replace `ExecutionResult` and `AgentExecutor`, and extend `ChatFrontend`:
-```python
-class ExecutionOutcome(StrEnum):
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    TIMED_OUT = "TIMED_OUT"
-    CANCELLED = "CANCELLED"
-    EXECUTOR_UNAVAILABLE = "EXECUTOR_UNAVAILABLE"
-
-
-class ExecutorEventKind(StrEnum):
-    SESSION = "SESSION"  # session id first seen
-    TOOL = "TOOL"  # tool_use event
-    STEP = "STEP"  # step_finish
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutorEvent:
-    kind: ExecutorEventKind
-    session_id: str | None = None
-    tool: str | None = None  # truncated to 40 chars
-    tool_status: str | None = None  # truncated to 20 chars
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionResult:
-    outcome: ExecutionOutcome
-    exit_code: int | None = None
-    error_class: ErrorClass | None = None  # None for SUCCEEDED/CANCELLED/EXECUTOR_UNAVAILABLE
-    session_id: str | None = None
-    http_status: int | None = None
-    retry_after_s: float | None = None
-    error_message: str | None = None  # redacted, <= 300 chars
-    output_tail: str = ""  # redacted, <= output_tail_chars
-    output_truncated: bool = False
-    tool_events: int = 0
-    llm_steps: int = 0
-    input_tokens: int | None = None  # None unless every step_finish carried ints
-    output_tokens: int | None = None
-    changed_files: tuple[str, ...] = ()  # <= 20 unique, each <= 200 chars, first-seen order
-    detail: str | None = None  # short infra detail for EXECUTOR_UNAVAILABLE, no secrets
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutorHealth:
-    healthy: bool
-    version: str | None
-    detail: str
-
-
-class AgentExecutor(Protocol):
-    async def health_check(self) -> ExecutorHealth: ...
-    async def run(
-        self,
-        *,
-        task_id: str,
-        provider: str,
-        model: str,
-        prompt: str,
-        session_id: str | None,
-        project_dir: str,
-        cancel_event: asyncio.Event,
-        on_event: Callable[[ExecutorEvent], None] | None = None,
-    ) -> ExecutionResult: ...
-    async def aclose(self) -> None: ...
-
-
-class ChatFrontend(Protocol):
-    async def start(self, controller: AgentController) -> None: ...
-    async def stop(self) -> None: ...
-    async def on_event(self, event: ControllerEvent) -> None: ...
-```
-`NullFrontend.on_event` returns None. Import `ControllerEvent` under `TYPE_CHECKING` only.
-
-## 4. OpenCode package
-
-### 4.1 `app/opencode/events.py` (pure, never raises)
-```python
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$")
-FILE_TOOLS = frozenset({"edit", "write", "patch"})
-
-@dataclass(frozen=True, slots=True)
-class OpenCodeError:
-    error_class: ErrorClass
-    http_status: int | None
-    retry_after_s: float | None
-    message: str            # unredacted here, <= 300 chars; executor redacts
-
-@dataclass(frozen=True, slots=True)
-class ParsedEvent:
-    type: str
-    session_id: str | None = None
-    text: str | None = None
-    tool: str | None = None
-    tool_status: str | None = None
-    file_path: str | None = None
-    input_tokens: int | None = None
-    output_tokens: int | None = None
-    error: OpenCodeError | None = None
-
-def parse_event_line(line: str | bytes, *, now: datetime) -> ParsedEvent | None
-def classify_opencode_error(error: object, *, now: datetime) -> OpenCodeError
-def classify_text(text: str) -> ErrorClass   # used for no-status errors and stderr
-```
-`parse_event_line` returns None in these cases:
-- the line is invalid UTF-8 (decode with `errors="replace"`, then attempt JSON) or not JSON;
-- the JSON is not a dict;
-- `type` is missing or not a str.
-
-Read every field by `isinstance` checks. Token fields count only when they are a real int ≥ 0 (not a bool). Session ids must match `SESSION_ID_RE`.
-
-`classify_opencode_error`:
-1. The input is not a dict → `UNKNOWN`. Read `name` and `data` (`data` must be a dict, otherwise use `{}`). Build `text = message + " " + responseBody`, each part only if it is a str, and cap it at 2000 chars.
-2. `name == "ProviderAuthError"` → `AUTH_FAILED`.
-3. `name == "MessageOutputLengthError"` → `CONTEXT_TOO_LARGE`.
-4. `statusCode` is an int in 100..599. Start with `app.providers.http.classify_status(status)`, then refine:
-   - 429: if `classify_text` gives `QUOTA_EXHAUSTED`, return that, else `RATE_LIMITED`.
-   - 400 or 413: if the text says context, return `CONTEXT_TOO_LARGE`.
-   - Never refine any other status. A 504 always stays `TIMEOUT_UNKNOWN_OUTCOME`.
-5. Otherwise, use `classify_text(text)`.
-
-`retry_after_s`: look up `"retry-after"` in `data.responseHeaders`, case-insensitively, and parse it with `app.providers.ratelimit.parse_retry_after(value, now)`.
-
-`classify_text`: use case-insensitive regexes, checked in this order:
-| Order | Pattern | Class |
-|---|---|---|
-| 1 | `quota\|resource.?exhausted\|insufficient_quota` | `QUOTA_EXHAUSTED` |
-| 2 | `rate.?limit\|too many requests\|\b429\b` | `RATE_LIMITED` |
-| 3 | `context.?(length\|window)\|maximum context\|too many tokens` | `CONTEXT_TOO_LARGE` |
-| 4 | `model.{0,40}not.?found\|model_not_found\|unknown model` | `MODEL_UNAVAILABLE` |
-| 5 | none of the above | `UNKNOWN` |
-
-### 4.2 `app/opencode/process.py`
-```python
-async def kill_process_tree(proc: asyncio.subprocess.Process, *, grace_s: float) -> None
-```
-It never raises, and it returns once `proc.returncode is not None` or after the best effort below.
-- **POSIX:** the process was started with `start_new_session=True`.
-  1. `os.killpg(proc.pid, SIGTERM)`.
-  2. Wait up to `grace_s` for `proc.wait()`.
-  3. Then `os.killpg(proc.pid, SIGKILL)`.
-  4. Ignore `ProcessLookupError`/`PermissionError`.
-- **Windows:**
-  1. Run `taskkill /PID <pid> /T /F` through `asyncio.create_subprocess_exec` with stdout/stderr DEVNULL, and wait up to 10 s.
-  2. Then, if the process is still alive, `proc.kill()`.
-  3. Then wait up to `grace_s`.
-
-  The process was started with `creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW`.
-- If the process has already exited (`returncode` is set), skip killing the root process, but on POSIX still `killpg` to reap any orphans (ignore errors).
-- Accepted limitation (document it in a comment): on Windows, grandchildren of an already-exited root cannot be found through `/T`.
-
-### 4.3 `app/opencode/health.py`
-```python
-async def check_opencode_health(server_url: str, *, timeout_s: float,
-                                transport: httpx.AsyncBaseTransport | None = None) -> ExecutorHealth
-```
-- Make one `httpx.AsyncClient(transport=transport, timeout=timeout_s, follow_redirects=False)` per call, used with `async with`.
-- GET `server_url.rstrip("/") + "/global/health"`.
-- It is healthy only for a 200 response whose JSON is a dict with `healthy is True`. Take `version` only if it is a str, truncated to 64.
-- Otherwise it is unhealthy, with detail `"HTTP <code>"`, `"malformed response"`, `"unhealthy"` or `type(e).__name__`.
-- It never raises.
-
-### 4.4 `app/opencode/executor.py`
-```python
-class OpenCodeExecutor:
-    def __init__(self, config: OpenCodeConfig, *, redactor: SecretRedactor | None = None,
-                 transport: httpx.AsyncBaseTransport | None = None,
-                 extra_env: Mapping[str, str] | None = None,
+class LlmGateway:
+    def __init__(self, config: AppConfig, *, adapters: Mapping[str, HttpProviderAdapter],
+                 cooldowns: CooldownManager, usage_sink: Callable[[UsageEvent], None],
+                 current_task_id: Callable[[], str | None], redactor: SecretRedactor | None = None,
+                 transport: httpx.AsyncBaseTransport | None = None, token: str | None = None,
                  clock: Callable[[], datetime] = utcnow) -> None
-    def opencode_model(self, provider: str, model: str) -> str   # f"{provider_map.get(provider, provider)}/{model}"
-    def build_argv(self, executable: str, *, provider: str, model: str, prompt: str, session_id: str | None) -> list[str]
-    async def health_check(self) -> ExecutorHealth
-    async def run(...) -> ExecutionResult          # signature per §3
-    async def aclose(self) -> None                  # no-op (no persistent resources)
+    token: str            # secrets.token_urlsafe(32) unless given
+    models: dict[str, tuple[str, str]]   # config.gateway_models() snapshot at init
+    @property base_url -> str             # f"http://127.0.0.1:{port}/v1"; RuntimeError before start
+    def build_app(self) -> web.Application
+    async def start(self) -> None         # AppRunner + TCPSite("127.0.0.1", config.gateway.port)
+    async def stop(self) -> None          # idempotent: runner.cleanup(), close httpx client
 ```
 
-`build_argv` returns `[executable, *command[1:], "run", "--attach", server_url, "--model", opencode_model, "--format", "json", ("--session", sid)?, prompt_arg]`. Here `prompt_arg` is the sanitized prompt, with a leading space added if it starts with `-`.
+Implementation rules:
+- Bind to `127.0.0.1` only. Read the actual port from `runner.addresses`. Use
+  `web.Application(client_max_size=max_request_bytes)`.
+- Use one `httpx.AsyncClient` with:
+  - `transport=transport`, `follow_redirects=False`, `trust_env=False`;
+  - `timeout=httpx.Timeout(connect=c, read=r, write=30, pool=c)`.
+- Use an `asyncio.Semaphore(max_concurrent_requests)` around upstream calls.
+- **Routes:**
+  - `POST /v1/chat/completions`
+  - `GET /v1/models`
+  - A catch-all `*` on `/{tail:.*}` returning 404. Wrong methods also get 404, not 405.
+- Every error body is OpenAI-shaped: `{"error": {"message": str, "type": str, "code": str|None}}`.
+- **Auth, checked first and before reading the body.**
+  - The `Authorization` header must be `Bearer <token>`. Compare the full header bytes with
+    `hmac.compare_digest`.
+  - Otherwise return 401 `invalid_api_key`. No upstream call.
+- **POST /v1/chat/completions, in order:**
+  1. Read the body; too large gives 413. The body must be valid JSON and an object, else 400.
+     `model` must be a str key of `self.models`, else 403 `model_not_allowlisted` (a stop error,
+     no fallback). Never substitute a model.
+  2. If `cooldowns.is_cooling(provider, model)`, return 429 `rate_limited` with `Retry-After`.
+     The value is the ceiling of the seconds left, from `cooldowns.active()`, max of the
+     `(provider, None)` and `(provider, model)` entries. No upstream call and no usage row.
+  3. The adapter is `adapters.get(provider)`. Headers are `adapter.chat_headers()`. If either is
+     None, return 503 `upstream_credential_missing`.
+  4. Build the upstream body:
+     - Copy only these top-level keys: `messages, stream, stream_options, temperature, top_p,
+       max_tokens, max_completion_tokens, stop, tools, tool_choice, parallel_tool_calls,
+       response_format, seed, presence_penalty, frequency_penalty, logit_bias, logprobs,
+       top_logprobs, user, reasoning_effort, n`.
+     - Set `model` to the upstream model id.
+     - Drop any other key and log its NAMES only, at warning. This blocks OpenRouter `models`,
+       `route`, `provider`, `plugins` and `transforms`, which can select other or paid models.
+  5. Send the request to `adapter.chat_url()` and nowhere else.
+     - Headers: `Content-Type: application/json`, the adapter auth header, and `Accept`
+       (`text/event-stream` if `stream` is true, else `application/json`).
+     - Forward no client header.
+     - Use `client.stream("POST", ...)`.
+- **Upstream 2xx, streaming** (`stream` true and the response content-type starts with
+  `text/event-stream`):
+  - Send an `aiohttp.web.StreamResponse(200)` with `Content-Type: text/event-stream` and
+    `Cache-Control: no-cache`.
+  - For each `aiter_raw()` chunk, `await resp.write(chunk)`. Backpressure bounds the buffering.
+    Nothing is accumulated except a line buffer for usage parsing, capped at 1 MiB; on overflow,
+    stop parsing usage.
+  - From each `data:` line other than `[DONE]` that parses to a dict with a dict `usage`, take
+    `prompt_tokens` / `completion_tokens` (ints >= 0; the last seen wins).
+  - Usage status:
+    - SUCCESS on normal end;
+    - UNKNOWN_OUTCOME if the upstream raises mid-stream or the client disconnects
+      (`ConnectionResetError` / `aiohttp.ClientConnectionResetError`). On disconnect, close
+      upstream.
+- **Upstream 2xx, non-streaming:**
+  - Read the body up to `max_response_bytes`. If over, return 502 `upstream_response_too_large`
+    and record UNKNOWN_OUTCOME.
+  - Otherwise return the same status with `Content-Type: application/json` and the bytes. Parse
+    `usage` the same way. Record SUCCESS.
+- **Upstream non-2xx, including any 3xx (never followed):**
+  - Read up to `max_error_body_bytes` and rebuild
+    `httpx.Response(status, headers=upstream.headers, content=capped)`.
+  - `err = adapter.error_from_response(...)` (already redacted). Then also apply
+    `redactor.redact` and replace the gateway token.
+  - Respond with the same status, except 3xx becomes 502. Body:
+    `{"error": {"message": err.message, "type": "upstream_error", "code": err.error_code}}`.
+    Add `Retry-After: ceil(err.retry_after_s)` when known.
+  - Record a usage ERROR row.
+  - If `err.error_class` is RATE_LIMITED, QUOTA_EXHAUSTED or PROVIDER_UNAVAILABLE, call
+    `cooldowns.record_failure(provider, model, cls, retry_after_s=...)`.
+  - Network and timeout classes are not recorded here. The orchestrator records them per attempt,
+    which avoids double counting.
+- **Transport errors** (`classify_transport_error`):
+  - TRANSIENT_NETWORK gives 502 `upstream_unreachable` and no usage row.
+  - TIMEOUT_UNKNOWN_OUTCOME / other gives 504 `upstream_timeout` and a usage UNKNOWN_OUTCOME
+    row.
+  - Never include the exception text; give the class name only.
+- On upstream 2xx, call `cooldowns.record_success(provider)`.
+- **Usage rows:** `UsageEvent(provider, model=upstream model id, cost_class=FREE, status,
+  occurred_at=clock(), task_id=current_task_id(), request_id=x-request-id[:100], tokens)`.
+  - Tokens are None when unknown.
+  - Wrap `usage_sink` in try/except and log the class name only.
+- **GET /v1/models** (auth required): `{"object": "list", "data": [{"id": gid, "object": "model",
+  "owned_by": "broke"}]}` in `models` order.
+- Logs: never log bodies, headers, the token or keys. Log the method, path, gateway model id,
+  status and duration.
+- **Tests** (new `tests/test_gateway.py`):
+  - Harness: `aiohttp.test_utils.TestServer(gw.build_app())` + `TestClient`; upstream via
+    `httpx.MockTransport`; adapters from `build_adapters(..., transport=..., environ={...})`.
+  - Cases:
+    - 401 when the token is missing or wrong, with zero upstream calls;
+    - 403 for a model that is not allowlisted, a disabled policy's model, or a model not in
+      `provider_order`;
+    - the upstream URL is exact for each of the 3 providers;
+    - the upstream `Authorization` is the real key, and the client's Authorization, x-api-key and
+      cookie are not forwarded;
+    - `model` is rewritten;
+    - `models`, `provider`, `plugins` and `route` are dropped;
+    - streaming passthrough is byte-identical, with usage parsed from the final chunk and the row
+      recorded with the task id;
+    - non-stream usage;
+    - 429 + Retry-After passed through, with a cooldown set and an ERROR row;
+    - a cooling model gives 429 with no upstream call;
+    - a 302 upstream gives 502 and is not followed;
+    - ConnectError gives 502; ReadTimeout gives 504;
+    - an upstream error echoing the key and the token is redacted in the response;
+    - a missing key env gives 503;
+    - an oversized request gives 413; invalid JSON gives 400;
+    - an oversized non-stream response gives 502;
+    - `/v1/models` lists only the allowlist;
+    - an unknown path or method gives 404;
+    - a real `start()` reports host 127.0.0.1 and `stop()` is idempotent.
 
-`run` steps:
-1. **Sanitize the prompt** with `sanitize_prompt` (§6, Decision 8). If it is invalid, return `FAILED`/`INVALID_REQUEST` without spawning.
-2. **Check the session id.** If `session_id` is not None and does not match `SESSION_ID_RE`, return `FAILED`/`INVALID_REQUEST`.
-3. **Resolve the executable** with `shutil.which(command[0])`. Return `EXECUTOR_UNAVAILABLE` in these cases:
-   - it resolves to None, with detail `"opencode executable not found"`;
-   - on Windows, it resolves to a `.cmd`/`.bat` suffix (case-insensitive), with detail `"refusing .cmd/.bat launcher; set opencode.command"`;
-   - `project_dir` is not an existing directory, with detail `"project directory missing"`.
-4. **Spawn** with `asyncio.create_subprocess_exec(*argv, stdin=DEVNULL, stdout=PIPE, stderr=PIPE, cwd=project_dir, env={**os.environ, **extra_env}, limit=max_line_bytes, **platform kwargs)`. If this raises OSError, return `EXECUTOR_UNAVAILABLE` with detail `type(e).__name__`.
-5. **Read concurrently:**
-   - **stdout reader:** loop `await stdout.readline()`.
-     - A `ValueError` (oversized line) increments `oversized_lines` and continues. CPython drops the buffered overrun.
-     - `b""` means EOF.
-     - Parse each line with `parse_event_line`.
-     - Track the first valid session id, and call `on_event(SESSION)` once.
-     - Text appends to a bounded tail. Keep at most `output_tail_chars` chars, dropping from the front, and set `output_truncated` when anything is dropped.
-     - Every `tool_use` increments `tool_events` and calls `on_event(TOOL)`. File tools add their path to `changed_files`.
-     - `step_finish` increments `llm_steps`, sums tokens, and calls `on_event(STEP)`. If any step lacks ints, the token totals become None.
-     - Keep the **first** error event.
-     - `on_event` exceptions are caught and logged (class name only).
-   - **stderr reader:** keep only the last `stderr_tail_bytes` bytes (a bounded `bytearray`, trimmed from the front).
-   - Then `proc.wait()`.
+## 5. Managed OpenCode server
 
-   Memory must not grow with output size.
-6. **Wait** with `asyncio.wait({drain_and_wait, cancel_event.wait()}, timeout=run_timeout_s, return_when=FIRST_COMPLETED)`:
-   - On cancel → `kill_process_tree`, then outcome `CANCELLED`.
-   - On timeout → kill, then outcome `TIMED_OUT`, `error_class=TIMEOUT_UNKNOWN_OUTCOME`.
-   - After a kill, wait for the drain task for at most `kill_grace_s + 5` s, then cancel it.
-   - Always cancel the helper `cancel_event.wait()` task.
-7. **Raw `asyncio.CancelledError`** (shutdown): `await asyncio.shield(kill_process_tree(...))`, then re-raise.
-8. **Map the result after a normal exit:**
-   - First error event present → `FAILED` with its class, status, retry_after and message (even when the exit code is 0).
-   - Exit 0 → `SUCCEEDED`.
-   - Non-zero exit → `FAILED` with `classify_text(stderr_tail)`, and the message is the redacted stderr tail (≤ 300 chars).
-9. **Redact before returning.** `output_tail`, `error_message` and `changed_files` go through `redactor.redact` when a redactor is set, after ANSI escapes are stripped (`\x1b\[[0-9;?]*[A-Za-z]`).
-10. **Log** one INFO line: `task_id`, provider, model, outcome, exit_code, error_class, `llm_steps`, `tool_events`, `oversized_lines`. Never log the prompt, the argv, or any output.
+### 5a. `app/opencode/endpoint.py` (new)
 
-## 5. DB repositories
-
-### 5.1 `app/db/sessions.py`
-```python
-class SessionStatus(StrEnum): OPEN = "OPEN"; CLOSED = "CLOSED"
-
-@dataclass(frozen=True, slots=True)
-class SessionRecord:
-    id: str; opencode_session_id: str | None; project_id: str; status: SessionStatus
-    created_at: datetime; updated_at: datetime; closed_at: datetime | None
-
-class AmbiguousReference(LookupError): ...
-
-class SessionRepository:
-    def create(self, *, project_id: str, now: datetime) -> SessionRecord
-    def get(self, session_id: str) -> SessionRecord | None
-    def find_by_ref(self, ref: str) -> SessionRecord | None   # exact id, else unique prefix (LIKE ref || '%' LIMIT 2); raises AmbiguousReference; caller validates ref format
-    def set_opencode_session_id(self, session_id: str, oc_id: str, *, now: datetime) -> SessionRecord  # only when currently NULL; otherwise unchanged (log WARNING if a different id is offered)
-    def touch(self, session_id: str, *, now: datetime) -> None
-    def close(self, session_id: str, *, now: datetime) -> None      # idempotent
-    def list_recent(self, limit: int) -> list[SessionRecord]        # ORDER BY updated_at DESC, id
-    def close_idle(self, *, cutoff: datetime, now: datetime) -> int # OPEN, updated_at < cutoff, no task in non-terminal status
-```
-`app/db/sessions.py` must not import `app/db/tasks.py`, to avoid an import cycle.
-
-### 5.2 `app/db/attempts.py`
-```python
-class AttemptStatus(StrEnum): RUNNING, SUCCEEDED, FAILED, TIMED_OUT, CANCELLED, EXECUTOR_UNAVAILABLE
-
-@dataclass(frozen=True, slots=True)
-class AttemptRecord:
-    id: int; task_id: str; session_id: str | None; attempt_no: int; provider: str; model: str
-    status: AttemptStatus; error_class: str | None; http_status: int | None
-    retry_after_ms: int | None; started_at: datetime; finished_at: datetime | None
-
-class FallbackAttemptRepository:
-    def start(self, *, task_id: str, session_id: str | None, attempt_no: int, provider: str, model: str, now: datetime) -> int
-    def finish(self, attempt_id: int, *, status: AttemptStatus, error_class: str | None, http_status: int | None, retry_after_ms: int | None, now: datetime) -> None
-    def list_for_task(self, task_id: str) -> list[AttemptRecord]   # ORDER BY attempt_no
-```
-- `session_id` here is our `sessions.id`, not the OpenCode id.
-- `retry_after_ms` is clamped to `[0, 2**31-1]`, and None stays None.
-- `quota_snapshot_id` stays NULL.
-
-### 5.3 `app/db/tasks.py` additions
-```python
-def set_selection(self, task_id: str, *, provider: str, model: str, now: datetime) -> TaskRecord  # sets selected_provider/model, cost_class='FREE', last_event_at
-def attach_session(self, task_id: str, session_id: str, *, now: datetime) -> TaskRecord
-def find_by_ref(self, ref: str) -> TaskRecord | None   # same semantics as sessions; raises AmbiguousReference (import from app.db.sessions)
-def list_recent(self, limit: int) -> list[TaskRecord]  # ORDER BY created_at DESC, id
-```
-
-### 5.4 `app/db/provider_models.py`
-Add `list_model_ids(self, provider: str) -> list[str]`. It returns all rows for the provider (ALLOWED and DISCOVERED_ONLY), sorted.
-
-## 6. Orchestrator (`app/orchestrator/orchestrator.py`)
-
-```python
-FAIL_OPENCODE_UNAVAILABLE = "OPENCODE_UNAVAILABLE"
-FAIL_INTERRUPTED_BY_RESTART = "INTERRUPTED_BY_RESTART"
-FAIL_DAEMON_SHUTDOWN = "DAEMON_SHUTDOWN"
-PROMPT_MAX_CHARS = 4000
-
-def sanitize_prompt(prompt: str) -> str | None   # Decision 8 minus the leading-space rule; None = invalid. Used by executor, orchestrator, backend.
-
-@dataclass(frozen=True, slots=True)
-class RunningTask:
-    task_id: str; session_id: str; provider: str | None; model: str | None
-    attempt_no: int; opencode_session_id: str | None; started_at: datetime
-
-class CancelResult(StrEnum):
-    CANCELLED = "CANCELLED"            # was QUEUED, now CANCELLED
-    CANCELLING = "CANCELLING"          # running; cancel signalled
-    NOT_FOUND = "NOT_FOUND"
-    NOT_CANCELLABLE = "NOT_CANCELLABLE"   # already terminal
-
-class Orchestrator:
-    def __init__(self, config: AppConfig, *, executor: AgentExecutor,
-                 adapters: Mapping[str, ProviderAdapter],
-                 cooldowns: CooldownManager | None = None,
-                 environ: Mapping[str, str] | None = None,
-                 clock: Callable[[], datetime] = utcnow) -> None
-    def bind(self, controller: AgentController) -> None          # called by controller.start after migrate
-    def recover_interrupted(self) -> int                          # Decision 11; returns count
-    async def handle(self, controller: AgentController, sub: TaskSubmission) -> None   # the TaskHandler
-    def request_cancel(self, task_id: str) -> CancelResult
-    def begin_shutdown(self) -> None                              # Decision 12
-    @property
-    def running(self) -> RunningTask | None
-    @property
-    def executor(self) -> AgentExecutor
-    @property
-    def cooldowns(self) -> CooldownManager
-    @property
-    def observations(self) -> Mapping[str, ProviderObservation]
-```
-`sanitize_prompt` may instead live in a small `app/orchestrator/prompt.py` if that avoids an import cycle with `app/opencode/executor.py`. Pick one place.
-
-### 6.1 `handle` algorithm
-All DB access uses `controller.conn`, and timestamps use `self._clock()`. Steps:
-1. **Load the task.** If `sub.task_id` is None, create the row as `_default_handler` does now; otherwise load it.
-   - Missing → log a warning and return.
-   - Status is not QUEUED (for example cancelled while queued) → return.
-   - Shutting down → transition QUEUED → CANCELLED with `DAEMON_SHUTDOWN`, emit `task_finished`, and return.
-2. **Register the cancel event.** Register `asyncio.Event` as the current cancel event and set `running`. Clear both in a `finally`.
-3. **Start routing.** Transition QUEUED → ROUTING and emit `task_routing`.
-4. **Validate the prompt and project:**
-   - `project_dir = config.opencode.project_directory(record.project_id)`.
-   - Unknown project, or `sanitize_prompt` returns None → transition ROUTING → FAILED with error_class `INVALID_REQUEST`, emit `task_finished`, and return.
-5. **Resolve the session:**
-   - If `record.session_id` is set, load it. If it is missing or CLOSED, transition ROUTING → FAILED with `INVALID_REQUEST`, emit, and return.
-   - Otherwise `SessionRepository.create(project_id=...)`, then `TaskRepository.attach_session`.
-   - `oc_sid = session.opencode_session_id`.
-6. **Health check.** `health = await executor.health_check()`. If it is unhealthy → ROUTING → FAILED with `OPENCODE_UNAVAILABLE`, emit with `detail`, and return.
-7. **Refresh providers.** Run `refresh_all(adapters, conn, config, now=..., environ=...)` when it has never run or `provider_refresh_interval_s` has elapsed. On any exception, log the class name and keep the previous observations.
-8. **Build the request.** `request = RouteRequest(task_id, project_id, RequiredCapabilities(tool_calling=config.orchestrator.require_tool_calling), session_id=session.id)`. `state_factory = lambda: build_router_state(config, conn, cooldowns, observations, now=clock(), environ=environ)`.
-9. **Loop.** Set `attempts: list[FailedAttempt] = []`, `prompt_to_send = sanitized prompt` and `send_session = oc_sid`, then repeat:
-   1. If cancel is set → transition the task's current status (ROUTING) to CANCELLED (error_class `DAEMON_SHUTDOWN` when shutting down, else None), emit, and return.
-   2. Route with `decision = route_with_state(request, config, state_factory, attempts=attempts)`.
-   3. **NoEligibleProvider** → transition ROUTING → FAILED with this error_class:
-      - `NON_FALLBACK_ERROR` → the last attempt's error_class value;
-      - any other reason → `reason.value` (for example `FREE_CAPACITY_EXHAUSTED`).
-
-      Emit `task_finished` with `reason`, `error_class` and `attempts=len(attempts)`, then return.
-   4. **Selected:**
-      - `set_selection`, `SessionRepository.touch`, then transition ROUTING → RUNNING.
-      - `attempt_no = len(attempts) + 1`. Insert the attempt row with `start`.
-      - Update `running`.
-      - Emit `provider_selected` with provider, model, attempt_no, `policy_id`, and `skipped` (a comma-joined `provider/model:REASON` list, ≤ 300 chars).
-   5. **Run** `result = await executor.run(task_id=..., provider=..., model=..., prompt=prompt_to_send, session_id=send_session, project_dir=project_dir, cancel_event=..., on_event=<throttled progress callback, §6.2>)`.
-   6. **Persist the session id.** If `result.session_id` is set and the session has no OpenCode id → `set_opencode_session_id`, and set `oc_sid`.
-   7. **Record usage:** `max(result.llm_steps, 1)` `UsageEvent`s (FREE, task_id, provider, model).
-      - The first event carries `input_tokens`/`output_tokens`. The rest carry `0/0` when the totals are known, else None.
-      - The status of the **last** event is `success` for SUCCEEDED, `unknown_outcome` for TIMED_OUT or for a FAILED attempt whose class is in `STOP_ERRORS`, and `error` otherwise. Earlier events are `success`.
-      - Cap the count at 500 events (log if capped).
-      - Skip this whole step for `EXECUTOR_UNAVAILABLE` and for a CANCELLED attempt with `llm_steps == 0`.
-   8. **Finish the attempt row** (status from the outcome, `error_class`, `http_status`, `retry_after_ms` from `round(retry_after_s*1000)`), then handle the outcome:
-      - **SUCCEEDED:** `cooldowns.record_success(provider)`. Transition RUNNING → SUCCEEDED with `exit_code`. Emit `task_finished` with these fields: `status`, `provider`, `model`, `attempts`, `changed_files` (comma-joined, ≤ 500 chars), `output_tail` (≤ 1500 chars), `session_id`, `exit_code`. Return.
-      - **CANCELLED:** transition RUNNING → CANCELLED (`DAEMON_SHUTDOWN` if shutting down) and emit. Return.
-      - **EXECUTOR_UNAVAILABLE:** RUNNING → FAILED with `OPENCODE_UNAVAILABLE`. Emit with `detail`. Return. There is no cooldown.
-      - **FAILED / TIMED_OUT:**
-        1. `ec = result.error_class or ErrorClass.UNKNOWN`.
-        2. `cooldowns.record_failure(provider, model, ec, retry_after_s=result.retry_after_s, now=clock())`.
-        3. Apply Decision 4. If `result.session_id is None and oc_sid is None and result.tool_events > 0`, set `ec = ErrorClass.UNKNOWN`.
-        4. Append `FailedAttempt(provider, model, ec)`.
-        5. Emit `attempt_failed` with provider, model, attempt_no, `error_class`, `http_status` and `retry_after_ms`.
-        6. Transition RUNNING → ROUTING.
-        7. Set the next send: if `oc_sid` is set → `prompt_to_send = config.opencode.continue_prompt`, `send_session = oc_sid`. Otherwise keep the original prompt and `send_session = None`.
-        8. Continue the loop.
-10. **`finally` block:**
-    - Unregister the cancel event and `running`.
-    - If the task is now terminal: `SessionRepository.touch`, and close the session if it has no `opencode_session_id` (Decision 16).
-11. **Raw `CancelledError`:** best effort, transition the task to CANCELLED with `DAEMON_SHUTDOWN` (ignore `InvalidTransition`/`ConcurrentTransition`/`sqlite3.Error`), then re-raise.
-
-Every transition uses `TaskRepository.transition`, so `ensure_transition` is enforced. The paths above are QUEUED → ROUTING → (RUNNING ⇄ ROUTING)* → terminal, and every one of them is legal in `ALLOWED_TRANSITIONS`.
-
-### 6.2 Events (bounded, for the frontend)
-Emit through `controller.emit(ControllerEvent(name, at, task_id, fields))`. Every task event's fields include `channel_id` (`record.discord_channel_id` or None) and `short_id` (the first 8 chars of the task id). The names are:
-- `task_queued` (from `enqueue_task`)
-- `task_routing`
-- `provider_selected`
-- `progress`
-- `attempt_failed`
-- `task_finished`
-
-`task_finished` always has `status` (the TaskStatus value) and `error_class` (or None). It also has `session_short` (the first 8 chars of our session id, or None).
-
-`progress` comes from executor events:
-- **SESSION:** always emitted, with `opencode_session_id`.
-- **TOOL:** emitted at most once per `progress_min_interval_s` per task, with `tool`, `tool_status`, `tool_events`, `llm_steps`.
-- **STEP:** emitted at most once per `progress_min_interval_s` per task, with the same fields.
-- Throttled events are dropped, not queued.
-
-### 6.3 `request_cancel(task_id)`
-1. The task is not found → `NOT_FOUND`.
-2. The task is terminal → `NOT_CANCELLABLE`.
-3. The task is the running one → set its event and return `CANCELLING`.
-4. The task is QUEUED → transition it to CANCELLED, emit `task_finished`, and return `CANCELLED`. The worker skips it later.
-5. Otherwise (ROUTING/RUNNING/WAITING_APPROVAL but not the tracked task, which should not happen) → `NOT_CANCELLABLE`, and log a warning.
-
-## 7. Daemon changes (`app/runtime/daemon.py`)
-- **`TaskSubmission`:** add `task_id: str | None = None` and `session_id: str | None = None`.
-- **`AgentController.__init__`:**
-  - Add `orchestrator: Orchestrator | None = None`. If it is given and `task_handler` is None, use `orchestrator.handle`.
-  - Expose the read-only property `orchestrator`.
-  - Keep the existing behavior when it is not given, and keep all current tests passing.
-- **`start()`:** after `migrate`, if the orchestrator is set, call `orchestrator.bind(self)`, then `orchestrator.recover_interrupted()`. Both run before the worker and frontend start.
-- **`enqueue_task(sub: TaskSubmission) -> TaskRecord | None`:**
-  - Return None if the controller is not started, is stopped, or `self._task_queue.full()`.
-  - Otherwise create the QUEUED row (with `session_id`), `put_nowait(dataclasses.replace(sub, task_id=record.id))`, emit `task_queued`, and return the record.
-  - Do not `await` between the full-check and the put.
-- **`cancel_task(task_id) -> CancelResult`:** delegate to the orchestrator. Without an orchestrator, cancel a QUEUED row directly, and otherwise return `NOT_CANCELLABLE`/`NOT_FOUND`.
-- **`stop()`:** call `orchestrator.begin_shutdown()` (if set) **before** `frontend.stop()` and the queue drain.
-- **`_event_loop`:** after logging, `await asyncio.wait_for(self._frontend.on_event(event), timeout=FRONTEND_EVENT_TIMEOUT_S)` with `FRONTEND_EVENT_TIMEOUT_S = 10`. Catch `Exception` (this includes `TimeoutError`) and log only the type name. A frontend failure must never kill the loop.
-- **`run_cleanup_now`:** in `_work`, before retention, run `SessionRepository(conn).close_idle(cutoff=now - timedelta(days=config.orchestrator.session_idle_close_days), now=now)` and add `sessions_closed` to the event fields.
-- **`metrics()`:** add `running_task_id` (or None).
-
-## 8. Discord frontend
-
-### 8.1 `app/bot/auth.py`
 ```python
 @dataclass(frozen=True, slots=True)
-class AuthDecision:
-    allowed: bool
-    reason: str     # "ok" | "user_not_allowed" | "guild_not_allowed" | "channel_not_allowed" | "dm_not_allowed"
-
-def authorize(cfg: DiscordConfig, *, user_id: int, guild_id: int | None, channel_id: int | None) -> AuthDecision
+class ServerEndpoint:
+    url: str
+    password: str | None = None
+    username: str = "opencode"
+    def auth(self) -> httpx.BasicAuth | None
 ```
-Checks run in this order: user, then dm (guild None), then guild, then channel. A None channel is not allowed. Empty lists deny (Decision 1). Pure, with no logging.
 
-### 8.2 `app/bot/format.py` (pure)
+### 5b. `app/opencode/env.py` (new): child environment allowlist (replaces `_child_env`)
+
 ```python
-DISCORD_MAX_CHARS = 1900
-def safe_text(text: str, redactor: SecretRedactor | None, limit: int = DISCORD_MAX_CHARS) -> str  # strip ANSI, redact, neutralize ```, truncate with "\n…(truncated)"
-def format_ack(record: TaskRecord, queue_position: int) -> str
-def format_event(event: ControllerEvent) -> str | None       # None = do not post
-def format_status(snapshot: StatusSnapshot) -> str
-def format_usage(snapshot: UsageSnapshot) -> str
-def format_models(groups: Sequence[ProviderModels]) -> str
-def format_sessions(sessions: Sequence[SessionRecord]) -> str
-def format_cancel(result: CancelResult, ref: str) -> str
+BASE_ENV_NAMES: frozenset[str]  # PATH HOME USER LOGNAME SHELL LANG LANGUAGE TERM TZ TMPDIR TEMP TMP
+  # XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR
+  # SYSTEMROOT WINDIR COMSPEC PATHEXT USERPROFILE APPDATA LOCALAPPDATA PROGRAMDATA, plus any LC_*
+def build_opencode_env(environ: Mapping[str, str], *, passthrough: Sequence[str],
+                       extra: Mapping[str, str]) -> dict[str, str]
 ```
-Every function's return value goes through `safe_text` (callers pass the redactor, so add a `redactor` keyword to each function). The contents are:
-- **Ack:** `Task <short_id> queued (position N). Project: <p>.`
-- **`provider_selected`:** `Provider: <provider> / <model> (attempt n)`.
-- **`attempt_failed`:** `Attempt n failed: <ERROR_CLASS> — trying next free candidate` (do not promise a next one).
-- **`progress`:** `Working… <tool> (<tool_status>), steps <n>`. For a SESSION event: `OpenCode session started`.
-- **`task_finished`:**
-  - SUCCEEDED: `✅ Task <short> completed`, a `Changed:` list (if any), `Provider: p / m`, `Cost class: FREE`, and the output tail in a code block.
-  - FAILED: `❌ Task <short> failed: <error_class>`.
-    - For `FREE_CAPACITY_EXHAUSTED`, add the explicit line: `No free capacity left on any configured provider. Nothing was paid for. Try again after cooldowns/quotas reset (/usage).`
-    - For `TIMEOUT_UNKNOWN_OUTCOME`/`UNKNOWN`, add: `Outcome unknown; not replayed. Continue with /code session:<session_short>`.
-    - For `OPENCODE_UNAVAILABLE`, add: `OpenCode server is not reachable.`
-  - CANCELLED: `🛑 Task <short> cancelled`.
-- **`task_routing`/`task_queued`:** None.
-- **Status:**
-  - `PC: online`;
-  - `OpenCode: healthy (<version>)` or `unreachable (<detail>)`;
-  - the current task (short id, provider/model, attempt, OpenCode session short), or `Current task: none`;
-  - `Queue: N`;
-  - up to 5 recent tasks (`short status provider/model`).
-- **Usage:** one line per provider/model/window:
-  - `<provider>[/<model>] <window> <unit>: <remaining> remaining (EXACT)`;
-  - `~<remaining> … (ESTIMATED)`;
-  - `UNKNOWN`, with no number, when `remaining` is None or the confidence is UNKNOWN.
 
-  Then the active cooldowns (`provider[/model] cooling until HH:MM UTC`), then today's observed usage (requests, tokens). With no data at all: `No quota data (UNKNOWN)`.
-- **Models:** per policy in `provider_order`, numbered allowlisted models with `ALLOWED` and a capability summary (`tools`, `ctx=<n>`, or `caps unknown`). Then `N other models DISCOVERED_ONLY (never selectable)` when N > 0.
-- **Sessions:** one line each: `<short id> <project> <status> oc=<first 12 chars of opencode id or ->`. With none: `No sessions.`
+- Copy only the allowlisted names and the passthrough names that are present, then apply `extra`.
+- Because it is an allowlist, every provider key, the bot token, `OPENCODE_CONFIG`,
+  `OPENCODE_CONFIG_DIR` and unknown variables are absent by construction. This also closes F3.
+- Tests (new `tests/test_opencode_env.py`):
+  - absent: provider key vars, `GOOGLE_GENERATIVE_AI_API_KEY`, `DISCORD_BOT_TOKEN`,
+    `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, `FOO_API_KEY`;
+  - present: PATH and the `LC_ALL` / passthrough names;
+  - extra overrides.
 
-### 8.3 `app/bot/commands.py` (pure handlers, no discord import)
+### 5c. `app/opencode/auth_store.py` (new)
+
 ```python
-@dataclass(frozen=True, slots=True)
-class CommandContext: user_id: int; guild_id: int | None; channel_id: int | None
-
-@dataclass(frozen=True, slots=True)
-class Reply: content: str; ephemeral: bool
-
-@dataclass(frozen=True, slots=True)
-class StatusSnapshot:
-    opencode: ExecutorHealth; running: RunningTask | None; queue_depth: int
-    recent: tuple[TaskRecord, ...]           # <= 5
-
-@dataclass(frozen=True, slots=True)
-class UsageSnapshot:
-    quota: tuple[QuotaRecord, ...]; cooldowns: Mapping[tuple[str, str | None], datetime]
-    today: tuple[tuple[str, str, UsageTotals], ...]; now: datetime
-
-@dataclass(frozen=True, slots=True)
-class ProviderModels:
-    policy_id: str; provider: str; listings: tuple[ModelListing, ...]
-    capabilities: Mapping[str, ModelCapability]
-
-class SubmitStatus(StrEnum): QUEUED, QUEUE_FULL, INVALID_PROMPT, UNKNOWN_PROJECT, UNKNOWN_SESSION, AMBIGUOUS_SESSION, SESSION_CLOSED
-
-@dataclass(frozen=True, slots=True)
-class SubmitResult: status: SubmitStatus; record: TaskRecord | None = None; queue_position: int = 0
-
-class BotBackend(Protocol):
-    def submit_code(self, *, prompt: str, project: str | None, session_ref: str | None, ctx: CommandContext) -> SubmitResult
-    def cancel(self, task_ref: str) -> tuple[CancelResult | None, str]   # None + message for unknown/ambiguous ref
-    async def status(self) -> StatusSnapshot
-    def usage(self) -> UsageSnapshot
-    def models(self) -> list[ProviderModels]
-    def sessions(self, limit: int = 10) -> list[SessionRecord]
-
-COMMAND_NAMES = ("code", "status", "usage", "models", "sessions", "cancel")
-REF_RE = re.compile(r"^[0-9a-f-]{6,36}$")
-
-async def run_command(name: str, *, cfg: DiscordConfig, backend: BotBackend, ctx: CommandContext,
-                      redactor: SecretRedactor | None, options: Mapping[str, str | None]) -> Reply
+def auth_store_path(environ: Mapping[str, str] | None = None) -> Path   # G6
+def stored_credential_providers(environ: Mapping[str, str] | None = None) -> list[str] | None
 ```
-`run_command` steps:
-1. Call `authorize`. If it is denied, log at WARNING `discord auth denied command=<name> user=<id> reason=<reason>` (never the options) and return `Reply("Not authorized.", ephemeral=True)`.
-2. Dispatch. An unknown name gives `Reply("Unknown command.", True)`.
-3. `/code` is non-ephemeral. Everything else is ephemeral.
 
-Rules for each command:
-- **`/code`:** `prompt` is required. `project` defaults to `"default"`. `session` is optional; it is lower-cased first and must match `REF_RE` (otherwise `UNKNOWN_SESSION`). Each `SubmitStatus` maps to a one-line reply.
-- **`/cancel`:** `task` is lower-cased first and must match `REF_RE`, otherwise `Invalid task id.`
+- A missing file gives `[]`.
+- Invalid JSON, a non-object, or a read error gives `None`, meaning unsafe/unknown.
+- Otherwise return the sorted top-level keys. Never read or return values. Sanitize each key:
+  - keep `[A-Za-z0-9._-]`, else `?`;
+  - truncate to 40 characters;
+  - keep at most 10 keys, then `+N more`.
+- Helper `auth_store_problem(environ) -> str | None` returns a user message or None. Messages:
+  - `"OpenCode has stored provider credentials for: a, b. Run \`opencode auth logout\` for each; OpenCode must hold no provider keys."`
+  - `"OpenCode credential store unreadable: <path>"`
+- Tests: new `tests/test_opencode_auth_store.py`, using `XDG_DATA_HOME` pointed at tmp_path.
 
-Every exception from the backend is caught. The reply is `Internal error (<ExceptionClass>).`, and it is logged with the class only.
+### 5d. `app/opencode/server.py` (new): `build_opencode_config` + `OpenCodeServerManager`
 
-### 8.4 `app/bot/backend.py`
-`ControllerBackend(controller: AgentController, config: AppConfig, *, environ=None)` implements `BotBackend`:
-- **`submit_code`:**
-  - It sanitizes the prompt with `sanitize_prompt` and checks the project with `project_directory`.
-  - It resolves `session_ref` with `SessionRepository.find_by_ref`; the session must be OPEN.
-  - Then it calls `controller.enqueue_task`, with the ctx ids converted to str (None stays None).
-  - `queue_position` is `controller.metrics()["task_queue_depth"]`.
-- **`cancel`:** `TaskRepository.find_by_ref`, then `controller.cancel_task`.
-- **`status`:** `await orchestrator.executor.health_check()`, plus `orchestrator.running`, `metrics()["task_queue_depth"]` and `TaskRepository.list_recent(5)`.
-- **`usage`:**
-  - `exact = QuotaSnapshotRepository(conn).latest(now)`, without estimate-prefixed sources (as in `app/quota/state.py::_build`);
-  - plus `estimate_quota(config, UsageRepository(conn), now, exact=exact)`;
-  - plus `orchestrator.cooldowns.active(now)`;
-  - plus `UsageRepository.daily_totals(now)`.
-- **`models`:** for each policy id in `provider_order`, call `model_listing(config, provider, ProviderModelRepository(conn).list_model_ids(provider))`, keeping only the listings of that policy plus the DISCOVERED_ONLY ones. The capabilities come from `allowed_capabilities`.
-- **`sessions`:** `SessionRepository.list_recent(limit)`.
-
-### 8.5 `app/bot/discord_frontend.py`
 ```python
-def create_frontend(config: AppConfig, *, redactor: SecretRedactor | None,
-                    environ: Mapping[str, str] | None = None) -> ChatFrontend
+def build_opencode_config(config: AppConfig, *, gateway_base_url: str, gateway_token: str) -> dict[str, Any]
 ```
-It returns `NullFrontend` and logs the WARNING of Decision 13 when `resolve_secret(config.discord.bot_token_env, environ)` is None. Otherwise it returns `DiscordFrontend(config, redactor=..., environ=...)`. The token is resolved again inside `start`; never store it on `self`.
 
-`DiscordFrontend`:
-- **`__init__`** creates nothing network-related.
-- **`build_client(self) -> tuple[discord.Client, app_commands.CommandTree]`** is public so tests can inspect the commands without connecting.
-  - `intents = discord.Intents.none(); intents.guilds = True`.
-  - Register the six commands with descriptions:
-    - `/code prompt:str(max_length=4000) project:str? session:str?`
-    - `/status`
-    - `/usage`
-    - `/models`
-    - `/sessions`
-    - `/cancel task:str`
-  - `setup_hook` copies global commands to each allowed guild and syncs per guild (`tree.copy_global_to(guild=discord.Object(id))`, `await tree.sync(guild=...)`). A sync failure logs the class name only.
-- **`start(controller)`:**
-  - Build `ControllerBackend` and the client.
-  - Then `self._task = asyncio.create_task(client.start(token))` (**not** `client.run`, which installs its own logging handler).
-  - Add a done-callback that logs `discord frontend stopped: <ExcClass>` on error (for example `LoginFailure`). The daemon keeps running.
-- **Each command callback:**
-  1. Build `CommandContext` from `interaction.user.id`, `interaction.guild_id` and `interaction.channel_id`.
-  2. Call `authorize` first. If denied, `interaction.response.send_message("Not authorized.", ephemeral=True)`, log as in §8.3, and return.
-  3. Otherwise `await interaction.response.defer(ephemeral=<command is not "code">, thinking=True)` immediately.
-  4. Then `reply = await run_command(...)`.
-  5. Then `await interaction.followup.send(reply.content, ephemeral=reply.ephemeral, allowed_mentions=AllowedMentions.none())`.
+The function returns:
 
-  `run_command` re-authorizes, which is harmless.
-- **`on_event(event)`:**
-  1. `text = format_event(event, redactor=...)`. If it is None, or `channel_id` is missing, return.
-  2. Resolve the channel with `client.get_channel(int(channel_id))`. If that is None, skip and log at DEBUG.
-  3. For `progress`: edit the task's existing progress message if one is tracked, otherwise send one and track it.
-  4. Any other event: send a new message.
-  5. Track messages in an `OrderedDict[str, discord.Message]` capped at 100 (LRU eviction). On `task_finished`, drop the entry.
-  6. Every send/edit uses `AllowedMentions.none()`.
-  7. Exceptions are caught and logged with the class name.
+```json
+{"$schema": "https://opencode.ai/config.json",
+ "enabled_providers": ["broke"],
+ "provider": {"broke": {"npm": "@ai-sdk/openai-compatible", "name": "broke-ai-coder gateway",
+   "options": {"baseURL": "<gateway_base_url>", "apiKey": "<token>"},
+   "models": {"<gid>": {"name": "<gid>", "limit": {"context": N, "output": N}}}}},
+ "model": "broke/<first gid>", "small_model": "broke/<gateway.small_model or first gid>",
+ "share": "disabled", "autoupdate": false}
+```
 
-  Provide a test seam: a `_client` attribute that tests can set to a stub exposing `get_channel`.
-- **`stop()`:** `await client.close()`, then await or cancel `_task` with a 10 s timeout. It is idempotent, and safe when `start` was never called.
+- `gateway_base_url` already ends in `/v1`.
+- Include `limit` only when `providers[p].models[m]` has both `context_window` and
+  `max_output_tokens`.
+- If `gateway_models()` is empty, raise `StartupError("no enabled allowlisted models; check routing.provider_order/policies")`.
 
-## 9. Test fakes
+```python
+class OpenCodeServerManager:
+    def __init__(self, app_config: AppConfig, *, gateway: LlmGateway, redactor: SecretRedactor | None = None,
+                 environ: Mapping[str, str] | None = None, password: str | None = None,
+                 health_transport: httpx.AsyncBaseTransport | None = None) -> None
+    password: str                         # secrets.token_urlsafe(24) unless given
+    @property endpoint -> ServerEndpoint  # http://127.0.0.1:<current port>
+    async def start(self) -> None
+    async def stop(self) -> None          # idempotent
+```
 
-### 9.1 `tests/fakes/fake_opencode.py` (stdlib only)
-- Run it as `[sys.executable, <abs path>]`, which makes up `opencode.command`. `shutil.which` resolves `sys.executable`, an absolute path.
-- On each invocation it appends `json.dumps(sys.argv[1:])` plus a newline to `$FAKE_OC_ARGV_FILE` (if that is set) and records `os.getcwd()` the same way in `$FAKE_OC_CWD_FILE`.
-- `$FAKE_OC_SCENARIOS` is a comma list. The n-th invocation (the counter is a file at `$FAKE_OC_COUNTER_FILE`) uses item n, and the last item repeats.
-- Tests pass these variables through `OpenCodeExecutor(extra_env=...)`.
+- **`start()`:**
+  - If `auth_store_problem()` returns a message, raise `StartupError(msg)`.
+  - Resolve the executable with the new shared helper `resolve_executable(command) -> str`
+    (raises `StartupError`). Move the `shutil.which` and win32 `.cmd`/`.bat` refusal out of
+    `executor.run` into `app/opencode/process.py`; the executor keeps returning
+    `_unavailable(...)` by catching it.
+  - Create `server_directory` with `mkdir(parents=True, exist_ok=True)`.
+  - Choose the port: `server_port`, or a free port when it is 0 (bind a socket to 127.0.0.1:0,
+    read the port, close it).
+  - Spawn `[exe, *command[1:], "serve", "--hostname", "127.0.0.1", "--port", str(port)]` with:
+    - `cwd=server_directory`, stdin/stdout DEVNULL, stderr PIPE;
+    - `env=build_opencode_env(environ or os.environ, passthrough=..., extra={"OPENCODE_CONFIG_CONTENT": json.dumps(cfg), "OPENCODE_SERVER_PASSWORD": password, "OPENCODE_SERVER_USERNAME": "opencode"})`;
+    - process-group kwargs as in `executor.run`.
+  - Drain stderr into a bounded tail of `stderr_tail_bytes`.
+  - Health-wait: poll `check_opencode_health(endpoint)` every 0.25 s until healthy or
+    `server_start_timeout_s`. On timeout or an early exit, kill the tree and raise
+    `StartupError("opencode serve did not become healthy: <detail>")`. The detail is the exit
+    code and the redacted stderr tail, at most 300 chars.
+  - Then start a `_monitor` task.
+- **`_monitor`:**
+  - Await process exit. If not stopping, log a warning with the exit code and the redacted stderr
+    tail.
+  - Sleep the backoff (1, 2, 4… capped at `server_restart_max_backoff_s`). Reset the backoff after
+    an uptime of at least 60 s.
+  - Re-spawn and health-wait; re-pick the port when it is 0. Failed restarts loop until `stop()`.
+  - Never raises.
+- **`stop()`:**
+  - Set stopping and cancel the monitor.
+  - `kill_process_tree(proc, grace_s=kill_grace_s)`.
+  - Cancel the stderr drain.
+- Tests (new `tests/test_opencode_server.py`):
+  - Config content, including the `limit` include/omit cases.
+  - Lifecycle with the fake serve (section 8):
+    - starts healthy;
+    - the served env has no provider keys and no bot token, and has
+      `OPENCODE_CONFIG_CONTENT` / password;
+    - `/global/health` without auth gives 401;
+    - after a `crash_after`, it restarts (start counter 2) and the endpoint is healthy again;
+    - `stop()` kills it (the port stops answering);
+    - `never_healthy` gives StartupError within the timeout;
+    - an `auth.json` with keys gives StartupError naming the ids and no values;
+    - a missing executable gives StartupError.
+  - Use small timeouts and backoff (monkeypatch the 60 s reset constant).
 
-The scenarios are:
+### 5e. HTTP helpers: add auth and `trust_env=False` (folds in F7)
 
-| Scenario | Behavior |
+- `check_opencode_health`, `abort_opencode_session` and the config check each take
+  `auth: httpx.Auth | None = None` and pass `trust_env=False` to `httpx.AsyncClient`.
+- Update the B7 docstring in `health.py`: Basic auth is now supported.
+
+## 6. Preflight (`app/opencode/config_check.py`)
+
+- Replace `allowed_small_models` with `opencode_model_ids(config) -> frozenset[str]`, which is
+  `{f"broke/{gid}" for gid in config.gateway_models()}`.
+- Replace `check_small_model` with:
+
+```python
+async def check_server_config(endpoint: ServerEndpoint, allowed: frozenset[str], *, gateway_base_url: str | None,
+                              timeout_s: float, transport=None, environ=None) -> tuple[SmallModelCheck, str]
+```
+
+Checks, in order. Each failure returns `(UNSAFE, detail)`, where the detail names the key path
+only and never values. `GET /config` failing or non-dict gives `(UNAVAILABLE, "GET /config failed")`.
+  0. `auth_store_problem(environ)` gives UNSAFE with that message. Run it off-loop with
+     `asyncio.to_thread`.
+  1. `enabled_providers` must be exactly the list `["broke"]`.
+  2. `provider` must be a dict whose key set is exactly `{"broke"}`.
+  3. Within `provider.broke`:
+     - `npm == "@ai-sdk/openai-compatible"`;
+     - `options.baseURL == gateway_base_url` (skip this check when `gateway_base_url` is None);
+     - `models` is a dict whose keys are all in `{a.removeprefix("broke/") for a in allowed}`.
+  4. `small_model` must be present and in `allowed`.
+  5. `_bad_model_key(body, allowed)` must return None. Extend it to walk `command` like
+     `agent`/`mode` (review fix 4).
+- **On-disk project check (defense in depth), simplified:**
+  - `allowed` is now `opencode_model_ids`.
+  - `_scope_dirs` always returns the full chain to the filesystem root (review fix 2). Update the
+    B13 docstring.
+  - In project files, any `provider`, `enabled_providers` or `disabled_providers` key is UNSAFE
+    (`key 'provider' is not allowed in project config`; review fix 4).
+  - Markdown agent scanning (review fix 1) is NOT added (superseded, section 10).
+- Rewrite the module docstring (B12/B13). The authoritative guarantee is "no keys in OpenCode +
+  gateway allowlist"; these checks are accident detection.
+- Tests: update `tests/test_opencode_config_check.py`, `tests/test_small_model_preflight.py`,
+  `tests/test_project_config_check.py` and `tests/test_slice3_safety.py`.
+  - Invert `test_without_git_only_project_dir_checked`: a parent file above a non-git project is
+    now UNSAFE.
+  - New cases: one per check 0–5, including:
+    - `enabled_providers` missing, `["broke","groq"]` and `"broke"` (not a list);
+    - an extra provider entry;
+    - a wrong baseURL;
+    - a non-allowlisted model key under `provider.broke.models`;
+    - `command.x.model` paid;
+    - a project file with `provider`;
+    - Basic auth sent (assert the header on the MockTransport).
+
+## 7. Executor, orchestrator, interfaces, daemon, wiring, CLI, bot text
+
+- **`app/runtime/interfaces.py`:**
+  - Rename the `AgentExecutor.check_small_model` protocol method to
+    `check_server_config(self, allowed: frozenset[str]) -> tuple[SmallModelCheck, str]`.
+  - Add `class StartupError(Exception)`.
+  - Add the `RuntimeService` Protocol: `async start() -> None`, `async stop() -> None`.
+  - Update `tests/fakes/fake_executor.py`: rename the attributes `small_model*` to
+    `server_check*`, and return `(self.server_check, detail)`.
+- **`app/opencode/executor.py`:**
+  - New ctor kwargs:
+    - `endpoint: Callable[[], ServerEndpoint] | None = None`. The default is
+      `lambda: ServerEndpoint(config.server_url)`.
+    - `gateway_base_url: Callable[[], str | None] | None = None`.
+    - `environ: Mapping[str, str] | None = None`.
+  - Remove `bot_token_env`; the env allowlist makes it moot.
+  - `opencode_model(provider, model)` returns `f"broke/{provider}/{model}"`.
+  - `build_argv` uses `--attach endpoint().url`.
+  - The child env is `build_opencode_env(...)` with `extra` holding `OPENCODE_SERVER_PASSWORD` /
+    `OPENCODE_SERVER_USERNAME` when the password is set (G4), plus `extra_env`.
+  - Health, abort and the config check pass `endpoint().auth()`.
+  - Update the B5/B13 docstrings.
+- **`app/orchestrator/orchestrator.py`:**
+  - Use `opencode_model_ids`.
+  - Rename `_small_model_state` to `_server_config_state`. It caches only OK, with the same TTL,
+    and returns `(check, detail)`.
+  - On UNSAFE, emit `detail="opencode server config not gateway-only"` and
+    `config_detail=<detail>`. On UNAVAILABLE, keep the current message.
+  - **Delete `_record_usage`, `_MAX_USAGE_EVENTS` and the usage imports.** The gateway is now the
+    only writer of `usage_events`, which avoids double counting. Update the B10 docstring.
+  - Cooldown and attempt logic is unchanged.
+- **`app/bot/format.py` (OPENCODE_UNSAFE_CONFIG text):**
+  - Replace it with: "OpenCode's config is not limited to the built-in free-model gateway, or
+    OpenCode has stored provider credentials, so the task was not run. Remove provider settings
+    from opencode.json files and run `opencode auth logout`."
+  - Keep the `Offending:` line. Update the matching test in `tests/test_bot_format.py`.
+- **`app/runtime/daemon.py`:**
+  - `AgentController.__init__` gains `services: Sequence[RuntimeService] = ()`.
+  - In `start()`, after `recover_interrupted()` and before workers and the frontend, start the
+    services in order and record which ones started.
+  - In `_teardown()`, after cancelling the worker tasks and before closing `conn`, stop the
+    started services in reverse order. Wrap each in try/except and log the class name only.
+  - A failing service start propagates through the existing `except BaseException: _teardown()`.
+- **`app/runtime/wiring.py`:**
+  - Build these in order:
+    1. `adapters`
+    2. `cooldowns = CooldownManager(config.cooldown)`
+    3. a `holder` for the controller
+    4. `gateway = LlmGateway(..., usage_sink=_sink, current_task_id=lambda: orchestrator.running.task_id if orchestrator.running else None)`.
+       `_sink` writes `UsageRepository(controller.conn).record(ev)` when conn is not None.
+    5. `redactor.add(gateway.token)`
+    6. If `managed_server`:
+       - `manager = OpenCodeServerManager(config, gateway=gateway, redactor=redactor, environ=environ)`
+       - `redactor.add(manager.password)`
+       - `endpoint = lambda: manager.endpoint`
+       Otherwise `manager = None` and `endpoint` is static.
+    7. `executor = OpenCodeExecutor(..., endpoint=endpoint, gateway_base_url=lambda: gateway.base_url, environ=environ)`
+    8. `orchestrator = Orchestrator(..., cooldowns=cooldowns)`
+    9. `controller = AgentController(..., services=[gateway, *([manager] if manager else [])])`
+  - Add `gateway` and `server_manager` fields to `Runtime`.
+  - `close_runtime` also awaits `gateway.stop()`; it is idempotent.
+  - Tests in `tests/test_wiring.py`:
+    - the services order;
+    - one shared CooldownManager;
+    - the redactor holds the token and the password;
+    - `managed_server=false` gives no manager;
+    - F17: the env passed to the executor has no bot token.
+- **`app/cli.py`:** in `main`, catch `StartupError` before the generic `Exception`. Print
+  `str(e)` to stderr and return 3. Add a test in `tests/test_cli.py`.
+- **Daemon tests (`tests/test_daemon.py`):**
+  - services start before the frontend and stop after the workers, in reverse order;
+  - a failing second service stops the first and closes conn.
+
+## 8. Fake `opencode serve` (`tests/fakes/fake_opencode.py`)
+
+- When `sys.argv[1] == "serve"`, parse `--hostname` and `--port` and run a stdlib
+  `ThreadingHTTPServer`.
+- If `OPENCODE_SERVER_PASSWORD` is set, require Basic auth (`opencode:<pw>`); otherwise answer 401.
+- `GET /global/health` returns `{"healthy": true, "version": "fake"}`.
+- `GET /config` returns `json.loads(OPENCODE_CONFIG_CONTENT)`, or the `FAKE_OC_CONFIG_OVERRIDE`
+  JSON when that is set.
+- `POST /session/<id>/abort` returns `true`.
+- Write `dict(os.environ)` as JSON to `FAKE_OC_ENV_FILE`, if set.
+- Increment the counter in `FAKE_OC_SERVE_COUNTER_FILE`.
+- Scenarios come from `FAKE_OC_SERVE_SCENARIO`:
+  - `ok` (default);
+  - `exit_immediately` (exit 5 after writing `boom` to stderr);
+  - `never_healthy` (health returns 503);
+  - `crash_after` (exit 7 after `FAKE_OC_SERVE_CRASH_AFTER_S` seconds, only on the first start
+    per the counter).
+- Tests set `opencode.command = [sys.executable, <path to fake_opencode.py>]` and pass
+  `FAKE_OC_*` through `environ=`. The allowlist drops them otherwise, so in tests either add them
+  to `env_passthrough` or pass them via `extra`. Prefer `env_passthrough`: `FAKE_OC_*` names
+  pass validation.
+
+## 9. Docs
+
+- **`docs/SETUP-discord-opencode.md`:**
+  - **Part B:** Gemini needs `GEMINI_API_KEY` only. Remove `GOOGLE_GENERATIVE_AI_API_KEY`.
+    State that keys are for the controller only and must never be given to OpenCode.
+  - **C4:** the secrets file drops `GOOGLE_GENERATIVE_AI_API_KEY`, which makes the expected
+    count 4 lines.
+    - Replace the `.bashrc` sourcing with loading it only when the daemon starts:
+      `set -a; . ~/.config/broke-ai-coder/secrets.env; set +a` in the controller's shell or start
+      command.
+    - Explain R1: never `source` it in `.bashrc`.
+  - **D2:** OpenCode is given no keys.
+    - Run `opencode auth list`. Then run `opencode auth logout` for every listed provider; the
+      daemon refuses to start otherwise.
+    - Remove any `provider`, `model`, `small_model` or `enabled_providers` entries from
+      `~/.config/opencode/opencode.json`.
+    - Model ids come from each provider's dashboard or models API, not `opencode models`.
+  - **D2b:** `small_model` and `model` are now pinned by the controller through
+    `OPENCODE_CONFIG_CONTENT` (optional `gateway.small_model`). There is no manual edit. Project
+    files must not contain `provider` / `enabled_providers`, or model keys outside `broke/...`.
+  - **D3 smoke test:** remove the manual `opencode run --model groq/...` step; with no keys it
+    cannot work. Replace it with: start the daemon, then run `/code` on `/workspace/hello`.
+  - **D4/D5:** do NOT run `opencode serve` yourself. The daemon starts it on
+    `127.0.0.1:<opencode.server_port>` with a random password and restarts it on crash. Stop any
+    tmux `opencode serve` session.
+  - **Checklist and Troubleshooting:** update the affected rows (health curl now needs the
+    password, so drop it). Add rows for `opencode auth logout` and the StartupError messages.
+- **`config.example.yaml`:**
+  - Remove the provider_map comment and rewrite the opencode SAFETY comment for the gateway.
+  - Add `managed_server`, `server_port`, `server_directory`, `server_start_timeout_s`,
+    `server_restart_max_backoff_s`, `env_passthrough: []` and the `gateway:` block with defaults
+    and one-line comments.
+  - `small_model_check_ttl_s`: change its comment to "cache a passing OpenCode server-config
+    check".
+- **SPEC.md:**
+  - §6.6: add the gateway as the structural layer.
+  - §9: `opencode serve` is launched by the daemon, and the model is `broke/<provider>/<model>`.
+  - §11 Secrets: keys are held only by the controller process, OpenCode credential storage is
+    forbidden, and residual risks R1–R4 are listed.
+  - §13: remove "(if enabled)".
+  - §16: add the new config keys.
+- **ARCHITECTURE.md:** §4.6 (managed serve + gateway flow diagram: OpenCode → gateway
+  127.0.0.1 → upstream https); §11 (the boundary: OpenCode is untrusted for keys; the gateway
+  holds them; R1); §12 failure modes (serve crash → restart; gateway upstream 429 → cooldown).
+- **TASKS.md:**
+  - Add T036 "LLM gateway" and T037 "Managed opencode serve" (done in this change).
+  - T003: managed by the daemon.
+  - T071: done via 127.0.0.1 + Basic auth.
+  - T072: required to close R1.
+  - T082: add the G1–G8 verification items.
+- **Residual risks (state exactly these, SPEC §11 + ARCHITECTURE §11):**
+  - **R1:** the agent runs as the same OS user as the daemon and can read the secrets file and
+    `/proc/<pid>/environ`. Fix: T072, a separate OS user.
+  - **R2:** `opencode` run by the user outside the daemon with their own keys or config is
+    outside this guarantee.
+  - **R3:** managed or MDM system OpenCode configs outrank inline config (admin-only).
+  - **R4:** account-level billing must stay off (OpenRouter $0 balance, Gemini project without
+    billing, Groq Free plan) as the second layer.
+  - Also: the gateway token and server password are visible to the agent. That is acceptable:
+    they only unlock allowlisted free models on localhost.
+
+## 10. Review items (`.pipeline/review.md`) disposition
+
+| Item | Disposition |
 |---|---|
-| `success` | `step_start`(sessionID `ses_fake1`), `text`, `tool_use` edit (`filePath` `src/a.py`), `step_finish` (tokens 10/5), exit 0 |
-| `rate_limit` | session event, then `error` APIError statusCode 429 with `responseHeaders {"retry-after":"30"}`, exit 1 |
-| `quota_text` | session event, then `error` UnknownError with message `Resource has been exhausted (e.g. check quota).`, exit 1 |
-| `auth` | `error` ProviderAuthError, exit 1 |
-| `no_session_429` | an `error` with statusCode 429 and no sessionID anywhere, exit 1 |
-| `tool_no_session` | a `tool_use` event without sessionID, then exit 1 with stderr `boom` |
-| `exit_nonzero` | stderr `boom`, exit 3 |
-| `error_exit0` | session, then a 503 error event, exit 0 |
-| `garbage` | non-JSON lines and `[]`, then `success` |
-| `hang` | session event, flush, sleep 120 |
-| `spawn_child` | spawns a grandchild (`sys.executable -c` loop appending a line to `$FAKE_OC_HEARTBEAT` every 0.1 s), emits a session event, sleeps 120 |
-| `flood` | 20 000 `text` events of 1 000 chars each, then exit 0 |
-| `long_line` | one 3 MB non-JSON line, then a newline, then a `success` sequence |
-| `secret_echo` | `text` containing `$FAKE_OC_SECRET`, then exit 0 |
+| Required fix 1 (markdown agents) | Superseded. Any model outside `broke/*` cannot resolve because of `enabled_providers`, and `broke/*` is enforced by the gateway. |
+| Required fix 2 (scan to root) | Done (section 6). |
+| Required fix 3 (server-cwd masking) | Superseded. The daemon owns the serve cwd, and inline config carries the safety keys. |
+| Required fix 4 (`command`, `provider`, alias, baseURL) | `command` and project-file `provider` are done. Alias and baseURL in GET /config are covered by check 3 and the gateway. |
+| F3 residual, F7, F10, F17, F18 (enabled_providers) | Done. |
+| F11 | Superseded (provider_map removed). |
+| F19 | Done via R1–R4 docs. |
+| F20, F24, R-b, R-c, R-d | Superseded: no keys in OpenCode. |
+| F21, F22 | Superseded. |
+| F23 | Folded into T082 (G1–G8). |
+| F5, F6, F8, F9, F12–F16, the strict xfail, B11 known gap, slice-2 follow-ups, other deferred items | Deferred, unrelated to this change. |
 
-The fake must flush stdout after every line.
+## Patterns to copy
 
-### 9.2 `tests/fakes/fake_executor.py`
-`ScriptedExecutor(results: list[ExecutionResult | Callable[..., Awaitable[ExecutionResult]]], health: ExecutorHealth = healthy)`:
-- It records every `run` kwarg dict in `.calls`.
-- It returns the scripted items in order; the last item repeats.
-- A callable item is awaited with the run kwargs. This supports cancel tests, where the item awaits `cancel_event.wait()` and returns CANCELLED, and can fire `on_event`.
-- `aclose` is a no-op.
-
-## 10. Tests (every test is offline; use the `db`/`make_config` fixtures and `NOW`/`secret_env` from `tests/conftest.py`)
-
-**`test_opencode_events.py`**
-- Each event type parses.
-- The session id comes from the top level and from `part`. An invalid session id (`-x`, too long, spaces) is ignored.
-- Non-JSON input, a non-dict, and a missing `type` each give None.
-- A bool token is rejected.
-- Classification:
-  - ProviderAuthError → AUTH_FAILED;
-  - 429 → RATE_LIMITED;
-  - 429 with quota text → QUOTA_EXHAUSTED;
-  - 504 with `rate limit` text → stays TIMEOUT_UNKNOWN_OUTCOME;
-  - 400 with context text → CONTEXT_TOO_LARGE;
-  - no status with `Resource has been exhausted` → QUOTA_EXHAUSTED;
-  - MessageOutputLengthError → CONTEXT_TOO_LARGE;
-  - garbage → UNKNOWN.
-- Retry-after is parsed case-insensitively.
-- Nothing raises on arbitrary nested junk.
-
-**`test_opencode_executor.py`** (real subprocesses of the fake; wrap each test in a 60 s `asyncio.wait_for`)
-- `build_argv`:
-  - order and flags;
-  - `--session` only when given;
-  - the provider_map maps gemini to `google/<m>`;
-  - openrouter gives `openrouter/openrouter/free`;
-  - a leading-`-` prompt gets a space prefix.
-- `success`: SUCCEEDED, `session_id="ses_fake1"`, `changed_files == ("src/a.py",)`, tokens 10/5, `llm_steps == 1`, the cwd equals `project_dir`, and the argv file shows `--format json`.
-- `rate_limit`: FAILED, RATE_LIMITED, http 429, `retry_after_s == 30`.
-- `quota_text`: QUOTA_EXHAUSTED.
-- `auth`: AUTH_FAILED.
-- `exit_nonzero`: FAILED, UNKNOWN, exit 3.
-- `error_exit0`: FAILED, PROVIDER_UNAVAILABLE.
-- `garbage`: SUCCEEDED.
-- `hang` with `run_timeout_s=1`: TIMED_OUT, TIMEOUT_UNKNOWN_OUTCOME, and returns well under 30 s.
-- `hang` with the cancel event set after the session event: CANCELLED.
-- `spawn_child` cancel: after the result plus 1 s, the heartbeat file size stays unchanged over a further 1 s (the process tree is dead). This must pass on Windows (taskkill) and on POSIX.
-- `flood`: `len(output_tail) <= output_tail_chars` and `output_truncated`.
-- `long_line` with `max_line_bytes=1_048_576`: SUCCEEDED (the oversized line is skipped).
-- `secret_echo` with a redactor holding the secret: the secret is absent from `output_tail`.
-- Missing executable: EXECUTOR_UNAVAILABLE.
-- Missing project dir: EXECUTOR_UNAVAILABLE.
-- On Windows only (`skipif` otherwise): a `.cmd` file in tmp gives EXECUTOR_UNAVAILABLE.
-- Empty prompt or a 4001-char prompt: FAILED/INVALID_REQUEST with no spawn (the argv file is absent).
-- Outer task cancelled (`CancelledError`) on `spawn_child`: the tree is killed (heartbeat stops) and CancelledError propagates.
-
-**`test_opencode_health.py`** (MockTransport)
-- Healthy, with the version.
-- `healthy: false`.
-- 500.
-- Non-JSON.
-- ConnectError raised by the handler.
-- The URL path is exactly `/global/health` when `server_url` has a trailing slash.
-
-**`test_sessions_attempts_repo.py`**
-- create/get, and `find_by_ref` with an exact match, a unique prefix and an ambiguous prefix (raises).
-- `set_opencode_session_id` sets the id only once.
-- `close_idle` respects the cutoff and unfinished tasks.
-- Attempts are started and finished in order, and `retry_after_ms` is clamped.
-- `TaskRepository.set_selection` sets cost_class FREE.
-- `TaskRepository.attach_session`, `find_by_ref` and `list_recent` order.
-
-**`test_orchestrator.py`** (ScriptedExecutor + `FakeProviderAdapter`s from `app/providers/fake.py` returning tool-capable, 200k-context capabilities for every allowlisted model, as in `full_state`; `environ=secret_env()`; drive it through a started `AgentController(cfg, orchestrator=orch)` with `enqueue_task`, then `await asyncio.wait_for(controller._task_queue.join(), 10)`. Set the database path under `tmp_path` and `opencode.working_directory` to `str(tmp_path)`.)
-- **Success:** first candidate `openrouter/openrouter/free`; the task is SUCCEEDED, cost_class FREE, `selected_*` set; 1 attempt row SUCCEEDED; a usage row FREE.
-- **T054 chain:**
-  - OR 429 (with session `ses_fake1`) → gemini g-3.8 429 → g-3.7 success. The attempts are persisted in order with error_class and http_status.
-  - The cooldowns contain `(openrouter, openrouter/free)` and `(gemini, g-3.8)`.
-  - The second and third calls have `session_id == "ses_fake1"` and `prompt == continue_prompt`.
-  - The task session's `opencode_session_id` is set.
-  - Run this with `max_fallback_attempts: 5`.
-- **No session captured** (results without `session_id`, 429): the second call re-sends the original prompt with `session_id=None`.
-- **Tool activity without a session:** FAILED with `UNKNOWN` after 1 attempt.
-- **Every candidate rate-limited:** two configs.
-  - `max_fallback_attempts: 10` → FREE_CAPACITY_EXHAUSTED after 5 attempts.
-  - `max_fallback_attempts: 2` → MAX_FALLBACK_ATTEMPTS_REACHED after 2 attempts.
-  - In both, the executor is never called after the stop.
-- **TIMED_OUT:** FAILED with TIMEOUT_UNKNOWN_OUTCOME, 1 attempt, no replay.
-- **AUTH_FAILED on OR:** the next candidate is gemini (provider excluded).
-- **Health unhealthy:** FAILED with `OPENCODE_UNAVAILABLE`, 0 attempts, the executor's `run` not called, no cooldowns.
-- **EXECUTOR_UNAVAILABLE result:** FAILED with `OPENCODE_UNAVAILABLE`, no cooldown.
-- **Cancel while running:** `request_cancel` → CANCELLING → the task ends CANCELLED.
-- **Cancel while queued** (block the worker on the first task with a gate): the second task becomes CANCELLED and its executor is never called.
-- **`recover_interrupted`:** pre-seeded RUNNING → FAILED `INTERRUPTED_BY_RESTART`; QUEUED → CANCELLED.
-- **Shutdown during a run:** `controller.stop()` → the task ends CANCELLED with `DAEMON_SHUTDOWN`.
-- **Follow-up:** a submission with an existing session (that has an OpenCode id) sends `session_id=<oc id>` with the new prompt.
-- **Unknown project:** FAILED with INVALID_REQUEST and 0 attempts.
-- **Events:** with `progress_min_interval_s=10` and a fixed clock, a callable script item that fires 1 SESSION and 50 rapid TOOL events produces at most 2 `progress` events (SESSION + 1).
-- **No PAID anywhere:** after the chain test, `SELECT COUNT(*) FROM usage_events WHERE cost_class <> 'FREE'` is 0.
-- **Integration:** one test with the real `OpenCodeExecutor` (fake script, scenarios `rate_limit,success`, MockTransport health returning healthy) reaches SUCCEEDED on the second candidate, with `--session ses_fake1` in the second argv.
-
-**`test_bot_auth.py`**
-- Every list is empty → denied.
-- User allowed, but guild or channel lists empty → denied.
-- DM → `dm_not_allowed`.
-- Wrong user, guild or channel → the right reason.
-- All three match → allowed.
-
-**`test_bot_format.py`**
-- `safe_text` truncates to ≤ 1900 chars, neutralizes ```` ``` ````, strips ANSI and redacts the secret.
-- `format_event` for each event name, including the explicit FREE_CAPACITY_EXHAUSTED line and the unknown-outcome continue hint. `task_routing` gives None.
-- `format_usage`: EXACT shows the number, ESTIMATED shows `~`, UNKNOWN shows no digits for that row, and the no-data message.
-- `format_models`: ALLOWED ranks and the DISCOVERED_ONLY count.
-- `format_status`: healthy and unreachable variants.
-
-**`test_bot_commands.py`** (fake BotBackend)
-- An unauthorized user gets "Not authorized." and the backend is not called. A log record is captured and does not contain the prompt text.
-- `/code` is QUEUED → the ack contains the short id and is non-ephemeral.
-- Each SubmitStatus gets its reply.
-- `/cancel` with an invalid ref → "Invalid task id."; with a valid ref it passes through.
-- `/status`, `/usage`, `/models` and `/sessions` are ephemeral.
-- A backend exception gives `Internal error (RuntimeError).`
-- A secret inside backend data is redacted in the reply.
-
-**`test_discord_frontend.py`**
-- `create_frontend` with an empty environ returns a `NullFrontend` and logs the env var **name**.
-- `create_frontend` with a token returns a `DiscordFrontend`, and the token value does not appear in `repr(frontend)` or `vars(frontend)`.
-- `build_client()` (no start) registers exactly `COMMAND_NAMES`, and `/code` has a `prompt` option with `max_length == 4000`.
-- `on_event` with a stub client (`get_channel` returns a fake channel recording `send`/`edit`) does the following:
-  - progress edits a single message;
-  - `task_finished` sends a new message;
-  - a missing `channel_id` sends nothing;
-  - `allowed_mentions` is `AllowedMentions.none()`.
-- `stop()` without `start()` does not raise.
-
-**`test_wiring.py`**
-- `build_runtime(config, redactor=..., environ={}, once=False)` gives a NullFrontend, an `OpenCodeExecutor` and an `Orchestrator` bound to the controller after start. `close_runtime` calls `aclose` on the adapters.
-- `once=True` always gives a NullFrontend, even with a token in environ.
-
-**Config tests** (add to `tests/test_config.py`)
-- The new defaults.
-- `provider_map` values containing `/` are rejected.
-- The `projects` key `default` is rejected.
-- An http base_url for a non-localhost host is rejected, while `http://localhost:8080` is accepted.
-- `resolve_secret` strips.
-
-**Daemon tests** (add to `tests/test_daemon.py`)
-- `enqueue_task` returns the record, and returns None when the queue is full or the controller is stopped.
-- A frontend whose `on_event` raises does not stop the event loop (a later event is still delivered).
-
-## 11. CLI wiring (`app/runtime/wiring.py`, `app/cli.py`)
-```python
-@dataclass(slots=True)
-class Runtime:
-    controller: AgentController
-    orchestrator: Orchestrator
-    executor: OpenCodeExecutor
-    adapters: dict[str, HttpProviderAdapter]
-
-def build_runtime(config: AppConfig, *, redactor: SecretRedactor, environ: Mapping[str, str] | None = None,
-                  once: bool = False) -> Runtime
-async def close_runtime(rt: Runtime) -> None     # aclose adapters + executor; each guarded, logs class name only
-```
-`build_runtime` wires:
-- `adapters = build_adapters(config, environ=environ, redactor=redactor)`;
-- `executor = OpenCodeExecutor(config.opencode, redactor=redactor)`;
-- `orchestrator = Orchestrator(config, executor=executor, adapters=adapters, environ=environ)`;
-- `frontend = NullFrontend() if once else create_frontend(config, redactor=redactor, environ=environ)`;
-- `controller = AgentController(config, frontend=frontend, orchestrator=orchestrator)`.
-
-Import `app.bot.discord_frontend` lazily inside `build_runtime` (only when `once` is False), so that `--check` and `--once` never import discord.
-
-In `cli.py`:
-- Replace the non-`--check` path with `asyncio.run(_serve(config, redactor, once=args.once))`.
-- `_serve` builds the runtime **inside** the running loop, installs the signal handlers as today, and runs `run_once()` or `run_forever()`.
-- `close_runtime` runs in a `finally`.
-- `--check` is unchanged.
-- `tests/test_cli.py` must pass unchanged.
-
-## 12. Doc fix
-In `docs/SETUP-discord-opencode.md` Part E, delete exactly the line `git checkout feat/providers-quota      # or main once branches are merged`. Change nothing else in the doc.
-
-## 13. Deferred (do not implement; carry forward in changes.md)
-- **Approvals.** T060 and T061 (approval buttons, action interception) and `/approve`/`/deny` are not trivial, because OpenCode permission events would need the server API. `/attach` is deferred too.
-- **Start scripts.** T101/T102 (start scripts, auto-start) and T082 (live end-to-end).
-- **OpenCode server auth.** Basic auth for the OpenCode server (`OPENCODE_SERVER_PASSWORD`) in the health check and in `--attach`.
-- **OpenCode internal retry visibility (B4).** Detecting 429 retries before the timeout fires.
-- **Slice-2 review follow-ups:**
-  - snapshot staleness max-age (before T044);
-  - code map vs. 504 precedence in `http.py`;
-  - ratelimit header overflow clamps;
-  - partial-key and other-scheme redaction;
-  - `install_redaction` covering handlers added later. No new handlers are added in this slice, and discord.py `client.start` adds none;
-  - A9 per-model Groq header scoping;
-  - probe-cost reuse;
-  - test_cli redaction-filter hygiene;
-  - all slice-1 test-strengthening items.
-- **Strict xfails.** The two strict xfails stay as they are. The paid-spend one is moot now that paid usage cannot be recorded. The reviewer may recommend deleting it.
-- **Quota refresh scheduler (T044).** Refresh happens only per task, rate-limited by `provider_refresh_interval_s`.
-- **More than one concurrent task.**
+- Adapter-style httpx usage and error redaction: `app/providers/http.py`.
+- Subprocess spawn, process-group kwargs and tree kill: `app/opencode/executor.py` `run()` and
+  `app/opencode/process.py`.
+- Bounded stderr tail: `OpenCodeExecutor._read_stderr`.
+- Pydantic config with `_CFG`, before-validators and after-validators: `app/config/models.py`.
+- MockTransport tests: `tests/test_opencode_executor.py` and `tests/test_opencode_config_check.py`.
+- Fake CLI scenarios: `tests/fakes/fake_opencode.py`.

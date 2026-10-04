@@ -5,9 +5,13 @@ Assumptions (see also app/opencode/events.py for B1-B3):
 B4. OpenCode may retry 429s internally without emitting an event. The only bound on that
     is ``opencode.run_timeout_s``. A timeout is an unknown outcome.
 B5. OpenCode's model argument is ``<opencode_provider>/<model>``. OpenCode splits on the
-    FIRST ``/``, so ``openrouter`` + ``openrouter/free`` becomes ``openrouter/openrouter/free``.
+    FIRST ``/``, so the gateway provider ``broke`` + gateway model id
+    ``openrouter/openrouter/free`` becomes ``broke/openrouter/openrouter/free``.
 B8. With ``--attach`` the process cwd selects the project directory, so cwd = project dir.
 B9. ``opencode run`` reads piped stdin when stdin is not a TTY, so stdin is always DEVNULL.
+B13. The child environment is an allowlist (app/opencode/env.py): no provider key, no bot
+    token and no OPENCODE_* variable can reach it. With a password-protected managed server,
+    ``OPENCODE_SERVER_PASSWORD``/``OPENCODE_SERVER_USERNAME`` are set for ``--attach`` (G4).
 B11. On cancel, timeout or outer cancellation the executor also sends a best-effort
     ``POST {server_url}/session/{id}/abort`` (app/opencode/abort.py), because killing the
     ``--attach`` client does not stop the server-side session.
@@ -24,9 +28,7 @@ import contextlib
 import logging
 import os
 import re
-import shutil
 import subprocess
-import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -35,12 +37,14 @@ from typing import Any
 
 import httpx
 
-from app.config.models import OpenCodeConfig
+from app.config.models import GATEWAY_PROVIDER_ID, OpenCodeConfig
 from app.opencode.abort import abort_opencode_session
-from app.opencode.config_check import check_project_config_async, check_small_model
+from app.opencode.config_check import check_project_config_async, check_server_config
+from app.opencode.endpoint import ServerEndpoint
+from app.opencode.env import build_opencode_env
 from app.opencode.events import SESSION_ID_RE, OpenCodeError, classify_text, parse_event_line
 from app.opencode.health import check_opencode_health
-from app.opencode.process import kill_process_tree
+from app.opencode.process import kill_process_tree, resolve_executable, spawn_kwargs
 from app.orchestrator.prompt import sanitize_prompt
 from app.providers.base import ErrorClass
 from app.redaction import SecretRedactor
@@ -51,6 +55,7 @@ from app.runtime.interfaces import (
     ExecutorEventKind,
     ExecutorHealth,
     SmallModelCheck,
+    StartupError,
 )
 from app.timeutil import utcnow
 
@@ -99,17 +104,21 @@ class OpenCodeExecutor:
         transport: httpx.AsyncBaseTransport | None = None,
         extra_env: Mapping[str, str] | None = None,
         clock: Callable[[], datetime] = utcnow,
-        bot_token_env: str | None = None,
+        endpoint: Callable[[], ServerEndpoint] | None = None,
+        gateway_base_url: Callable[[], str | None] | None = None,
+        environ: Mapping[str, str] | None = None,
     ) -> None:
         self._config = config
-        self._bot_token_env = bot_token_env
+        self._endpoint = endpoint or (lambda: ServerEndpoint(config.server_url))
+        self._gateway_base_url = gateway_base_url or (lambda: None)
+        self._environ = environ
         self._redactor = redactor
         self._transport = transport
         self._extra_env = dict(extra_env or {})
         self._clock = clock
 
     def opencode_model(self, provider: str, model: str) -> str:
-        return f"{self._config.provider_map.get(provider, provider)}/{model}"
+        return f"{GATEWAY_PROVIDER_ID}/{provider}/{model}"
 
     def build_argv(
         self,
@@ -125,7 +134,7 @@ class OpenCodeExecutor:
             *self._config.command[1:],
             "run",
             "--attach",
-            self._config.server_url,
+            self._endpoint().url,
             "--model",
             self.opencode_model(provider, model),
             "--format",
@@ -137,18 +146,22 @@ class OpenCodeExecutor:
         return argv
 
     async def health_check(self) -> ExecutorHealth:
+        endpoint = self._endpoint()
         return await check_opencode_health(
-            self._config.server_url,
+            endpoint.url,
             timeout_s=self._config.health_timeout_s,
             transport=self._transport,
+            auth=endpoint.auth(),
         )
 
-    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck:
-        return await check_small_model(
-            self._config.server_url,
+    async def check_server_config(self, allowed: frozenset[str]) -> tuple[SmallModelCheck, str]:
+        return await check_server_config(
+            self._endpoint(),
             allowed,
+            gateway_base_url=self._gateway_base_url(),
             timeout_s=self._config.health_timeout_s,
             transport=self._transport,
+            environ=self._environ,
         )
 
     async def check_project_models(
@@ -160,27 +173,30 @@ class OpenCodeExecutor:
         return None
 
     async def _abort_session(self, session_id: str | None) -> None:
+        endpoint = self._endpoint()
         await abort_opencode_session(
-            self._config.server_url,
+            endpoint.url,
             session_id,
             timeout_s=self._config.health_timeout_s,
             transport=self._transport,
+            auth=endpoint.auth(),
         )
 
     # ---- helpers ---------------------------------------------------
 
     def _child_env(self) -> dict[str, str]:
-        """os.environ minus the Discord bot token and OpenCode config-injection variables.
-
-        Provider keys stay (OpenCode needs them). OPENCODE_CONFIG / OPENCODE_CONFIG_CONTENT are
-        removed so no out-of-band config can select a model (B13).
-        """
-        env = {**os.environ, **self._extra_env}
-        for name in ("OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"):
-            env.pop(name, None)
-        if self._bot_token_env:
-            env.pop(self._bot_token_env, None)
-        return env
+        """Allowlisted environment (see app/opencode/env.py) plus the server credentials."""
+        extra: dict[str, str] = {}
+        endpoint = self._endpoint()
+        if endpoint.password is not None:
+            extra["OPENCODE_SERVER_PASSWORD"] = endpoint.password
+            extra["OPENCODE_SERVER_USERNAME"] = endpoint.username
+        extra.update(self._extra_env)
+        return build_opencode_env(
+            os.environ if self._environ is None else self._environ,
+            passthrough=self._config.env_passthrough,
+            extra=extra,
+        )
 
     def _clean(self, text: str) -> str:
         text = _ANSI_RE.sub("", text)
@@ -341,24 +357,17 @@ class OpenCodeExecutor:
         if session_id is not None and not SESSION_ID_RE.fullmatch(session_id):
             return _invalid()
 
-        executable = shutil.which(self._config.command[0])
-        if executable is None:
-            return _unavailable("opencode executable not found")
-        if sys.platform == "win32" and Path(executable).suffix.lower() in (".cmd", ".bat"):
-            return _unavailable("refusing .cmd/.bat launcher; set opencode.command")
+        try:
+            executable = resolve_executable(self._config.command[0])
+        except StartupError as e:
+            return _unavailable(str(e))
         if not Path(project_dir).is_dir():
             return _unavailable("project directory missing")
 
         argv = self.build_argv(
             executable, provider=provider, model=model, prompt=clean_prompt, session_id=session_id
         )
-        kwargs: dict[str, Any]
-        if sys.platform == "win32":
-            kwargs = {
-                "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-            }
-        else:
-            kwargs = {"start_new_session": True}
+        kwargs = spawn_kwargs()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,

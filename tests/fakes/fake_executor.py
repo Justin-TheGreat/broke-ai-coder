@@ -22,13 +22,13 @@ class ScriptedExecutor:
         self,
         results: list[Item],
         health: ExecutorHealth = HEALTHY,
-        small_model: SmallModelCheck = SmallModelCheck.OK,
+        server_check: SmallModelCheck = SmallModelCheck.OK,
         project_check: SmallModelCheck = SmallModelCheck.OK,
     ) -> None:
         self.project_check = project_check
         self.project_calls: list[str] = []
-        self.small_model = small_model
-        self.small_model_calls: list[frozenset[str]] = []
+        self.server_check = server_check
+        self.server_check_calls: list[frozenset[str]] = []
         self._results = list(results)
         self._health = health
         self.calls: list[dict[str, Any]] = []
@@ -38,9 +38,9 @@ class ScriptedExecutor:
         self.health_calls += 1
         return self._health
 
-    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck:
-        self.small_model_calls.append(allowed)
-        return self.small_model
+    async def check_server_config(self, allowed: frozenset[str]) -> tuple[SmallModelCheck, str]:
+        self.server_check_calls.append(allowed)
+        return self.server_check, "provider.broke.models"
 
     async def check_project_models(
         self, allowed: frozenset[str], project_dir: str

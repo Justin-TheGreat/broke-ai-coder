@@ -108,15 +108,14 @@ def test_free_variant_rule_only_applies_to_openrouter():
     parse_config(data)
 
 
-def _pol(provider="a", models=("m",), **kw):
+def _pol(provider="groq", models=("m",), **kw):
     return {"provider": provider, "model_order": list(models), **kw}
 
 
-def _data(routing, providers=("a", "b")):
+def _data(routing, providers=("groq", "gemini")):
     return {
         "providers": {p: {"api_key_env": f"{p.upper()}_KEY"} for p in providers},
         "routing": routing,
-        "opencode": {"provider_map": {"a": "groq", "b": "google"}},
     }
 
 
@@ -280,7 +279,10 @@ def test_opencode_and_orchestrator_defaults():
     cfg = parse_config({})
     oc = cfg.opencode
     assert oc.command == ["opencode"]
-    assert oc.provider_map == {"openrouter": "openrouter", "gemini": "google", "groq": "groq"}
+    assert oc.managed_server is True and oc.server_port == 4096
+    assert oc.server_directory == "data/opencode-server"
+    assert oc.server_start_timeout_s == 30 and oc.server_restart_max_backoff_s == 60
+    assert oc.env_passthrough == []
     assert oc.run_timeout_s == 1800 and oc.kill_grace_s == 5 and oc.health_timeout_s == 5
     assert oc.max_line_bytes == 1_048_576 and oc.output_tail_chars == 4000
     assert oc.stderr_tail_bytes == 4096 and oc.projects == {}
@@ -299,8 +301,12 @@ def test_project_directory_lookup():
 @pytest.mark.parametrize(
     "opencode",
     [
-        {"provider_map": {"gemini": "google/x"}},
-        {"provider_map": {"": "x"}},
+        {"provider_map": {"gemini": "google"}},
+        {"server_url": "http://example.com:4096"},
+        {"server_port": -1},
+        {"server_port": 70000},
+        {"server_start_timeout_s": 0},
+        {"server_restart_max_backoff_s": 601},
         {"projects": {"default": "/x"}},
         {"projects": {"bad name": "/x"}},
         {"command": []},
@@ -330,46 +336,159 @@ def test_resolve_secret_strips():
     assert resolve_secret("K", {"K": "   "}) is None
 
 
-def _groq_policy_config(model, provider_map):
+def test_provider_map_removed_with_message():
+    with pytest.raises(ConfigError, match="opencode.provider_map was removed"):
+        parse_config({"opencode": {"provider_map": {"groq": "groq"}}})
+
+
+def test_server_url_http_must_be_local_but_https_any():
+    assert parse_config({"opencode": {"server_url": "http://localhost:4096"}})
+    assert parse_config({"opencode": {"server_url": "http://[::1]:4096"}})
+    assert parse_config({"opencode": {"server_url": "https://oc.example.com"}})
+    with pytest.raises(ConfigError, match="http:// only for localhost"):
+        parse_config({"opencode": {"server_url": "http://oc.example.com"}})
+
+
+def _one_policy(provider, models, **extra):
     return {
-        "providers": {"groq": {"api_key_env": "GROQ_API_KEY"}},
+        "providers": {provider: {"api_key_env": "K_ENV"}},
         "routing": {
-            "provider_order": ["g"],
-            "policies": {"g": {"provider": "groq", "model_order": [model]}},
+            "provider_order": ["p"],
+            "policies": {"p": {"provider": provider, "model_order": models}},
         },
-        "opencode": {"provider_map": provider_map},
+        **extra,
     }
 
 
-def test_provider_map_to_openrouter_requires_free_model():
-    cfg = _groq_policy_config("openai/gpt-oss-120b", {"groq": "openrouter"})
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "google", "x"])
+def test_unsupported_policy_provider_rejected_as_paid(provider):
+    with pytest.raises(ConfigError, match="free-only"):
+        parse_config(_one_policy(provider, ["m"]))
+
+
+def test_openrouter_requires_free_model_but_others_do_not():
     with pytest.raises(ConfigError, match="free"):
-        parse_config(cfg)
+        parse_config(_one_policy("openrouter", ["openai/gpt-oss-120b"]))
+    assert parse_config(_one_policy("openrouter", ["qwen/qwen3-coder:free"]))
+    assert parse_config(_one_policy("groq", ["openai/gpt-oss-120b"]))
 
 
-def test_provider_map_to_openrouter_allows_free_model():
-    cfg = _groq_policy_config("qwen/qwen3-coder:free", {"groq": "openrouter"})
-    assert parse_config(cfg).opencode.provider_map == {"groq": "openrouter"}
+@pytest.mark.parametrize("model", ["a{b", "a}b", "{env:SECRET}", "a b", "a	b", "m{file:/x}"])
+def test_model_ids_with_braces_or_whitespace_rejected(model):
+    with pytest.raises(ConfigError, match="must not contain"):
+        parse_config(_one_policy("groq", [model]))
 
 
-def test_openrouter_policy_remapped_away_is_not_free_checked():
-    cfg = {
-        "providers": {"openrouter": {"api_key_env": "K"}},
-        "routing": {
-            "provider_order": ["o"],
-            "policies": {"o": {"provider": "openrouter", "model_order": ["x/paid"]}},
-        },
-        "opencode": {"provider_map": {"openrouter": "groq"}},
-    }
-    assert parse_config(cfg)
+# ---- env_passthrough ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["anthropic", "openai", "opencode", "OpenRouter", "x"])
-def test_provider_map_value_must_be_known_opencode_provider(value):
+@pytest.mark.parametrize(
+    "name",
+    [
+        "OPENCODE_CONFIG",
+        "OPENCODE_X",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_PROFILE",
+        "AZURE_CLIENT_SECRET",
+        "FOO_API_KEY",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "lower",
+        "1BAD",
+        "",
+    ],
+)
+def test_env_passthrough_rejects_credentialish_names(name):
     with pytest.raises(ConfigError):
-        parse_config({"opencode": {"provider_map": {"groq": value}}})
+        parse_config({"opencode": {"env_passthrough": [name]}})
 
 
-def test_provider_map_must_be_one_to_one():
-    with pytest.raises(ConfigError, match="one-to-one"):
-        parse_config({"opencode": {"provider_map": {"a": "groq", "b": "groq"}}})
+def test_env_passthrough_accepts_ordinary_names():
+    cfg = parse_config({"opencode": {"env_passthrough": ["HTTPS_PROXY", "NODE_OPTIONS"]}})
+    assert cfg.opencode.env_passthrough == ["HTTPS_PROXY", "NODE_OPTIONS"]
+
+
+def test_env_passthrough_must_not_name_provider_key_or_bot_token_env():
+    prov = {"groq": {"api_key_env": "MY_GROQ_SECRET"}}
+    with pytest.raises(ConfigError, match="MY_GROQ_SECRET"):
+        parse_config({"providers": prov, "opencode": {"env_passthrough": ["MY_GROQ_SECRET"]}})
+    with pytest.raises(ConfigError, match="MY_BOT"):
+        parse_config(
+            {
+                "discord": {"bot_token_env": "MY_BOT"},
+                "opencode": {"env_passthrough": ["MY_BOT"]},
+            }
+        )
+
+
+# ---- gateway ------------------------------------------------------------------------------
+
+
+def test_gateway_defaults_and_bounds():
+    g = parse_config({}).gateway
+    assert g.port == 0 and g.max_concurrent_requests == 4 and g.small_model is None
+    assert g.max_request_bytes == 16_777_216 and g.max_response_bytes == 33_554_432
+    assert g.max_error_body_bytes == 65_536
+    assert g.upstream_connect_timeout_s == 10 and g.upstream_read_timeout_s == 300
+    for bad in (
+        {"port": 70000},
+        {"max_request_bytes": 10},
+        {"max_response_bytes": 10},
+        {"max_error_body_bytes": 10},
+        {"upstream_read_timeout_s": 0},
+        {"max_concurrent_requests": 0},
+        {"unknown": 1},
+    ):
+        with pytest.raises(ConfigError):
+            parse_config({"gateway": bad})
+
+
+def _gw_data(**gateway):
+    return {
+        "providers": {
+            "groq": {"api_key_env": "G_KEY"},
+            "gemini": {"api_key_env": "M_KEY"},
+        },
+        "routing": {
+            "provider_order": ["g1", "m1"],
+            "policies": {
+                "g1": {"provider": "groq", "model_order": ["q1", "q2"]},
+                "m1": {"provider": "gemini", "model_order": ["m1"]},
+                "unlisted": {"provider": "groq", "model_order": ["q3"]},
+            },
+        },
+        "gateway": gateway,
+    }
+
+
+def test_gateway_models_order_and_exclusions():
+    cfg = parse_config(_gw_data())
+    assert cfg.gateway_models() == {
+        "groq/q1": ("groq", "q1"),
+        "groq/q2": ("groq", "q2"),
+        "gemini/m1": ("gemini", "m1"),
+    }
+    assert list(cfg.gateway_models()) == ["groq/q1", "groq/q2", "gemini/m1"]  # not "unlisted"
+
+
+def test_gateway_models_skip_disabled_policy_and_provider():
+    data = _gw_data()
+    data["routing"]["policies"]["g1"]["enabled"] = False
+    assert list(parse_config(data).gateway_models()) == ["gemini/m1"]
+    data = _gw_data()
+    data["providers"]["gemini"]["enabled"] = False
+    assert list(parse_config(data).gateway_models()) == ["groq/q1", "groq/q2"]
+
+
+def test_gateway_models_may_be_empty_at_load():
+    assert parse_config({}).gateway_models() == {}
+
+
+def test_gateway_small_model_must_be_allowlisted():
+    assert parse_config(_gw_data(small_model="gemini/m1")).gateway.small_model == "gemini/m1"
+    for bad in ("groq/q3", "m1", "broke/groq/q1", "openai/gpt-4o"):
+        with pytest.raises(ConfigError, match="small_model"):
+            parse_config(_gw_data(small_model=bad))
+    data = _gw_data(small_model="groq/q1")
+    data["routing"]["policies"]["g1"]["enabled"] = False
+    with pytest.raises(ConfigError, match="small_model"):
+        parse_config(data)

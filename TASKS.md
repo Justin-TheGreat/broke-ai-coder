@@ -76,13 +76,7 @@ all work.
 **Status:** TODO
 **Depends on:** T002
 
-Run/configure:
-
-```bash
-opencode serve --hostname 127.0.0.1 --port 4096
-```
-
-Enable server authentication if the final deployment ever exposes the HTTP service beyond localhost.
+Managed by the daemon (T037): the controller launches `opencode serve --hostname 127.0.0.1 --port <opencode.server_port>` with a random Basic-auth password; do not run it by hand.
 
 Acceptance:
 - `/global/health` is reachable locally.
@@ -361,6 +355,28 @@ Implement temporary provider cooldowns after:
 Acceptance:
 - Router skips a provider during cooldown.
 - Cooldown expires automatically.
+
+## T036 — LLM gateway
+
+**Status:** DONE (feat/llm-gateway)
+**Depends on:** T031, T035
+
+Key-holding loopback gateway in the daemon (`app/gateway/server.py`): bearer-token auth, allowlisted free models only (`AppConfig.gateway_models()`), body-key filtering, exact upstream URL per provider, error passthrough with redaction, cooldown recording, one usage row per upstream request.
+
+Acceptance:
+- A model outside the allowlist is rejected with 403 and never sent upstream.
+- The real key is used only in the upstream `Authorization` header.
+
+## T037 — Managed opencode serve
+
+**Status:** DONE (feat/llm-gateway)
+**Depends on:** T003, T036
+
+The daemon launches and supervises `opencode serve` (`app/opencode/server.py`) with an allowlisted environment (no keys), inline `OPENCODE_CONFIG_CONTENT` (gateway as the only provider, pinned `model`/`small_model`), a random Basic-auth password, restart with backoff, and refusal to start while OpenCode has stored credentials.
+
+Acceptance:
+- The served process environment holds no provider key or bot token.
+- A crash is followed by a restart and a healthy endpoint.
 
 ---
 
@@ -665,6 +681,8 @@ Acceptance:
 **Status:** TODO
 **Depends on:** T003
 
+**Status:** DONE via 127.0.0.1 binding + Basic auth (T037).
+
 Keep OpenCode on localhost. If private remote administration is added, use Tailscale/private networking and authentication rather than port forwarding.
 
 Acceptance:
@@ -676,6 +694,8 @@ Acceptance:
 **Depends on:** T002
 
 Run the service under a non-admin account whenever practical.
+
+**Required to close residual risk R1:** run OpenCode as a separate OS user that cannot read the controller's secrets file or `/proc/<pid>/environ`. Planned for the next round.
 
 Acceptance:
 - Agent cannot modify unrelated system directories as part of normal execution.
@@ -733,6 +753,18 @@ Test:
 **Depends on:** T022, T061, T081
 
 Use a disposable Git repository.
+
+Also verify these gateway assumptions against real services and OpenCode (each one currently rests on documentation only):
+
+- G1. `@ai-sdk/openai-compatible` sends `Authorization: Bearer <apiKey>` to `POST {baseURL}/chat/completions`; streaming is SSE and the final chunk may carry `usage`.
+- G2. Gemini's OpenAI-compatible endpoint is `.../v1beta/openai/chat/completions` with Bearer auth; error body shapes.
+- G3. OpenRouter and Groq use `{base_url}/chat/completions` with Bearer auth.
+- G4. `opencode run --attach` authenticates to a password-protected server via `OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` in its own environment.
+- G5. The `limit` field of a custom-provider model is optional.
+- G6. Stored credentials live at `$XDG_DATA_HOME/opencode/auth.json` (default `~/.local/share/opencode/auth.json`), a JSON object keyed by provider id.
+- G7. `GET /config` returns the merged config including `enabled_providers` and `provider`; `OPENCODE_CONFIG_CONTENT` outranks global and project files.
+- G8. `{env:` / `{file:` substitution also applies to `OPENCODE_CONFIG_CONTENT` (model ids with braces are rejected at config load).
+- Pinning only `model` and `small_model` is enough (agent models do not override `--model`); revisit per-agent pinning here.
 
 Test flow:
 

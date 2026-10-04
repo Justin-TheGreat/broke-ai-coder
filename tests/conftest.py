@@ -116,3 +116,9 @@ def full_state(config: AppConfig, now: datetime = NOW, **kwargs: Any) -> RouterS
         capabilities=caps,
         **kwargs,
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_opencode_credential_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """Never read the developer's real OpenCode auth.json."""
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))

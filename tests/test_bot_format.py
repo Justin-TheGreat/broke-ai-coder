@@ -163,3 +163,20 @@ def test_sessions_and_cancel():
     assert fmt.format_sessions([]) == "No sessions."
     assert "cancelled" in fmt.format_cancel(CancelResult.CANCELLED, "abc123")
     assert "not found" in fmt.format_cancel(CancelResult.NOT_FOUND, "abc123")
+
+
+def test_unsafe_config_text_mentions_gateway_logout_and_offending_detail():
+    out = fmt.format_event(
+        ev(
+            "task_finished",
+            status="FAILED",
+            error_class="OPENCODE_UNSAFE_CONFIG",
+            config_detail="server config key 'provider' is not gateway-only",
+        ),
+        redactor=SecretRedactor([SECRET]),
+    )
+    assert out is not None
+    assert "built-in free-model gateway" in out
+    assert "stored provider credentials" in out and "opencode auth logout" in out
+    assert "Offending: server config key 'provider' is not gateway-only" in out
+    assert "small_model" not in out

@@ -97,6 +97,7 @@ class HttpProviderAdapter:
     HEALTH_PARAMS: ClassVar[Mapping[str, str]] = {}
     ERROR_CODE_MAP: ClassVar[Mapping[str, ErrorClass]] = {}
     STATUS_OVERRIDES: ClassVar[Mapping[int, ErrorClass]] = {}
+    CHAT_PATH: ClassVar[str] = "chat/completions"
 
     def __init__(
         self,
@@ -119,6 +120,17 @@ class HttpProviderAdapter:
     @property
     def base_url(self) -> str:
         return self._config.base_url or self.DEFAULT_BASE_URL
+
+    def chat_url(self) -> str:
+        """OpenAI-compatible chat completions URL (used by the gateway)."""
+        return self.base_url.rstrip("/") + "/" + self.CHAT_PATH
+
+    def chat_headers(self) -> dict[str, str] | None:
+        """Bearer auth for the chat endpoint, or None when the key is missing."""
+        key = self._api_key()
+        if key is None:
+            return None
+        return {"Authorization": f"Bearer {key}"}
 
     def __repr__(self) -> str:
         return (

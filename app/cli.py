@@ -13,6 +13,7 @@ from app.config.secrets import collect_secret_values
 from app.db.connection import open_database
 from app.db.migrations import migrate
 from app.redaction import SecretRedactor, install_redaction
+from app.runtime.interfaces import StartupError
 from app.runtime.wiring import build_runtime, close_runtime
 
 logger = logging.getLogger(__name__)
@@ -69,6 +70,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except KeyboardInterrupt:
         return 0
+    except StartupError as e:
+        print(str(e), file=sys.stderr)
+        return 3
     except Exception:
         logger.exception("fatal error")
         return 1

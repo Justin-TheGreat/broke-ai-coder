@@ -26,6 +26,8 @@ class GeminiAdapter(HttpProviderAdapter):
     DEFAULT_BASE_URL: ClassVar[str] = "https://generativelanguage.googleapis.com/v1beta"
     HEALTH_PATH: ClassVar[str] = "models"
     HEALTH_PARAMS: ClassVar[Mapping[str, str]] = {"pageSize": "1"}
+    # G2: the OpenAI-compatible endpoint; Bearer auth (the base class default) is correct there.
+    CHAT_PATH: ClassVar[str] = "openai/chat/completions"
     ERROR_CODE_MAP: ClassVar[Mapping[str, ErrorClass]] = {
         "api_key_invalid": ErrorClass.AUTH_FAILED,
         "resource_exhausted": ErrorClass.RATE_LIMITED,

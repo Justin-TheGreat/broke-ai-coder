@@ -25,6 +25,18 @@ class ChatFrontend(Protocol):
     async def on_event(self, event: ControllerEvent) -> None: ...
 
 
+class StartupError(Exception):
+    """A required runtime service could not start; the message is safe to print."""
+
+
+class RuntimeService(Protocol):
+    """A background service the controller starts before workers and stops after them."""
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+
 class NullFrontend:
     async def start(self, controller: AgentController) -> None:
         logger.info("frontend disabled")
@@ -46,7 +58,7 @@ class ExecutionOutcome(StrEnum):
 
 class SmallModelCheck(StrEnum):
     OK = "OK"
-    UNSAFE = "UNSAFE"  # small_model missing or not an allowlisted free model
+    UNSAFE = "UNSAFE"  # server config is not gateway-only, or stored credentials exist
     UNAVAILABLE = "UNAVAILABLE"  # GET /config failed
 
 
@@ -92,7 +104,7 @@ class ExecutorHealth:
 
 class AgentExecutor(Protocol):
     async def health_check(self) -> ExecutorHealth: ...
-    async def check_small_model(self, allowed: frozenset[str]) -> SmallModelCheck: ...
+    async def check_server_config(self, allowed: frozenset[str]) -> tuple[SmallModelCheck, str]: ...
     async def check_project_models(
         self, allowed: frozenset[str], project_dir: str
     ) -> tuple[SmallModelCheck, str]: ...

@@ -35,10 +35,18 @@ discord:
   allowed_guild_ids: []
   allowed_channel_ids: []
 opencode:
-  server_url: http://127.0.0.1:4096
+  # OpenCode never holds a provider key. The daemon launches `opencode serve` itself (managed_server)
+  # with an inline config whose ONLY provider is the built-in loopback gateway; the gateway holds
+  # the real keys and forwards allowlisted free models only (see `gateway:` below).
+  server_url: http://127.0.0.1:4096   # only used when managed_server is false (tests/debug)
+  managed_server: true     # false = tests/debug only, unsupported for production
+  server_port: 4096        # 0 = pick a free port on each (re)start
+  server_directory: data/opencode-server   # cwd of `opencode serve`; created by the daemon
+  server_start_timeout_s: 30
+  server_restart_max_backoff_s: 60   # crash restarts back off 1, 2, 4 ... up to this
+  env_passthrough: []      # extra env var names OpenCode may see; key/token-like names are rejected
   working_directory: /workspace
   command: [opencode]            # e.g. ["node", "C:/path/opencode/bin/opencode"]; .cmd/.bat refused
-  # provider_map: {openrouter: openrouter, gemini: google, groq: groq}   # our id -> OpenCode id
   # projects: {myproj: /workspace/myproj}   # extra project names for /code project:<name>
   run_timeout_s: 1800
   kill_grace_s: 5
@@ -47,19 +55,27 @@ opencode:
   output_tail_chars: 4000
   stderr_tail_bytes: 4096
   continue_prompt: "Continue the previous task from where it stopped. Do not repeat steps that already completed."
-  # SAFETY: OpenCode's background `small_model` must be set in the GLOBAL
-  # ~/.config/opencode/opencode.json ("provider/model") to one of the allowlisted free models
-  # below, e.g. "groq/<model>" or "openrouter/openrouter/free" (checked via GET <server_url>/config).
-  # Project opencode.json / .opencode/*.json files (project dir up to the git root) are also
-  # checked per task: model, small_model, agent.*.model, mode.*.model must be allowlisted or
-  # absent. Otherwise tasks fail closed with OPENCODE_UNSAFE_CONFIG.
-  # Every routing policy provider must be mapped in provider_map to openrouter/google/groq.
+  # SAFETY: the daemon pins model/small_model to broke/<provider>/<model> and enabled_providers to
+  # ["broke"] via OPENCODE_CONFIG_CONTENT. Before each task GET /config must show exactly that,
+  # `opencode auth` storage must be empty (run `opencode auth logout`), and project opencode.json /
+  # .opencode/*.json files (project dir up to the filesystem root) must not contain provider,
+  # enabled_providers or disabled_providers, or model keys outside broke/... Otherwise tasks fail
+  # closed with OPENCODE_UNSAFE_CONFIG. Policy providers must be openrouter, gemini or groq.
+gateway:
+  port: 0                        # 127.0.0.1 only; 0 = ephemeral (the daemon tells OpenCode)
+  max_request_bytes: 16777216    # reject larger request bodies (413)
+  max_response_bytes: 33554432   # cap for non-streaming upstream bodies (502 if exceeded)
+  max_error_body_bytes: 65536    # upstream error bodies are read only up to this size
+  upstream_connect_timeout_s: 10
+  upstream_read_timeout_s: 300   # max silence from the upstream while streaming
+  max_concurrent_requests: 4     # simultaneous upstream calls
+  small_model: null              # gateway model id "<provider>/<model>"; default = first allowlisted
 orchestrator:
   provider_refresh_interval_s: 300
   progress_min_interval_s: 10
   session_idle_close_days: 7
   require_tool_calling: false
-  small_model_check_ttl_s: 30   # cache a passing small_model check this long
+  small_model_check_ttl_s: 30   # cache a passing OpenCode server-config check
 database:
   path: data/agent-controller.db
   busy_timeout_ms: 5000

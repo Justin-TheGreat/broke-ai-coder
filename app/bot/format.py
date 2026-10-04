@@ -84,10 +84,9 @@ def _finished_text(fields: dict[str, object], task_id: str | None, redactor) -> 
         lines.append(hint)
     elif error_class == "OPENCODE_UNSAFE_CONFIG":
         lines.append(
-            "OpenCode's small_model (global opencode.json) or a project opencode.json model "
-            "key is not an allowlisted free model, so the task was not run. Set small_model "
-            "in the global opencode.json to an allowlisted free model (provider/model), and "
-            "do not set other model keys to anything else."
+            "OpenCode's config is not limited to the built-in free-model gateway, or OpenCode "
+            "has stored provider credentials, so the task was not run. Remove provider "
+            "settings from opencode.json files and run `opencode auth logout`."
         )
         offending = _s(fields.get("config_detail"))
         if offending:

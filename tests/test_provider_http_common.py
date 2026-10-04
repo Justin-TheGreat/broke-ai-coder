@@ -172,3 +172,41 @@ async def test_classify_error_never_raises():
     assert await a.classify_error(_Hostile()) == E.UNKNOWN
     bad = httpx.HTTPStatusError("e", request=None, response=None)  # type: ignore[arg-type]
     assert await a.classify_error(bad) == E.UNKNOWN
+
+
+# ---- chat_url / chat_headers (gateway support) ----------------------------------------
+
+
+def _adapter(provider: str, key: str | None = "k-123456", **cfg):
+    from app.providers.registry import ADAPTER_TYPES
+
+    environ = {} if key is None else {"TEST_API_KEY": key}
+    from conftest import provider_cfg
+
+    return ADAPTER_TYPES[provider](provider_cfg(**cfg), environ=environ)
+
+
+@pytest.mark.parametrize(
+    ("provider", "url"),
+    [
+        ("openrouter", "https://openrouter.ai/api/v1/chat/completions"),
+        ("groq", "https://api.groq.com/openai/v1/chat/completions"),
+        (
+            "gemini",
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        ),
+    ],
+)
+def test_chat_url_defaults(provider, url):
+    assert _adapter(provider).chat_url() == url
+
+
+def test_chat_url_custom_base_url_strips_trailing_slash():
+    a = _adapter("groq", base_url="http://127.0.0.1:9999/x/")
+    assert a.chat_url() == "http://127.0.0.1:9999/x/chat/completions"
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "gemini", "groq"])
+def test_chat_headers_bearer_and_missing_key(provider):
+    assert _adapter(provider, key="k-123456").chat_headers() == {"Authorization": "Bearer k-123456"}
+    assert _adapter(provider, key=None).chat_headers() is None

@@ -4,7 +4,7 @@ import asyncio
 import dataclasses
 import logging
 import sqlite3
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -16,7 +16,7 @@ from app.db.retention import CleanupResult, run_retention_cleanup
 from app.db.sessions import SessionRepository
 from app.db.tasks import ConcurrentTransition, TaskRecord, TaskRepository
 from app.orchestrator.state_machine import InvalidTransition, TaskStatus
-from app.runtime.interfaces import ChatFrontend, NullFrontend
+from app.runtime.interfaces import ChatFrontend, NullFrontend, RuntimeService
 from app.timeutil import to_db, utcnow
 
 if TYPE_CHECKING:
@@ -64,8 +64,11 @@ class AgentController:
         task_handler: TaskHandler | None = None,
         orchestrator: Orchestrator | None = None,
         clock: Callable[[], datetime] = utcnow,
+        services: Sequence[RuntimeService] = (),
     ) -> None:
         self._config = config
+        self._services = list(services)
+        self._started_services: list[RuntimeService] = []
         self._frontend: ChatFrontend = frontend if frontend is not None else NullFrontend()
         self._orchestrator = orchestrator
         if task_handler is not None:
@@ -107,6 +110,9 @@ class AgentController:
             if self._orchestrator is not None:
                 self._orchestrator.bind(self)
                 self._orchestrator.recover_interrupted()
+            for service in self._services:
+                await service.start()
+                self._started_services.append(service)
             self._tasks = [
                 asyncio.create_task(self._worker_loop(), name="task-worker"),
                 asyncio.create_task(self._event_loop(), name="event-consumer"),
@@ -143,6 +149,12 @@ class AgentController:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        while self._started_services:
+            service = self._started_services.pop()
+            try:
+                await service.stop()
+            except Exception as e:
+                logger.warning("service stop failed: %s", type(e).__name__)
         while True:
             try:
                 event = self._event_queue.get_nowait()

@@ -63,14 +63,14 @@ def test_build_argv(tmp_path):
     assert argv[2:5] == ["run", "--attach", "http://127.0.0.1:4096"]
     assert argv[0] == "/bin/oc" and argv[-1] == "hi"
     assert "--session" not in argv
-    assert argv[argv.index("--model") + 1] == "google/g-1"
+    assert argv[argv.index("--model") + 1] == "broke/gemini/g-1"
     assert argv[argv.index("--format") + 1] == "json"
 
 
 def test_build_argv_session_and_openrouter_and_dash(tmp_path):
     ex = make_exec(tmp_path)
-    assert ex.opencode_model("openrouter", "openrouter/free") == "openrouter/openrouter/free"
-    assert ex.opencode_model("unmapped", "m") == "unmapped/m"
+    assert ex.opencode_model("openrouter", "openrouter/free") == "broke/openrouter/openrouter/free"
+    assert ex.opencode_model("groq", "m") == "broke/groq/m"
     argv = ex.build_argv("x", provider="groq", model="m", prompt="-rf", session_id="ses_1")
     assert argv[argv.index("--session") + 1] == "ses_1"
     assert argv[-1] == " -rf"
@@ -257,7 +257,7 @@ async def test_missing_project_dir(tmp_path):
 async def test_cmd_launcher_refused(tmp_path, monkeypatch):
     cmd = tmp_path / "oc.cmd"
     cmd.write_text("@echo off\r\n")
-    monkeypatch.setattr("app.opencode.executor.shutil.which", lambda _c: str(cmd))
+    monkeypatch.setattr("app.opencode.process.shutil.which", lambda _c: str(cmd))
     ex = OpenCodeExecutor(OpenCodeConfig(command=["opencode"]))
     r = await run(ex, tmp_path)
     assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE
@@ -351,29 +351,60 @@ def test_command_allows_plain_launchers(command):
     assert OpenCodeConfig(command=command).command == command
 
 
-async def test_bot_token_removed_but_parent_environ_unchanged(tmp_path, monkeypatch):
+async def test_child_env_is_an_allowlist_and_parent_environ_unchanged(monkeypatch):
     import os
 
     monkeypatch.setenv("TEST_BOT_TOKEN_VAR", "tok")
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
-    ex = OpenCodeExecutor(
-        OpenCodeConfig(command=[sys.executable, FAKE]),
-        extra_env={"X": "1"},
-        bot_token_env="TEST_BOT_TOKEN_VAR",
-    )
+    monkeypatch.setenv("LC_ALL", "C")
+    ex = OpenCodeExecutor(OpenCodeConfig(command=[sys.executable, FAKE]), extra_env={"X": "1"})
     env = ex._child_env()
-    assert "TEST_BOT_TOKEN_VAR" not in env
-    assert env["OPENROUTER_API_KEY"] == "k" and env["X"] == "1"
+    assert "TEST_BOT_TOKEN_VAR" not in env and "OPENROUTER_API_KEY" not in env
+    assert env["X"] == "1" and env["LC_ALL"] == "C"
     assert os.environ["TEST_BOT_TOKEN_VAR"] == "tok"
 
 
-async def test_bot_token_stripped_even_if_extra_env_sets_it(tmp_path, monkeypatch):
+async def test_child_env_server_password_and_passthrough(monkeypatch):
+    from app.opencode.endpoint import ServerEndpoint
+
+    cfg = OpenCodeConfig(command=[sys.executable, FAKE], env_passthrough=["MY_PROXY"])
+    ex = OpenCodeExecutor(
+        cfg,
+        endpoint=lambda: ServerEndpoint("http://127.0.0.1:1", "pw-123456", "opencode"),
+        environ={"MY_PROXY": "p", "GROQ_API_KEY": "nope", "PATH": "/bin"},
+    )
+    env = ex._child_env()
+    assert env["OPENCODE_SERVER_PASSWORD"] == "pw-123456"
+    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+    assert env["MY_PROXY"] == "p" and "GROQ_API_KEY" not in env
+    plain = OpenCodeExecutor(cfg, environ={})._child_env()
+    assert "OPENCODE_SERVER_PASSWORD" not in plain
+
+
+async def test_attach_uses_endpoint_url_and_auth_for_health_and_abort(tmp_path):
+    from app.opencode.endpoint import ServerEndpoint
+
+    seen = []
+
+    def handler(req):
+        seen.append((str(req.url), req.headers.get("authorization")))
+        return httpx.Response(200, json={"healthy": True, "version": "v"})
+
+    ep = ServerEndpoint("http://127.0.0.1:5151", "pw-123456")
     ex = OpenCodeExecutor(
         OpenCodeConfig(command=[sys.executable, FAKE]),
-        extra_env={"TEST_BOT_TOKEN_VAR": "tok"},
-        bot_token_env="TEST_BOT_TOKEN_VAR",
+        endpoint=lambda: ep,
+        transport=httpx.MockTransport(handler),
     )
-    assert "TEST_BOT_TOKEN_VAR" not in ex._child_env()
+    argv = ex.build_argv("x", provider="groq", model="m", prompt="hi", session_id=None)
+    assert argv[argv.index("--attach") + 1] == "http://127.0.0.1:5151"
+    assert (await ex.health_check()).healthy
+    await ex._abort_session("ses_1")
+    assert [u for u, _ in seen] == [
+        "http://127.0.0.1:5151/global/health",
+        "http://127.0.0.1:5151/session/ses_1/abort",
+    ]
+    assert all(a and a.startswith("Basic ") for _, a in seen)
 
 
 def test_command_allows_python_and_node():
@@ -381,21 +412,23 @@ def test_command_allows_python_and_node():
     assert OpenCodeConfig(command=["node", "C:/path/opencode/bin/opencode"])
 
 
-async def test_bot_token_not_passed_to_child(tmp_path, monkeypatch):
+async def test_bot_token_and_provider_keys_not_passed_to_child(tmp_path, monkeypatch):
     monkeypatch.setenv("TEST_BOT_TOKEN_VAR", "tok-should-not-leak")
-    monkeypatch.setenv("TEST_PROVIDER_KEY_VAR", "keep")
-    config = OpenCodeConfig(command=[sys.executable, FAKE])
-    ex = OpenCodeExecutor(
-        config,
-        extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": "TEST_BOT_TOKEN_VAR"},
-        bot_token_env="TEST_BOT_TOKEN_VAR",
-    )
-    r = await run(ex, tmp_path)
-    assert r.output_tail.strip() == "present=False"
+    monkeypatch.setenv("TEST_PROVIDER_API_KEY", "key-should-not-leak")
+    monkeypatch.setenv("TEST_PLAIN_VAR", "kept-only-via-passthrough")
+    for var, expected in (
+        ("TEST_BOT_TOKEN_VAR", "present=False"),
+        ("TEST_PROVIDER_API_KEY", "present=False"),
+        ("TEST_PLAIN_VAR", "present=False"),
+    ):
+        ex = OpenCodeExecutor(
+            OpenCodeConfig(command=[sys.executable, FAKE]),
+            extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": var},
+        )
+        assert (await run(ex, tmp_path)).output_tail.strip() == expected
     ex2 = OpenCodeExecutor(
-        config,
-        extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": "TEST_PROVIDER_KEY_VAR"},
-        bot_token_env="TEST_BOT_TOKEN_VAR",
+        OpenCodeConfig(command=[sys.executable, FAKE], env_passthrough=["TEST_PLAIN_VAR"]),
+        extra_env={"FAKE_OC_SCENARIOS": "env_dump", "FAKE_OC_BOT_VAR": "TEST_PLAIN_VAR"},
     )
     assert (await run(ex2, tmp_path)).output_tail.strip() == "present=True"
 

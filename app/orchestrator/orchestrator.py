@@ -1,7 +1,8 @@
 """Task orchestrator: route -> run via OpenCode -> fall back on provider failures.
 
-Assumption B10: each ``step_finish`` event is one LLM request, so for quota estimates an
-attempt counts ``max(steps, 1)`` requests.
+Assumption B10: usage accounting lives in the LLM gateway (app/gateway/server.py), the only
+writer of ``usage_events``: every upstream request is one row, tagged with the running task id.
+The orchestrator writes none, which avoids double counting.
 """
 
 from __future__ import annotations
@@ -20,15 +21,14 @@ from app.config.models import AppConfig
 from app.db.attempts import AttemptStatus, FallbackAttemptRepository
 from app.db.sessions import SessionRecord, SessionRepository, SessionStatus
 from app.db.tasks import ConcurrentTransition, TaskNotFound, TaskRecord, TaskRepository
-from app.db.usage import UsageEvent, UsageRepository, UsageStatus
-from app.opencode.config_check import allowed_small_models
+from app.opencode.config_check import opencode_model_ids
 from app.orchestrator.prompt import PROMPT_MAX_CHARS, sanitize_prompt
 from app.orchestrator.state_machine import (
     TERMINAL_STATUSES,
     InvalidTransition,
     TaskStatus,
 )
-from app.providers.base import STOP_ERRORS, CostClass, ErrorClass, ProviderAdapter
+from app.providers.base import ErrorClass, ProviderAdapter
 from app.quota.cooldown import CooldownManager
 from app.quota.state import ProviderObservation, build_router_state, refresh_all, route_with_state
 from app.router.types import (
@@ -44,7 +44,6 @@ from app.runtime.daemon import ControllerEvent, TaskSubmission
 from app.runtime.interfaces import (
     AgentExecutor,
     ExecutionOutcome,
-    ExecutionResult,
     ExecutorEvent,
     ExecutorEventKind,
     SmallModelCheck,
@@ -73,7 +72,6 @@ FAIL_OPENCODE_UNSAFE_CONFIG = "OPENCODE_UNSAFE_CONFIG"
 FAIL_INTERRUPTED_BY_RESTART = "INTERRUPTED_BY_RESTART"
 FAIL_DAEMON_SHUTDOWN = "DAEMON_SHUTDOWN"
 
-_MAX_USAGE_EVENTS = 500
 _FieldValue = str | int | float | bool | None
 
 
@@ -123,7 +121,7 @@ class Orchestrator:
         self._environ = environ
         self._observations: dict[str, ProviderObservation] = {}
         self._last_refresh: datetime | None = None
-        self._small_model_ok_at: datetime | None = None
+        self._server_config_ok_at: datetime | None = None
         self._controller: AgentController | None = None
         self._shutting_down = False
         self._cancel_event: asyncio.Event | None = None
@@ -379,23 +377,25 @@ class Orchestrator:
     def _stop_class(self) -> str | None:
         return FAIL_DAEMON_SHUTDOWN if self._shutting_down else None
 
-    async def _small_model_state(self) -> SmallModelCheck:
-        """Fail-closed small_model preflight; only OK results are cached (TTL)."""
+    async def _server_config_state(self) -> tuple[SmallModelCheck, str]:
+        """Fail-closed server-config preflight; only OK results are cached (TTL)."""
         now = self._clock()
         ttl = self._config.orchestrator.small_model_check_ttl_s
         if (
-            self._small_model_ok_at is not None
+            self._server_config_ok_at is not None
             and ttl > 0
-            and (now - self._small_model_ok_at).total_seconds() < ttl
+            and (now - self._server_config_ok_at).total_seconds() < ttl
         ):
-            return SmallModelCheck.OK
+            return SmallModelCheck.OK, ""
         try:
-            result = await self._executor.check_small_model(allowed_small_models(self._config))
+            result, detail = await self._executor.check_server_config(
+                opencode_model_ids(self._config)
+            )
         except Exception as e:
-            logger.warning("small_model check failed: %s", type(e).__name__)
-            return SmallModelCheck.UNAVAILABLE
-        self._small_model_ok_at = now if result == SmallModelCheck.OK else None
-        return result
+            logger.warning("server config check failed: %s", type(e).__name__)
+            return SmallModelCheck.UNAVAILABLE, "GET /config failed"
+        self._server_config_ok_at = now if result == SmallModelCheck.OK else None
+        return result, detail
 
     async def _maybe_refresh(self, controller: AgentController) -> None:
         assert controller.conn is not None
@@ -449,51 +449,6 @@ class Orchestrator:
             )
 
         return on_event
-
-    def _record_usage(
-        self,
-        conn: sqlite3.Connection,
-        task_id: str,
-        provider: str,
-        model: str,
-        result: ExecutionResult,
-        ec: ErrorClass,
-    ) -> None:
-        if result.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE:
-            return
-        if result.outcome == ExecutionOutcome.CANCELLED and result.llm_steps == 0:
-            return
-        count = max(result.llm_steps, 1)
-        if count > _MAX_USAGE_EVENTS:
-            logger.info("usage events capped at %d (steps=%d)", _MAX_USAGE_EVENTS, count)
-            count = _MAX_USAGE_EVENTS
-        if result.outcome == ExecutionOutcome.SUCCEEDED:
-            last_status = UsageStatus.SUCCESS
-        elif result.outcome == ExecutionOutcome.TIMED_OUT or (
-            result.outcome == ExecutionOutcome.FAILED and ec in STOP_ERRORS
-        ):
-            last_status = UsageStatus.UNKNOWN_OUTCOME
-        else:
-            last_status = UsageStatus.ERROR
-        known = result.input_tokens is not None and result.output_tokens is not None
-        usage = UsageRepository(conn)
-        for i in range(count):
-            if i == 0:
-                tin, tout = result.input_tokens, result.output_tokens
-            else:
-                tin, tout = (0, 0) if known else (None, None)
-            usage.record(
-                UsageEvent(
-                    provider=provider,
-                    model=model,
-                    cost_class=CostClass.FREE,
-                    status=last_status if i == count - 1 else UsageStatus.SUCCESS,
-                    occurred_at=self._clock(),
-                    task_id=task_id,
-                    input_tokens=tin,
-                    output_tokens=tout,
-                )
-            )
 
     async def _run_task(
         self, controller: AgentController, record: TaskRecord, cancel: asyncio.Event
@@ -553,23 +508,33 @@ class Orchestrator:
             )
             return
 
-        sm = await self._small_model_state()
+        sm, sm_detail = await self._server_config_state()
         if sm != SmallModelCheck.OK:
-            unsafe = sm == SmallModelCheck.UNSAFE
-            self._finish(
-                controller,
-                task_id,
-                TaskStatus.FAILED,
-                error_class=FAIL_OPENCODE_UNSAFE_CONFIG if unsafe else FAIL_OPENCODE_UNAVAILABLE,
-                session=session,
-                detail="small_model not allowlisted" if unsafe else "GET /config failed",
-            )
+            if sm == SmallModelCheck.UNSAFE:
+                self._finish(
+                    controller,
+                    task_id,
+                    TaskStatus.FAILED,
+                    error_class=FAIL_OPENCODE_UNSAFE_CONFIG,
+                    session=session,
+                    detail="opencode server config not gateway-only",
+                    config_detail=sm_detail,
+                )
+            else:
+                self._finish(
+                    controller,
+                    task_id,
+                    TaskStatus.FAILED,
+                    error_class=FAIL_OPENCODE_UNAVAILABLE,
+                    session=session,
+                    detail="GET /config failed",
+                )
             return
 
         # Per-task on-disk project config check (never cached across projects).
         try:
             pc, pc_detail = await self._executor.check_project_models(
-                allowed_small_models(cfg), project_dir
+                opencode_model_ids(cfg), project_dir
             )
         except Exception as e:
             logger.warning("project config check failed: %s", type(e).__name__)
@@ -695,8 +660,6 @@ class Orchestrator:
                     self._running = dataclasses.replace(self._running, opencode_session_id=oc_sid)
 
             ec = result.error_class or ErrorClass.UNKNOWN
-            self._record_usage(conn, task_id, provider, model, result, ec)
-
             retry_ms = (
                 round(result.retry_after_s * 1000) if result.retry_after_s is not None else None
             )

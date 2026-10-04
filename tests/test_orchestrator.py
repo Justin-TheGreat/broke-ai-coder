@@ -8,13 +8,13 @@ from pathlib import Path
 import httpx
 from conftest import NOW, secret_env
 from fakes.fake_executor import HEALTHY, ScriptedExecutor, ok
+from oc_helpers import GATEWAY_URL, good_config
 
 from app.db.attempts import AttemptStatus, FallbackAttemptRepository
 from app.db.connection import open_database
 from app.db.migrations import migrate
 from app.db.sessions import SessionRepository
 from app.db.tasks import TaskRepository
-from app.opencode.config_check import allowed_small_models
 from app.opencode.executor import OpenCodeExecutor
 from app.orchestrator.orchestrator import CancelResult, Orchestrator
 from app.orchestrator.state_machine import TaskStatus
@@ -53,7 +53,7 @@ def build(
     health=HEALTHY,
     routing=None,
     orchestrator=None,
-    small_model=SmallModelCheck.OK,
+    server_check=SmallModelCheck.OK,
 ):
     overrides = {
         "database": {"path": str(tmp_path / "o.db")},
@@ -78,7 +78,7 @@ def build(
                 for m in pol.model_order
             ],
         )
-    executor = ScriptedExecutor(results, health, small_model)
+    executor = ScriptedExecutor(results, health, server_check)
     orch = Orchestrator(
         cfg, executor=executor, adapters=adapters, environ=secret_env(), clock=lambda: NOW
     )
@@ -142,8 +142,8 @@ async def test_success(tmp_path, make_config):
         assert (t.selected_provider, t.selected_model) == ("openrouter", "openrouter/free")
         atts = FallbackAttemptRepository(c.conn).list_for_task(rec.id)
         assert [a.status for a in atts] == [AttemptStatus.SUCCEEDED]
-        rows = c.conn.execute("SELECT cost_class, status FROM usage_events").fetchall()
-        assert [(r[0], r[1]) for r in rows] == [("FREE", "success")]
+        # the orchestrator never writes usage rows: the gateway is the only writer
+        assert c.conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
         assert orch.running is None
         sess = SessionRepository(c.conn).get(t.session_id)
         assert sess.opencode_session_id == "ses_a" and sess.status.value == "OPEN"
@@ -243,8 +243,7 @@ async def test_timed_out_is_not_replayed(tmp_path, make_config):
         assert t.status == TaskStatus.FAILED and t.error_class == "TIMEOUT_UNKNOWN_OUTCOME"
         assert len(ex.calls) == 1
         assert len(FallbackAttemptRepository(c.conn).list_for_task(rec.id)) == 1
-        statuses = [r[0] for r in c.conn.execute("SELECT status FROM usage_events ORDER BY id")]
-        assert statuses == ["success", "unknown_outcome"]
+        assert c.conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()[0] == 0
 
 
 async def test_auth_failure_moves_to_next_provider(tmp_path, make_config):
@@ -456,17 +455,18 @@ async def test_real_executor_integration(tmp_path, make_config):
         opencode={"working_directory": str(tmp_path), "command": [sys.executable, FAKE]},
         routing={"max_fallback_attempts": 5},
     )
-    safe = sorted(allowed_small_models(cfg))[0]
+    safe = good_config(cfg)
 
     def handler(req):
         if req.url.path == "/config":
-            return httpx.Response(200, json={"small_model": safe})
+            return httpx.Response(200, json=safe)
         return httpx.Response(200, json={"healthy": True})
 
     transport = httpx.MockTransport(handler)
     executor = OpenCodeExecutor(
         cfg.opencode,
         transport=transport,
+        gateway_base_url=lambda: GATEWAY_URL,
         extra_env={
             "FAKE_OC_SCENARIOS": "rate_limit,success",
             "FAKE_OC_ARGV_FILE": str(tmp_path / "argv.txt"),
@@ -495,13 +495,13 @@ async def test_real_executor_integration(tmp_path, make_config):
     lines = [json.loads(x) for x in (tmp_path / "argv.txt").read_text().splitlines()]
     assert len(lines) == 2
     assert "--session" not in lines[0]
-    assert lines[0][lines[0].index("--model") + 1] == "openrouter/openrouter/free"
+    assert lines[0][lines[0].index("--model") + 1] == "broke/openrouter/openrouter/free"
     assert lines[1][lines[1].index("--session") + 1] == "ses_fake1"
-    assert lines[1][lines[1].index("--model") + 1] == "google/g-3.8"
+    assert lines[1][lines[1].index("--model") + 1] == "broke/gemini/g-3.8"
 
 
 async def test_unsafe_small_model_fails_closed(tmp_path, make_config):
-    cfg, ex, orch = build(tmp_path, make_config, [ok()], small_model=SmallModelCheck.UNSAFE)
+    cfg, ex, orch = build(tmp_path, make_config, [ok()], server_check=SmallModelCheck.UNSAFE)
     async with started(cfg, orch) as c:
         rec = submit(c)
         await drain(c)
@@ -513,7 +513,7 @@ async def test_unsafe_small_model_fails_closed(tmp_path, make_config):
 
 
 async def test_small_model_config_unavailable_is_opencode_unavailable(tmp_path, make_config):
-    cfg, ex, orch = build(tmp_path, make_config, [ok()], small_model=SmallModelCheck.UNAVAILABLE)
+    cfg, ex, orch = build(tmp_path, make_config, [ok()], server_check=SmallModelCheck.UNAVAILABLE)
     async with started(cfg, orch) as c:
         rec = submit(c)
         await drain(c)
@@ -528,5 +528,17 @@ async def test_small_model_ok_is_cached_for_ttl(tmp_path, make_config):
         submit(c)
         submit(c)
         await drain(c)
-        assert len(ex.small_model_calls) == 1 and len(ex.calls) == 2
-        assert "openrouter/openrouter/free" in ex.small_model_calls[0]
+        assert len(ex.server_check_calls) == 1 and len(ex.calls) == 2
+        assert "broke/openrouter/openrouter/free" in ex.server_check_calls[0]
+
+
+async def test_unsafe_server_config_event_carries_detail(tmp_path, make_config):
+    cfg, ex, orch = build(tmp_path, make_config, [ok()], server_check=SmallModelCheck.UNSAFE)
+    rec_events = Recorder()
+    async with started(cfg, orch, rec_events) as c:
+        submit(c)
+        await drain(c)
+        await c._event_queue.join()
+    done = [e for e in rec_events.events if e.name == "task_finished"][-1]
+    assert done.fields["detail"] == "opencode server config not gateway-only"
+    assert done.fields["config_detail"] == "provider.broke.models"

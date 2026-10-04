@@ -16,7 +16,11 @@ _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _SHELL_NAMES = frozenset(
     {"cmd", "powershell", "pwsh", "bash", "sh", "zsh", "dash", "wsl", "env", "start"}
 )
-_OPENCODE_PROVIDERS = frozenset({"openrouter", "google", "groq"})
+GATEWAY_PROVIDER_ID = "broke"
+# Keys of app.providers.registry.ADAPTER_TYPES (not imported: that would be an import cycle).
+SUPPORTED_PROVIDERS = frozenset({"openrouter", "gemini", "groq"})
+_ENV_NAME_RE = re.compile(ENV_NAME_PATTERN)
+_FORBIDDEN_PASSTHROUGH_PREFIXES = ("OPENCODE_", "AWS_", "AZURE_")
 
 PAID_NOT_SUPPORTED = "paid inference is not supported: this project is free-only"
 _PAID_ROUTING_KEYS = (
@@ -60,6 +64,8 @@ class PolicyConfig(BaseModel):
         out = [m.strip() for m in v]
         if any(not m for m in out):
             raise ValueError("model_order entries must be non-empty")
+        if any("{" in m or "}" in m or any(ch.isspace() for ch in m) for m in out):
+            raise ValueError("model_order entries must not contain '{', '}' or whitespace")
         if len(set(out)) != len(out):
             raise ValueError("model_order contains duplicate models")
         return out
@@ -216,9 +222,12 @@ class OpenCodeConfig(BaseModel):
     server_url: str = "http://127.0.0.1:4096"
     working_directory: str = "/workspace"
     command: list[str] = Field(default_factory=lambda: ["opencode"], min_length=1)
-    provider_map: dict[str, str] = Field(
-        default_factory=lambda: {"openrouter": "openrouter", "gemini": "google", "groq": "groq"}
-    )
+    managed_server: bool = True
+    server_port: int = Field(4096, ge=0, le=65535)
+    server_directory: str = "data/opencode-server"
+    server_start_timeout_s: float = Field(30, gt=0, le=300, allow_inf_nan=False)
+    server_restart_max_backoff_s: float = Field(60, gt=0, le=600, allow_inf_nan=False)
+    env_passthrough: list[str] = Field(default_factory=list)
     projects: dict[str, str] = Field(default_factory=dict)
     run_timeout_s: float = Field(1800, gt=0, le=86400, allow_inf_nan=False)
     kill_grace_s: float = Field(5, gt=0, le=60, allow_inf_nan=False)
@@ -231,12 +240,41 @@ class OpenCodeConfig(BaseModel):
         " completed."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_provider_map(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "provider_map" in data:
+            raise ValueError(
+                "opencode.provider_map was removed: OpenCode reaches providers only through"
+                " the built-in gateway"
+            )
+        return data
+
     @field_validator("server_url")
     @classmethod
     def _server_url_valid(cls, v: str) -> str:
         if not v.startswith(("https://", "http://")):
             raise ValueError("server_url must start with https:// or http://")
+        if v.startswith("http://") and urlsplit(v).hostname not in _LOCAL_HOSTS:
+            raise ValueError("server_url must use https:// (http:// only for localhost)")
         return v
+
+    @field_validator("env_passthrough")
+    @classmethod
+    def _env_passthrough_valid(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            name = raw.strip()
+            if not _ENV_NAME_RE.match(name):
+                raise ValueError(f"env_passthrough entry {raw!r} is not a valid env var name")
+            if (
+                name.startswith(_FORBIDDEN_PASSTHROUGH_PREFIXES)
+                or name.endswith("_API_KEY")
+                or name == "GOOGLE_APPLICATION_CREDENTIALS"
+            ):
+                raise ValueError(f"env_passthrough must not pass credential-like variable {name}")
+            out.append(name)
+        return out
 
     @field_validator("command")
     @classmethod
@@ -251,23 +289,6 @@ class OpenCodeConfig(BaseModel):
             stem = base[:-4] if base.endswith(".exe") else base
             if stem in _SHELL_NAMES:
                 raise ValueError(f"command must not use a shell or interpreter wrapper ({stem})")
-        return out
-
-    @field_validator("provider_map")
-    @classmethod
-    def _provider_map_valid(cls, v: dict[str, str]) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for key, value in v.items():
-            k, val = key.strip(), value.strip()
-            if not k or not val:
-                raise ValueError("provider_map keys and values must be non-empty")
-            if val not in _OPENCODE_PROVIDERS:
-                raise ValueError(
-                    f"provider_map values must be one of {sorted(_OPENCODE_PROVIDERS)}"
-                )
-            out[k] = val
-        if len(set(out.values())) != len(out):
-            raise ValueError("provider_map must be one-to-one (no two keys may share a value)")
         return out
 
     @field_validator("projects")
@@ -292,6 +313,19 @@ class OpenCodeConfig(BaseModel):
         if project == "default":
             return self.working_directory
         return self.projects.get(project)
+
+
+class GatewayConfig(BaseModel):
+    model_config = _CFG
+
+    port: int = Field(0, ge=0, le=65535)
+    max_request_bytes: int = Field(16_777_216, ge=65_536, le=67_108_864)
+    max_response_bytes: int = Field(33_554_432, ge=65_536, le=134_217_728)
+    max_error_body_bytes: int = Field(65_536, ge=1024, le=1_048_576)
+    upstream_connect_timeout_s: float = Field(10, gt=0, le=60, allow_inf_nan=False)
+    upstream_read_timeout_s: float = Field(300, gt=0, le=1800, allow_inf_nan=False)
+    max_concurrent_requests: int = Field(4, ge=1, le=64)
+    small_model: str | None = None
 
 
 class OrchestratorConfig(BaseModel):
@@ -333,20 +367,19 @@ class AppConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     cooldown: CooldownConfig = Field(default_factory=CooldownConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
 
     @model_validator(mode="after")
     def _providers_defined(self) -> AppConfig:
         for pid, pol in self.routing.policies.items():
             if pol.provider not in self.providers:
                 raise ValueError(f"policy {pid!r} references undefined provider {pol.provider!r}")
-            mapped = self.opencode.provider_map.get(pol.provider)
-            if mapped not in _OPENCODE_PROVIDERS:
+            if pol.provider not in SUPPORTED_PROVIDERS:
                 raise ValueError(
-                    f"policy {pid!r}: provider {pol.provider!r} is not mapped in"
-                    f" opencode.provider_map to one of {sorted(_OPENCODE_PROVIDERS)};"
-                    f" {PAID_NOT_SUPPORTED}"
+                    f"policy {pid!r}: provider {pol.provider!r} is not one of"
+                    f" {sorted(SUPPORTED_PROVIDERS)}; {PAID_NOT_SUPPORTED}"
                 )
-            if mapped == "openrouter":
+            if pol.provider == "openrouter":
                 for m in pol.model_order:
                     if not is_free_openrouter_model(m):
                         raise ValueError(
@@ -354,4 +387,30 @@ class AppConfig(BaseModel):
                             f" (use 'openrouter/free' or an id ending in ':free'); "
                             f"{PAID_NOT_SUPPORTED}"
                         )
+        known_envs = {p.api_key_env for p in self.providers.values()}
+        known_envs.add(self.discord.bot_token_env)
+        clash = sorted(set(self.opencode.env_passthrough) & known_envs)
+        if clash:
+            raise ValueError(
+                f"opencode.env_passthrough must not include secret env vars: {', '.join(clash)}"
+            )
+        small = self.gateway.small_model
+        if small is not None and small not in self.gateway_models():
+            raise ValueError(
+                "gateway.small_model must be one of the enabled allowlisted gateway models"
+            )
         return self
+
+    def gateway_models(self) -> dict[str, tuple[str, str]]:
+        """Ordered ``"<provider>/<model>" -> (provider, model)`` for routable candidates only."""
+        out: dict[str, tuple[str, str]] = {}
+        for pid in self.routing.provider_order:
+            pol = self.routing.policies.get(pid)
+            if pol is None or not pol.enabled:
+                continue
+            prov = self.providers.get(pol.provider)
+            if prov is None or not prov.enabled or pol.provider not in SUPPORTED_PROVIDERS:
+                continue
+            for model in pol.model_order:
+                out[f"{pol.provider}/{model}"] = (pol.provider, model)
+        return out

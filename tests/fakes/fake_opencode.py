@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SID = "ses_fake1"
 
@@ -69,7 +72,93 @@ def pick_scenario() -> str:
     return names[min(n, len(names) - 1)]
 
 
+def serve(argv: list[str]) -> int:
+    """`opencode serve` stand-in: parses --hostname/--port, serves health/config/abort."""
+    host, port = "127.0.0.1", 4096
+    for i, a in enumerate(argv):
+        if a == "--hostname":
+            host = argv[i + 1]
+        elif a == "--port":
+            port = int(argv[i + 1])
+    scenario = os.environ.get("FAKE_OC_SERVE_SCENARIO", "ok")
+    counter = os.environ.get("FAKE_OC_SERVE_COUNTER_FILE")
+    n = 0
+    if counter:
+        try:
+            with open(counter) as f:
+                n = int(f.read().strip() or "0")
+        except FileNotFoundError:
+            n = 0
+        with open(counter, "w") as f:
+            f.write(str(n + 1))
+    env_file = os.environ.get("FAKE_OC_ENV_FILE")
+    if env_file:
+        with open(env_file, "w") as f:
+            json.dump(dict(os.environ), f)
+    if scenario == "exit_immediately":
+        sys.stderr.write("boom\n")
+        sys.stderr.flush()
+        return 5
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+    expected = "Basic " + base64.b64encode(f"opencode:{password}".encode()).decode()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            return None
+
+        def _send(self, status: int, body: object) -> None:
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _authed(self) -> bool:
+            if password and self.headers.get("Authorization") != expected:
+                self._send(401, {"error": "unauthorized"})
+                return False
+            return True
+
+        def do_GET(self) -> None:
+            if not self._authed():
+                return
+            if self.path == "/global/health":
+                if scenario == "never_healthy":
+                    self._send(503, {"healthy": False})
+                else:
+                    self._send(200, {"healthy": True, "version": "fake"})
+            elif self.path == "/config":
+                override = os.environ.get("FAKE_OC_CONFIG_OVERRIDE")
+                text = override or os.environ.get("OPENCODE_CONFIG_CONTENT", "{}")
+                self._send(200, json.loads(text))
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self) -> None:
+            if not self._authed():
+                return
+            if self.path.startswith("/session/") and self.path.endswith("/abort"):
+                self._send(200, True)
+            else:
+                self._send(404, {"error": "not found"})
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    if scenario == "crash_after" and n == 0:
+        delay = float(os.environ.get("FAKE_OC_SERVE_CRASH_AFTER_S", "1"))
+
+        def crash() -> None:
+            time.sleep(delay)
+            os._exit(7)
+
+        threading.Thread(target=crash, daemon=True).start()
+    server.serve_forever()
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        return serve(sys.argv[2:])
     argv_file = os.environ.get("FAKE_OC_ARGV_FILE")
     if argv_file:
         with open(argv_file, "a") as f:

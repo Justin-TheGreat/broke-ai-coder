@@ -1,61 +1,64 @@
-"""Fail-closed checks of OpenCode's model-selecting config (FREE-ONLY safety).
+"""Fail-closed checks of the OpenCode server's config (FREE-ONLY safety).
 
-B12. OpenCode makes background calls (e.g. title generation) with ``small_model``. When it is
-     unset OpenCode picks a cheaper model from the provider itself or falls back to the main
-     model, and there is no option to disable these calls. ``GET {server_url}/config`` returns
-     the effective merged config object, which includes ``small_model`` ("provider/model")
-     when set. The task only runs when ``small_model`` equals one of the allowlisted, enabled
-     routing candidates in OpenCode form, which are free by construction. The same allowlist
-     applies to ``model``, ``agent.*.model`` and ``mode.*.model`` when present.
+The authoritative guarantee is structural: OpenCode holds no provider keys (its environment is
+an allowlist, ``opencode auth`` storage must be empty) and its only provider is the key-holding
+gateway, which forwards allowlisted free models only. The checks below detect accidents and
+drift; they are not what keeps paid models unreachable.
+
+B12. OpenCode makes background calls (e.g. title generation) with ``small_model``. The daemon
+     pins ``model`` and ``small_model`` to ``broke/<gateway model id>`` through
+     ``OPENCODE_CONFIG_CONTENT`` and ``enabled_providers: ["broke"]``. ``GET /config`` returns
+     the effective merged config; before each task it must show exactly that shape (checks 1-5
+     in ``check_server_config``) and ``opencode auth`` storage must be empty (check 0).
 
 B13. OpenCode merges configs (later wins): global ``~/.config/opencode/opencode.json``, the
      ``OPENCODE_CONFIG`` file, the project's ``opencode.json``, ``.opencode/`` directories, and
-     ``OPENCODE_CONFIG_CONTENT``. ``GET /config`` has no documented per-request directory
-     selector, so it reflects the server's own start directory only. Therefore, before each
-     task, the project's on-disk config is checked too: ``opencode.json``/``opencode.jsonc``
-     and ``*.json``/``*.jsonc`` directly in ``.opencode/``, in the project dir and each parent
-     up to and including the git root (or only the project dir when no ``.git`` is found).
-     Unparseable files are UNSAFE. The two env vars are stripped from the OpenCode child env.
+     ``OPENCODE_CONFIG_CONTENT`` (which outranks the files; managed/MDM system configs outrank
+     it, residual risk R3). ``GET /config`` has no documented per-request directory selector,
+     so it reflects the server's own start directory only. Therefore, before each task, the
+     project's on-disk config is checked too, as defense in depth: ``opencode.json``/
+     ``opencode.jsonc`` and ``*.json``/``*.jsonc`` directly in ``.opencode/``, in the project
+     dir and every parent up to the filesystem root. Unparseable files are UNSAFE, and a
+     project file must not contain ``provider``, ``enabled_providers`` or
+     ``disabled_providers``. OPENCODE_* variables never reach the OpenCode child (env
+     allowlist).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from app.config.models import AppConfig
+from app.config.models import GATEWAY_PROVIDER_ID, AppConfig
+from app.opencode.auth_store import auth_store_problem
+from app.opencode.endpoint import ServerEndpoint
 from app.runtime.interfaces import SmallModelCheck
 
-_FREE_PROVIDERS = frozenset({"openrouter", "google", "groq"})
+_NPM_PACKAGE = "@ai-sdk/openai-compatible"
+_PROJECT_FORBIDDEN_KEYS = ("provider", "enabled_providers", "disabled_providers")
+_MODEL_SECTIONS = ("agent", "mode", "command")
 
 
-def allowed_small_models(config: AppConfig) -> frozenset[str]:
-    """Models of enabled policies on enabled, free-mapped providers as ``<oc provider>/<model>``."""
-    pmap = config.opencode.provider_map
-    out: set[str] = set()
-    for pol in config.routing.policies.values():
-        mapped = pmap.get(pol.provider)
-        prov = config.providers.get(pol.provider)
-        if not pol.enabled or prov is None or not prov.enabled or mapped not in _FREE_PROVIDERS:
-            continue
-        out.update(f"{mapped}/{model}" for model in pol.model_order)
-    return frozenset(out)
+def opencode_model_ids(config: AppConfig) -> frozenset[str]:
+    """Allowlisted models in OpenCode form: ``broke/<provider>/<model>``."""
+    return frozenset(f"{GATEWAY_PROVIDER_ID}/{gid}" for gid in config.gateway_models())
 
 
 def _bad_model_key(cfg: dict[str, Any], allowed: frozenset[str]) -> str | None:
     """Key path of the first non-allowlisted model value, or None.
 
-    Checked: ``model``, ``small_model``, ``agent.<n>.model``, ``mode.<n>.model``. A value that
-    is present but not an allowlisted string is bad (fail closed).
+    Checked: ``model``, ``small_model``, ``agent.<n>.model``, ``mode.<n>.model``,
+    ``command.<n>.model``. A value that is present but not an allowlisted string is bad.
     """
     for key in ("model", "small_model"):
         if key in cfg and not (isinstance(cfg[key], str) and cfg[key] in allowed):
             return key
-    for section in ("agent", "mode"):
+    for section in _MODEL_SECTIONS:
         if section not in cfg:
             continue
         entries = cfg[section]
@@ -71,33 +74,69 @@ def _bad_model_key(cfg: dict[str, Any], allowed: frozenset[str]) -> str | None:
     return None
 
 
-async def check_small_model(
-    server_url: str,
+def _gateway_shape_problem(
+    body: dict[str, Any], allowed: frozenset[str], gateway_base_url: str | None
+) -> str | None:
+    """Key path of the first deviation from the gateway-only shape, or None."""
+    if body.get("enabled_providers") != [GATEWAY_PROVIDER_ID]:
+        return "enabled_providers"
+    providers = body.get("provider")
+    if not isinstance(providers, dict) or set(providers) != {GATEWAY_PROVIDER_ID}:
+        return "provider"
+    broke = providers[GATEWAY_PROVIDER_ID]
+    if not isinstance(broke, dict):
+        return f"provider.{GATEWAY_PROVIDER_ID}"
+    if broke.get("npm") != _NPM_PACKAGE:
+        return f"provider.{GATEWAY_PROVIDER_ID}.npm"
+    if gateway_base_url is not None:
+        options = broke.get("options")
+        if not isinstance(options, dict) or options.get("baseURL") != gateway_base_url:
+            return f"provider.{GATEWAY_PROVIDER_ID}.options.baseURL"
+    models = broke.get("models")
+    prefix = f"{GATEWAY_PROVIDER_ID}/"
+    ids = {a.removeprefix(prefix) for a in allowed}
+    if not isinstance(models, dict) or any(k not in ids for k in models):
+        return f"provider.{GATEWAY_PROVIDER_ID}.models"
+    small = body.get("small_model")
+    if not (isinstance(small, str) and small in allowed):
+        return "small_model"
+    return _bad_model_key(body, allowed)
+
+
+async def check_server_config(
+    endpoint: ServerEndpoint,
     allowed: frozenset[str],
     *,
+    gateway_base_url: str | None,
     timeout_s: float,
     transport: httpx.AsyncBaseTransport | None = None,
-) -> SmallModelCheck:
-    """Never raises. Any failure to read the config is UNAVAILABLE; a bad value is UNSAFE."""
-    url = server_url.rstrip("/") + "/config"
+    environ: Mapping[str, str] | None = None,
+) -> tuple[SmallModelCheck, str]:
+    """Never raises. Returns (OK|UNSAFE|UNAVAILABLE, detail naming key paths only)."""
+    problem = await asyncio.to_thread(auth_store_problem, environ)
+    if problem is not None:
+        return SmallModelCheck.UNSAFE, problem
+    url = endpoint.url.rstrip("/") + "/config"
     try:
         async with httpx.AsyncClient(
-            transport=transport, timeout=timeout_s, follow_redirects=False
+            transport=transport,
+            timeout=timeout_s,
+            follow_redirects=False,
+            trust_env=False,
+            auth=endpoint.auth(),
         ) as client:
             response = await client.get(url)
         if response.status_code != 200:
-            return SmallModelCheck.UNAVAILABLE
+            return SmallModelCheck.UNAVAILABLE, "GET /config failed"
         body = response.json()
     except Exception:
-        return SmallModelCheck.UNAVAILABLE
+        return SmallModelCheck.UNAVAILABLE, "GET /config failed"
     if not isinstance(body, dict):
-        return SmallModelCheck.UNAVAILABLE
-    small = body.get("small_model")
-    if not (isinstance(small, str) and small in allowed):
-        return SmallModelCheck.UNSAFE
-    if _bad_model_key(body, allowed) is not None:
-        return SmallModelCheck.UNSAFE
-    return SmallModelCheck.OK
+        return SmallModelCheck.UNAVAILABLE, "GET /config failed"
+    bad = _gateway_shape_problem(body, allowed, gateway_base_url)
+    if bad is not None:
+        return SmallModelCheck.UNSAFE, f"server config key '{bad}' is not gateway-only"
+    return SmallModelCheck.OK, ""
 
 
 # ---- on-disk project config (B13) ---------------------------------------------------------
@@ -145,13 +184,9 @@ def strip_jsonc(text: str) -> str:
 
 
 def _scope_dirs(project_dir: Path) -> list[Path]:
-    """Project dir and parents up to and including the git root; just the project dir if none."""
+    """Project dir and every parent up to the filesystem root (OpenCode may merge any of them)."""
     start = project_dir.resolve()
-    chain = [start, *start.parents]
-    for idx, d in enumerate(chain):
-        if (d / ".git").exists():
-            return chain[: idx + 1]
-    return [start]
+    return [start, *start.parents]
 
 
 def _candidate_files(project_dir: Path) -> list[Path]:
@@ -179,6 +214,12 @@ def check_project_config(project_dir: str, allowed: frozenset[str]) -> tuple[Sma
             return SmallModelCheck.UNSAFE, f"{path}: unreadable or not valid JSON"
         if not isinstance(data, dict):
             return SmallModelCheck.UNSAFE, f"{path}: top level is not an object"
+        for forbidden in _PROJECT_FORBIDDEN_KEYS:
+            if forbidden in data:
+                return (
+                    SmallModelCheck.UNSAFE,
+                    f"{path}: key '{forbidden}' is not allowed in project config",
+                )
         bad = _bad_model_key(data, allowed)
         if bad is not None:
             return SmallModelCheck.UNSAFE, f"{path}: key '{bad}' is not an allowlisted model"
