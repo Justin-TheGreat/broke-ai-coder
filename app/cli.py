@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from collections.abc import Sequence
@@ -12,6 +13,12 @@ from app.config.models import AppConfig
 from app.config.secrets import collect_secret_values
 from app.db.connection import open_database
 from app.db.migrations import migrate
+from app.opencode.os_user import (
+    SudoLauncher,
+    SystemHostProbe,
+    build_launcher,
+    render_sudoers,
+)
 from app.redaction import SecretRedactor, install_redaction
 from app.runtime.interfaces import StartupError
 from app.runtime.wiring import build_runtime, close_runtime
@@ -36,6 +43,40 @@ async def _serve(config: AppConfig, redactor: SecretRedactor, *, once: bool) -> 
         await close_runtime(rt)
 
 
+def _print_sudoers(config: AppConfig) -> int:
+    if os.name != "posix":
+        print("run --print-sudoers inside WSL as the daemon user", file=sys.stderr)
+        return 2
+    daemon = SystemHostProbe().user_by_uid(os.geteuid())
+    if daemon is None:
+        print("cannot look up the daemon user", file=sys.stderr)
+        return 2
+    try:
+        text = render_sudoers(daemon.name, config.opencode.os_user.name, config.opencode.command[0])
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    sys.stdout.write(text)
+    return 0
+
+
+def _check_os_user(config: AppConfig) -> int:
+    name = config.opencode.os_user.name
+    if config.opencode.os_user.mode == "none":
+        print(
+            "opencode.os_user.mode is none: OpenCode would run as the daemon user"
+            " (unsupported for production)",
+            file=sys.stderr,
+        )
+        return 3
+    launcher = build_launcher(config)
+    assert isinstance(launcher, SudoLauncher)
+    # The self-check never sweeps, so a running daemon's serve survives.
+    asyncio.run(launcher.self_check())
+    print(f"os_user OK: OpenCode runs as {name}; isolation checks passed")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-controller")
     parser.add_argument("--config", default="config.yaml")
@@ -45,6 +86,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--once",
         action="store_true",
         help="start, run one cleanup, stop (no gateway or opencode serve)",
+    )
+    group.add_argument(
+        "--print-sudoers",
+        action="store_true",
+        help="print the sudoers drop-in for opencode.os_user (run inside WSL as the daemon user)",
+    )
+    group.add_argument(
+        "--check-os-user",
+        action="store_true",
+        help="run the OpenCode user isolation self-check (does not kill anything)",
     )
     args = parser.parse_args(argv)
 
@@ -59,7 +110,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     redactor.add(*collect_secret_values(config))
 
+    if args.print_sudoers:
+        return _print_sudoers(config)
     try:
+        if args.check_os_user:
+            return _check_os_user(config)
         if args.check:
             conn = open_database(
                 config.database.path, busy_timeout_ms=config.database.busy_timeout_ms

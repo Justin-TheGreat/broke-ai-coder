@@ -10,9 +10,10 @@ import pytest
 
 from app.config.models import OpenCodeConfig
 from app.opencode.executor import OpenCodeExecutor
+from app.opencode.os_user import DirectLauncher
 from app.providers.base import ErrorClass
 from app.redaction import SecretRedactor
-from app.runtime.interfaces import ExecutionOutcome, ExecutorEventKind
+from app.runtime.interfaces import ExecutionOutcome, ExecutorEventKind, StartupError
 
 FAKE = str(Path(__file__).parent / "fakes" / "fake_opencode.py")
 
@@ -437,3 +438,104 @@ async def test_prompt_nul_stripped_and_dash_prefixed(tmp_path):
     r = await run(make_exec(tmp_path), tmp_path, prompt="--help\x00 me ")
     assert r.outcome == ExecutionOutcome.SUCCEEDED
     assert argv_lines(tmp_path)[0][-1] == " --help me"
+
+
+# ---- launcher integration and N9 -------------------------------------------------------
+
+
+class RecordingLauncher(DirectLauncher):
+    def __init__(self, prefix: list[str] | None = None) -> None:
+        super().__init__()
+        self.prefix = prefix or []
+        self.kills: list[float] = []
+
+    def command(self, argv):
+        return [*self.prefix, *argv]
+
+    async def kill_tree(self, proc, *, grace_s):
+        self.kills.append(grace_s)
+        await super().kill_tree(proc, grace_s=grace_s)
+
+
+def make_exec_with(tmp_path, scenarios="success", *, launcher=None, reason=None, **cfg):
+    ex = make_exec(tmp_path, scenarios, **cfg)
+    ex._launcher = launcher or RecordingLauncher()
+    ex._unavailable_reason = reason
+    return ex
+
+
+async def test_n9_unavailable_reason_blocks_spawn(tmp_path, monkeypatch):
+    async def no_spawn(*a, **k):
+        raise AssertionError("must not spawn while the managed serve is down")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", no_spawn)
+    ex = make_exec_with(tmp_path, reason=lambda: "managed OpenCode server is down: restarting")
+    r = await run(ex, tmp_path)
+    assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE
+    assert r.detail == "managed OpenCode server is down: restarting"
+
+
+async def test_n9_invalid_prompt_still_invalid(tmp_path):
+    ex = make_exec_with(tmp_path, reason=lambda: "down")
+    r = await run(ex, tmp_path, prompt="   ")
+    assert r.outcome == ExecutionOutcome.FAILED
+    assert r.error_class == ErrorClass.INVALID_REQUEST
+
+
+async def test_n9_reason_none_spawns_normally(tmp_path):
+    r = await run(make_exec_with(tmp_path, reason=lambda: None), tmp_path)
+    assert r.outcome == ExecutionOutcome.SUCCEEDED
+
+
+async def test_spawned_argv_is_launcher_command_of_build_argv(tmp_path, monkeypatch):
+    ex = make_exec_with(tmp_path, launcher=RecordingLauncher(prefix=["PFX", "--"]))
+    seen: dict = {}
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*argv, **kw):
+        seen["argv"] = list(argv)
+        return await real(*argv[2:], **kw)  # drop the fake prefix to really run
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    r = await run(ex, tmp_path)
+    assert r.outcome == ExecutionOutcome.SUCCEEDED
+    expected = ex._launcher.command(
+        ex.build_argv(
+            seen["argv"][2],
+            provider="openrouter",
+            model="openrouter/free",
+            prompt="do it",
+            session_id=None,
+        )
+    )
+    assert seen["argv"] == expected
+    assert seen["argv"][:2] == ["PFX", "--"]
+
+
+async def test_timeout_uses_launcher_kill_tree(tmp_path):
+    launcher = RecordingLauncher()
+    ex = make_exec_with(tmp_path, "hang", launcher=launcher, run_timeout_s=1, kill_grace_s=1)
+    r = await run(ex, tmp_path)
+    assert r.outcome == ExecutionOutcome.TIMED_OUT
+    assert launcher.kills == [1]
+
+
+async def test_unavailable_when_launcher_rejects_executable(tmp_path):
+    class Rejecting(RecordingLauncher):
+        def executable(self, command0):
+            raise StartupError("opencode.command[0] must be an absolute path when x")
+
+    ex = make_exec_with(tmp_path, launcher=Rejecting())
+    r = await run(ex, tmp_path)
+    assert r.outcome == ExecutionOutcome.EXECUTOR_UNAVAILABLE
+    assert "absolute path" in r.detail
+
+
+async def test_check_server_config_uses_launcher_auth_problem(tmp_path):
+    class Problem(RecordingLauncher):
+        async def auth_store_problem(self):
+            return "OpenCode has stored provider credentials for: openai. launcher-said-so"
+
+    ex = make_exec_with(tmp_path, launcher=Problem())
+    check, detail = await ex.check_server_config(frozenset({"broke/x"}))
+    assert check.value == "UNSAFE" and "launcher-said-so" in detail

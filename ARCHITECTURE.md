@@ -705,7 +705,8 @@ Discord Bot
 Controller daemon  ── holds ALL provider keys
    │  LLM gateway (127.0.0.1, allowlisted free models only)
    ▼
-OpenCode  ── UNTRUSTED FOR KEYS: no key in its env, config or credential store
+OpenCode  ── runs as OS user brokeoc (sudo); UNTRUSTED FOR KEYS: no key in its env, config or credential store
+       │   boundary: no read access to daemon home / secrets / proc
        │
        ▼
 OS shell / repositories
@@ -723,7 +724,13 @@ Recommended network rules:
 
 Residual risks:
 
-- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: T072 (separate OS user). The same exposure covers ambient cloud credentials reachable through the allowed `HOME`/`XDG_*` (for example `~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens): do not keep such credentials for that user until T072.
+- **R1.** Resolved by T072 when `opencode.os_user.mode: sudo` (the default): OpenCode runs as a dedicated unprivileged Linux user that cannot read the daemon user's home, the secrets file, `/proc/<daemon pid>/environ` or ambient cloud credentials in the daemon's home. Remaining residuals:
+  - **R1a.** Agent-written code in /workspace (git hooks, scripts, package files) runs as whoever executes it. Do not run git or tests there as the daemon user on unreviewed changes.
+  - **R1b (was N4).** The agent holds the gateway token and serve password. It can call allowlisted free models and reconfigure or kill its own serve, but it has no keys. The per-task GET /config and auth checks fail closed, and the crafted-server identity gap is unchanged.
+  - **R1c.** The daemon parses agent-writable project config files. Only key names are reported. A FIFO or huge file can stall or fail that check.
+  - **R1d.** WSL interop and /mnt must stay closed (the startup self-check enforces this).
+  - **R1e.** Mode `none` keeps the original exposure (same OS user); it is for tests and dev only.
+  - **R1f.** sudo logs each command line, including prompts, to the system journal.
 - **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
 - **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
 - **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.
@@ -755,6 +762,9 @@ These metrics describe only the controller process and its SQLite file. They are
 | OpenCode restarted | Mark running session uncertain and require recovery logic |
 | `opencode serve` crashes | The daemon restarts it with backoff (1, 2, 4 ... `server_restart_max_backoff_s`); tasks fail `OPENCODE_UNAVAILABLE` meanwhile |
 | `opencode serve` cannot start (stored credentials, missing binary, never healthy) | Daemon start fails with a one-line `StartupError` (exit 3) |
+| OpenCode user isolation self-check fails (sudoers missing, user can read the daemon home, interop on) | Daemon start fails with a one-line `StartupError` (exit 3); no task runs |
+| `opencode serve` fatal (port taken by something else) | Tasks fail `OPENCODE_UNAVAILABLE` with a message telling the user to restart the daemon; no fallback attempt spawns (N9, N10) |
+| Daemon stop / serve restart | All processes of the OpenCode user are killed (`pkill -KILL -U`), so no detached agent process outlives serve (N1) |
 | Provider 429 | Update quota/cooldown and try next eligible provider |
 | Gateway upstream 429 | Gateway passes it through with `Retry-After` and sets the provider/model cooldown; further requests for that model get 429 without an upstream call |
 | Provider 401 | Disable provider until credential is fixed |

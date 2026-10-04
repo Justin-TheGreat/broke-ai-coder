@@ -40,3 +40,7 @@ copy config.example.yaml config.yaml
 - `providers.<p>.models`: per-model capability overrides (tools, vision, context window, ...).
 - `cooldown`: how long rate-limited or failing providers and models are skipped.
 - Log output redacts configured API keys.
+- Production (WSL) runs OpenCode as a separate Linux user through sudo
+  (`opencode.os_user`, setup guide Part C6); `--print-sudoers` and `--check-os-user` help with
+  setup.
+- On Windows/tests set `opencode.os_user.mode: none`, which is unsupported for production.

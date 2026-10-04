@@ -56,6 +56,7 @@ def db(tmp_path) -> Iterator:
 
 def _base_config_dict() -> dict[str, Any]:
     return {
+        "opencode": {"os_user": {"mode": "none"}},
         "providers": {
             p: {"enabled": True, "api_key_env": f"{p.upper()}_API_KEY"}
             for p in ("openrouter", "gemini", "groq")

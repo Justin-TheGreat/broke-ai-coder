@@ -58,7 +58,9 @@ class Recorder:
         self.events.append(event)
 
 
-def build(make_config, tmp_path, *, crash: bool, port: int | None = None):
+def build(
+    make_config, tmp_path, *, crash: bool, port: int | None = None, scenarios: str = "success"
+):
     """Return (cfg, manager, executor, orchestrator, recorder, argv_file)."""
     argv_file = tmp_path / "argv.txt"
     extra = {"FAKE_OC_SERVE_SCENARIO": "crash_after", "FAKE_OC_SERVE_CRASH_AFTER_S": "1.5"}
@@ -79,7 +81,11 @@ def build(make_config, tmp_path, *, crash: bool, port: int | None = None):
         endpoint=lambda: manager.endpoint,
         gateway_base_url=lambda: StubGateway.base_url,
         unavailable_reason=manager.unavailable_reason,
-        extra_env={"FAKE_OC_SCENARIOS": "success", "FAKE_OC_ARGV_FILE": str(argv_file)},
+        extra_env={
+            "FAKE_OC_SCENARIOS": scenarios,
+            "FAKE_OC_ARGV_FILE": str(argv_file),
+            "FAKE_OC_COUNTER_FILE": str(tmp_path / "run-counter.txt"),
+        },
     )
     adapters = {
         pol.provider: FakeProviderAdapter(
@@ -181,6 +187,7 @@ async def test_task_after_fatal_error_fails_closed(make_config, tmp_path, monkey
                 rec = await run_one(c)
                 text = assert_failed_closed(c, orch, rec, recorder, argv_file, hits)
                 assert "already in use" in text
+                assert "restart the daemon" in text  # N10
             assert serve_count(tmp_path) == 1
         finally:
             if server is not None:
@@ -199,3 +206,40 @@ async def test_task_runs_again_after_successful_relaunch(make_config, tmp_path, 
         t = TaskRepository(c.conn).get(rec.id)
         assert t.status == TaskStatus.SUCCEEDED, t.error_class
         assert argv_file.exists() and len(argv_file.read_text().splitlines()) == 1
+
+
+async def test_n9_fallback_attempt_after_serve_goes_down_does_not_spawn(
+    make_config, tmp_path, monkeypatch
+):
+    """Attempt 1 fails over (rate limit); the serve then goes fatal; attempt 2 must not spawn."""
+    cfg, m, ex, orch, recorder, argv_file = build(
+        make_config, tmp_path, crash=False, scenarios="rate_limit,success"
+    )
+    await m.start()
+    real_run = ex.run
+    calls: list[int] = []
+
+    async def run_then_go_down(**kw):
+        result = await real_run(**kw)
+        calls.append(1)
+        if len(calls) == 1:
+            m.fatal_error = "port 4096 already in use - stop any manually started `opencode serve`"
+        return result
+
+    monkeypatch.setattr(ex, "run", run_then_go_down)
+    async with running(cfg, orch, recorder, m) as c:
+        rec = await run_one(c)
+        t = TaskRepository(c.conn).get(rec.id)
+        assert t.status == TaskStatus.FAILED and t.error_class == "OPENCODE_UNAVAILABLE"
+        attempts = FallbackAttemptRepository(c.conn).list_for_task(rec.id)
+        assert len(attempts) == 2
+        assert attempts[1].status.value == "EXECUTOR_UNAVAILABLE"
+        assert len(argv_file.read_text().splitlines()) == 1  # only attempt 1 ever spawned
+        assert calls == [1, 1]
+        cooling = orch.cooldowns.active(datetime.now(UTC))
+        assert {p for p, _ in cooling} == {attempts[0].provider}  # attempt 1 only
+        finished = [e for e in recorder.events if e.name == "task_finished" and e.task_id == rec.id]
+        assert len(finished) == 1
+        text = fmt.format_event(finished[0])
+        assert "managed OpenCode server is down" in text and "restart the daemon" in text
+        assert PASSWORD not in text

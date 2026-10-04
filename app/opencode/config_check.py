@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -111,9 +111,13 @@ async def check_server_config(
     timeout_s: float,
     transport: httpx.AsyncBaseTransport | None = None,
     environ: Mapping[str, str] | None = None,
+    auth_problem: Callable[[], Awaitable[str | None]] | None = None,
 ) -> tuple[SmallModelCheck, str]:
     """Never raises. Returns (OK|UNSAFE|UNAVAILABLE, detail naming key paths only)."""
-    problem = await asyncio.to_thread(auth_store_problem, environ)
+    if auth_problem is not None:
+        problem = await auth_problem()
+    else:
+        problem = await asyncio.to_thread(auth_store_problem, environ)
     if problem is not None:
         return SmallModelCheck.UNSAFE, problem
     url = endpoint.url.rstrip("/") + "/config"

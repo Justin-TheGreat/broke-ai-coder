@@ -21,6 +21,7 @@ from oc_helpers import GATEWAY_TOKEN, GATEWAY_URL
 
 import app.opencode.server as server_mod
 from app.config.models import AppConfig
+from app.opencode.os_user import DirectLauncher
 from app.opencode.server import OpenCodeServerManager, build_opencode_config
 from app.redaction import SecretRedactor
 from app.runtime.interfaces import StartupError
@@ -583,3 +584,137 @@ async def test_tasks_run_again_after_successful_relaunch(make_config, tmp_path, 
     finally:
         await m.stop()
     assert not m.ready
+
+
+# ---- launcher integration (T072) and N10 -----------------------------------------------
+
+
+class RecordingLauncher(DirectLauncher):
+    """Direct behaviour, recording every call, so the fake serve still runs."""
+
+    def __init__(self, *, isolated: bool = False, problem: str | None = None) -> None:
+        super().__init__()
+        self.isolated = isolated
+        self.problem = problem
+        self.calls: list[str] = []
+        self.commands: list[list[str]] = []
+        self.envs: list[dict[str, str]] = []
+
+    def command(self, argv):
+        self.commands.append(list(argv))
+        return super().command(argv)
+
+    def environment(self, environ, *, passthrough, extra):
+        env = super().environment(environ, passthrough=passthrough, extra=extra)
+        env["LAUNCHER_MARK"] = "1"
+        self.envs.append(env)
+        return env
+
+    async def kill_tree(self, proc, *, grace_s):
+        self.calls.append("kill_tree")
+        await super().kill_tree(proc, grace_s=grace_s)
+
+    async def sweep(self):
+        self.calls.append("sweep")
+
+    async def auth_store_problem(self):
+        self.calls.append("auth_store_problem")
+        return self.problem
+
+
+def launcher_manager(make_config, tmp_path, launcher, **opencode) -> OpenCodeServerManager:
+    return OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path, **opencode),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(tmp_path),
+        password="pw-server-0123456789",
+        launcher=launcher,
+    )
+
+
+async def test_serve_argv_and_env_come_from_the_launcher(make_config, tmp_path):
+    launcher = RecordingLauncher()
+    m = launcher_manager(make_config, tmp_path, launcher)
+    await m.start()
+    try:
+        assert len(launcher.commands) == 1
+        argv = launcher.commands[0]
+        assert argv[1:] == [FAKE, "serve", "--hostname", "127.0.0.1", "--port", argv[-1]]
+        env = launcher.envs[0]
+        assert set(env) >= {
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_SERVER_PASSWORD",
+            "OPENCODE_SERVER_USERNAME",
+        }
+        assert json.loads((tmp_path / "env.json").read_text())["LAUNCHER_MARK"] == "1"
+    finally:
+        await m.stop()
+
+
+async def test_reap_kills_tree_then_sweeps(make_config, tmp_path):
+    launcher = RecordingLauncher()
+    m = launcher_manager(make_config, tmp_path, launcher)
+    await m.start()
+    launcher.calls.clear()
+    await m.stop()
+    assert launcher.calls == ["kill_tree", "sweep"]
+    launcher.calls.clear()
+    await m.stop()  # idempotent: no proc, but the sweep still runs
+    assert launcher.calls == ["sweep"]
+
+
+async def test_sweep_failure_never_breaks_reap(make_config, tmp_path):
+    class Boom(RecordingLauncher):
+        async def sweep(self):
+            raise RuntimeError("sweep exploded")
+
+    m = launcher_manager(make_config, tmp_path, Boom())
+    await m.start()
+    await m.stop()
+    assert not m.ready
+
+
+async def test_start_uses_launcher_auth_problem(make_config, tmp_path):
+    launcher = RecordingLauncher(problem="OpenCode has stored provider credentials for: x.")
+    m = launcher_manager(make_config, tmp_path, launcher)
+    with pytest.raises(StartupError, match="stored provider credentials"):
+        await m.start()
+    assert launcher.commands == [] and serve_count(tmp_path) == 0
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+async def test_password_hint_only_when_isolated(make_config, tmp_path, monkeypatch, isolated):
+    port = free_port()
+    server, _ = await start_foreign(port, status_unauth=200)
+    monkeypatch.setattr(server_mod, "_port_in_use", lambda p: False)
+    m = launcher_manager(
+        make_config,
+        tmp_path,
+        RecordingLauncher(isolated=isolated),
+        server_port=port,
+        server_start_timeout_s=5,
+    )
+    try:
+        with pytest.raises(StartupError) as ei:
+            await m.start()
+    finally:
+        server.close()
+        await server.wait_closed()
+    msg = str(ei.value)
+    assert "does not enforce the password" in msg
+    assert ("env_keep line is missing" in msg) is isolated
+
+
+def test_unavailable_reason_after_fatal_leads_with_restart_instruction(make_config, tmp_path):
+    m = launcher_manager(make_config, tmp_path, RecordingLauncher())
+    m.fatal_error = (
+        "port 4096 already in use - stop any manually started `opencode serve`" + "x" * 400
+    )
+    reason = m.unavailable_reason()
+    assert reason is not None and len(reason) <= 300
+    assert reason.startswith("managed OpenCode server is down")
+    assert "restart the daemon" in reason
+    m.fatal_error = "port 4096 already in use"
+    assert "already in use" in (m.unavailable_reason() or "")
+    m.fatal_error = None
+    assert m.unavailable_reason() == "managed OpenCode server is down: restarting"

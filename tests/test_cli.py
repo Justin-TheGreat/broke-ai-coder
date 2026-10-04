@@ -45,9 +45,96 @@ def test_startup_error_prints_message_and_returns_3(tmp_path, capsys, monkeypatc
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\n"
-        "opencode:\n  command: [no-such-opencode-binary-xyz]\n"
+        "opencode:\n  command: [no-such-opencode-binary-xyz]\n  os_user: {mode: none}\n"
     )
     assert main(["--config", str(cfg)]) == 3
     err = capsys.readouterr().err
     assert "opencode executable not found" in err
     assert "Traceback" not in err
+
+
+# ---- --print-sudoers / --check-os-user ------------------------------------------------------
+
+
+def _cfg(tmp_path, command="/usr/local/bin/opencode", mode="sudo"):
+    p = tmp_path / "c.yaml"
+    p.write_text(
+        f"database:\n  path: {(tmp_path / 'x.db').as_posix()}\n"
+        f"opencode:\n  command: [{command}]\n  os_user: {{mode: {mode}}}\n"
+    )
+    return str(p)
+
+
+def _fake_posix(monkeypatch):
+    import app.cli as cli
+    from app.opencode.os_user import SystemHostProbe, UserInfo
+
+    monkeypatch.setattr(cli.os, "name", "posix", raising=False)
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(
+        SystemHostProbe,
+        "user_by_uid",
+        lambda self, uid: UserInfo("justin", 1000, 1000, "/home/justin"),
+    )
+
+
+def test_print_sudoers_prints_exact_text(tmp_path, capsys, monkeypatch):
+    from app.opencode.os_user import render_sudoers
+
+    _fake_posix(monkeypatch)
+    assert main(["--config", _cfg(tmp_path), "--print-sudoers"]) == 0
+    out = capsys.readouterr().out
+    assert out == render_sudoers("justin", "brokeoc", "/usr/local/bin/opencode")
+
+
+def test_print_sudoers_relative_command_exits_2(tmp_path, capsys, monkeypatch):
+    _fake_posix(monkeypatch)
+    assert main(["--config", _cfg(tmp_path, command="opencode"), "--print-sudoers"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "absolute path" in captured.err
+
+
+def test_print_sudoers_needs_posix(tmp_path, capsys, monkeypatch):
+    import app.cli as cli
+
+    monkeypatch.setattr(cli.os, "name", "nt", raising=False)
+    assert main(["--config", _cfg(tmp_path), "--print-sudoers"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "inside WSL" in captured.err
+
+
+def test_check_os_user_mode_none_exits_3(tmp_path, capsys):
+    assert main(["--config", _cfg(tmp_path, mode="none"), "--check-os-user"]) == 3
+    assert "unsupported for production" in capsys.readouterr().err
+
+
+def test_check_os_user_ok_runs_self_check_only(tmp_path, capsys, monkeypatch):
+    from app.opencode.os_user import SudoLauncher
+
+    calls: list[str] = []
+
+    async def fake_check(self):
+        calls.append("self_check")
+
+    async def no_sweep(self):
+        raise AssertionError("--check-os-user must never sweep")
+
+    monkeypatch.setattr(SudoLauncher, "self_check", fake_check)
+    monkeypatch.setattr(SudoLauncher, "sweep", no_sweep)
+    assert main(["--config", _cfg(tmp_path), "--check-os-user"]) == 0
+    assert calls == ["self_check"]
+    assert (
+        "os_user OK: OpenCode runs as brokeoc; isolation checks passed" in capsys.readouterr().out
+    )
+
+
+def test_check_os_user_failure_exits_3(tmp_path, capsys, monkeypatch):
+    from app.opencode.os_user import SudoLauncher
+    from app.runtime.interfaces import StartupError
+
+    async def fail(self):
+        raise StartupError("OpenCode user isolation (opencode.os_user) check failed: x")
+
+    monkeypatch.setattr(SudoLauncher, "self_check", fail)
+    assert main(["--config", _cfg(tmp_path), "--check-os-user"]) == 3
+    assert "check failed: x" in capsys.readouterr().err

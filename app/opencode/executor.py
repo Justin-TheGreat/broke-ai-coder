@@ -16,6 +16,10 @@ B11. On cancel, timeout or outer cancellation the executor also sends a best-eff
     ``POST {server_url}/session/{id}/abort`` (app/opencode/abort.py), because killing the
     ``--attach`` client does not stop the server-side session.
 
+B14. With ``opencode.os_user.mode: sudo`` the process runs as ``opencode.os_user.name`` through
+    ``sudo -n -u <name> --`` (app/opencode/os_user.py). In managed mode (N9) a run never spawns
+    while the managed serve is not known-good: ``run`` returns EXECUTOR_UNAVAILABLE first.
+
 Known gap: for a brand-new session (no ``--session`` passed), no id is known until the first
 event carrying one has been read, so before that the server-side session cannot be aborted
 and may keep running after a kill. A resumed session is aborted using the id passed in.
@@ -41,10 +45,10 @@ from app.config.models import GATEWAY_PROVIDER_ID, OpenCodeConfig
 from app.opencode.abort import abort_opencode_session
 from app.opencode.config_check import check_project_config_async, check_server_config
 from app.opencode.endpoint import ServerEndpoint
-from app.opencode.env import build_opencode_env
 from app.opencode.events import SESSION_ID_RE, OpenCodeError, classify_text, parse_event_line
 from app.opencode.health import check_opencode_health
-from app.opencode.process import kill_process_tree, resolve_executable, spawn_kwargs
+from app.opencode.os_user import DirectLauncher, OpenCodeLauncher
+from app.opencode.process import spawn_kwargs
 from app.orchestrator.prompt import sanitize_prompt
 from app.providers.base import ErrorClass
 from app.redaction import SecretRedactor
@@ -108,8 +112,10 @@ class OpenCodeExecutor:
         gateway_base_url: Callable[[], str | None] | None = None,
         environ: Mapping[str, str] | None = None,
         unavailable_reason: Callable[[], str | None] | None = None,
+        launcher: OpenCodeLauncher | None = None,
     ) -> None:
         self._config = config
+        self._launcher: OpenCodeLauncher = launcher or DirectLauncher(environ)
         self._unavailable_reason = unavailable_reason
         self._endpoint = endpoint or (lambda: ServerEndpoint(config.server_url))
         self._gateway_base_url = gateway_base_url or (lambda: None)
@@ -170,6 +176,7 @@ class OpenCodeExecutor:
             timeout_s=self._config.health_timeout_s,
             transport=self._transport,
             environ=self._environ,
+            auth_problem=self._launcher.auth_store_problem,
         )
 
     async def check_project_models(
@@ -200,7 +207,7 @@ class OpenCodeExecutor:
             extra["OPENCODE_SERVER_PASSWORD"] = endpoint.password
             extra["OPENCODE_SERVER_USERNAME"] = endpoint.username
         extra.update(self._extra_env)
-        return build_opencode_env(
+        return self._launcher.environment(
             os.environ if self._environ is None else self._environ,
             passthrough=self._config.env_passthrough,
             extra=extra,
@@ -366,14 +373,26 @@ class OpenCodeExecutor:
             return _invalid()
 
         try:
-            executable = resolve_executable(self._config.command[0])
+            executable = self._launcher.executable(self._config.command[0])
         except StartupError as e:
             return _unavailable(str(e))
         if not Path(project_dir).is_dir():
             return _unavailable("project directory missing")
+        # N9: never spawn while the managed serve is not known-good.
+        if (
+            self._unavailable_reason is not None
+            and (reason := self._unavailable_reason()) is not None
+        ):
+            return _unavailable(reason)
 
-        argv = self.build_argv(
-            executable, provider=provider, model=model, prompt=clean_prompt, session_id=session_id
+        argv = self._launcher.command(
+            self.build_argv(
+                executable,
+                provider=provider,
+                model=model,
+                prompt=clean_prompt,
+                session_id=session_id,
+            )
         )
         kwargs = spawn_kwargs()
         try:
@@ -408,12 +427,12 @@ class OpenCodeExecutor:
             else:
                 kind = "timeout"
             if kind != "exit":
-                await kill_process_tree(proc, grace_s=grace)
+                await self._launcher.kill_tree(proc, grace_s=grace)
                 await self._abort_session(state.session_id or session_id)
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(drain, timeout=grace + 5)
         except asyncio.CancelledError:
-            await asyncio.shield(kill_process_tree(proc, grace_s=grace))
+            await asyncio.shield(self._launcher.kill_tree(proc, grace_s=grace))
             await asyncio.shield(self._abort_session(state.session_id or session_id))
             raise
         finally:

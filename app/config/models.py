@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -216,6 +216,36 @@ class DiscordConfig(BaseModel):
     allowed_channel_ids: list[int] = Field(default_factory=list)
 
 
+class OsUserConfig(BaseModel):
+    model_config = _CFG
+
+    mode: Literal["sudo", "none"] = "sudo"
+    name: str = Field("brokeoc", pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
+    protected_paths: list[str] = Field(
+        default_factory=lambda: ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_root(cls, v: str) -> str:
+        if v == "root":
+            raise ValueError("os_user.name must not be root")
+        return v
+
+    @field_validator("protected_paths")
+    @classmethod
+    def _protected_paths_valid(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            path = raw.strip()
+            if not path or "\x00" in path:
+                raise ValueError("protected_paths entries must be non-empty and contain no NUL")
+            if not path.startswith(("/", "~/")):
+                raise ValueError(f"protected_paths entry {raw!r} must start with / or ~/")
+            out.append(path)
+        return out
+
+
 class OpenCodeConfig(BaseModel):
     model_config = _CFG
 
@@ -235,6 +265,7 @@ class OpenCodeConfig(BaseModel):
     max_line_bytes: int = Field(1_048_576, ge=1024, le=16_777_216)
     output_tail_chars: int = Field(4000, ge=200, le=20000)
     stderr_tail_bytes: int = Field(4096, ge=256, le=65536)
+    os_user: OsUserConfig = Field(default_factory=OsUserConfig)
     continue_prompt: str = (
         "Continue the previous task from where it stopped. Do not repeat steps that already"
         " completed."

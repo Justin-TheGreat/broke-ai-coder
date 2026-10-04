@@ -68,7 +68,7 @@ async def test_services_order_and_shared_cooldowns(make_config, tmp_path):
     )
     try:
         assert rt.server_manager is not None
-        assert rt.controller._services == [rt.gateway, rt.server_manager]
+        assert rt.controller._services == [rt.gateway, rt.launcher, rt.server_manager]
         # one CooldownManager shared by the gateway, the orchestrator and the router state
         assert rt.gateway._cooldowns is rt.orchestrator.cooldowns
     finally:
@@ -79,7 +79,7 @@ async def test_managed_server_false_has_no_manager(make_config, tmp_path):
     rt = build_runtime(cfg(make_config, tmp_path), redactor=SecretRedactor(), environ={})
     try:
         assert rt.server_manager is None
-        assert rt.controller._services == [rt.gateway]
+        assert rt.controller._services == [rt.gateway, rt.launcher]
         ep = rt.executor._endpoint()
         assert ep.url == "http://127.0.0.1:4096" and ep.password is None
     finally:

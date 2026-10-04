@@ -9,8 +9,12 @@ What you will end up with:
 ```text
 WSL Ubuntu-24.04
 ├── ~/.config/broke-ai-coder/secrets.env   (chmod 600: bot token + provider keys)
-├── opencode serve on 127.0.0.1:4096       (started and restarted by the controller, password-protected)
-├── /workspace/                            (repos the agent may edit)
+├── opencode serve on 127.0.0.1:4096       (started and restarted by the controller, password-protected,
+│                                           run as the separate user brokeoc through sudo)
+├── brokeoc                                (OpenCode user, own home /home/brokeoc, no access to your home)
+├── /usr/local/bin/opencode                (root-owned copy of the opencode binary)
+├── /var/lib/broke-ai-coder/opencode-server (serve's working directory, owned by brokeoc)
+├── /workspace/                            (repos the agent may edit; group brokeai = you + brokeoc)
 └── ~/broke-ai-coder/                      (the controller, cloned from GitHub)
 Discord
 └── private server "broke-ai-coder" with a bot that has slash-command access
@@ -145,15 +149,85 @@ cd ~/broke-ai-coder
 bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
 ```
 
-**Residual risk R1.** Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Even so, today OpenCode runs as the same Linux user as the controller, so a deliberately rogue agent could still read `secrets.env` and `/proc/<controller pid>/environ`. This change keeps OpenCode's config and environment key-free; it is not yet a guarantee against a malicious agent. The planned fix (next round, T072) is to run OpenCode as a separate Linux user with no access to the secrets file or the controller's `/proc`. Ambient cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens) are reachable the same way through the allowed `HOME`/`XDG_*`, so do not keep any of them for the WSL user until T072. Until then, keep account-level billing off as the second layer (Part B).
+Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Residual risk R1 (OpenCode reading your secrets) is closed by Part C6: OpenCode runs as the separate Linux user `brokeoc`, which cannot read your home, `secrets.env` or the daemon's `/proc`. The remaining residuals (R1a-R1f) are listed in SPEC.md section 11. Keep account-level billing off as the second layer (Part B).
 
-### C5. Workspace for agent-editable repos
-Keep repos on the Linux filesystem (not `/mnt/c/...` or OneDrive — slow and sync conflicts). This matches `opencode.working_directory: /workspace` in `config.example.yaml`:
+### C5. Workspace for agent-editable repos (shared with the OpenCode user)
+Keep repos on the Linux filesystem (not `/mnt/c/...` or OneDrive — slow and sync conflicts). This matches `opencode.working_directory: /workspace` in `config.example.yaml`. The directory is shared through the group `brokeai` (you and `brokeoc`):
 
 ```bash
+sudo apt install -y acl
+sudo groupadd brokeai && sudo usermod -aG brokeai "$USER"
 sudo mkdir -p /workspace
-sudo chown "$USER:$USER" /workspace
+sudo chown "$USER:brokeai" /workspace
+sudo chmod 2770 /workspace
+sudo chgrp -R brokeai /workspace
+sudo find /workspace -type d -exec chmod g+s {} +
+sudo setfacl -R -m g:brokeai:rwX /workspace
+sudo setfacl -R -d -m g:brokeai:rwX /workspace
 ```
+
+Then log in again so that `id` shows `brokeai`: type `exit`, and in PowerShell run `wsl --terminate Ubuntu-24.04`, then reopen Ubuntu. Never put the controller repo (`~/broke-ai-coder`) in `/workspace`.
+
+### C6. OpenCode user (one-time)
+OpenCode runs as the unprivileged user `brokeoc` through `sudo -n -u brokeoc -- ...` with a narrow sudoers rule: you may run exactly four commands (the opencode binary, `pkill`, `test`, `head`) as `brokeoc`, never as root. `brokeoc` has its own home and cannot read yours.
+
+1. Create the user and check its groups:
+   ```bash
+   sudo useradd --create-home --home-dir /home/brokeoc --shell /bin/bash --user-group brokeoc
+   sudo usermod -aG brokeai brokeoc
+   sudo chmod 700 /home/brokeoc
+   id brokeoc          # must NOT list sudo, adm, docker or lxd
+   ```
+2. Lock down your own home and secrets:
+   ```bash
+   chmod 700 "$HOME" ~/.config/broke-ai-coder
+   chmod 600 ~/.config/broke-ai-coder/secrets.env
+   ```
+3. Create the serve working directory:
+   ```bash
+   sudo install -d -m 0755 -o root -g root /var/lib/broke-ai-coder
+   sudo install -d -m 2770 -o brokeoc -g brokeai /var/lib/broke-ai-coder/opencode-server
+   ```
+4. Close WSL interop and the default `/mnt/c` mount. With interop on, any Linux user (including `brokeoc`) could start a Windows `.exe` as your Windows account and read every Windows file and `\\wsl$` path; with the default DrvFs mount `/mnt/c` is world-readable. MERGE the following into `/etc/wsl.conf` with `sudo nano /etc/wsl.conf` and keep any existing entries such as `[boot]` `systemd=true`:
+   ```ini
+   [interop]
+   enabled=false
+   appendWindowsPath=false
+
+   [automount]
+   options="umask=077"
+   ```
+   Then in PowerShell run `wsl --shutdown` and reopen Ubuntu. **Cost:** you can no longer launch Windows programs from WSL shells (`code .`, `explorer.exe`, `clip.exe`, `powershell.exe`). The daemon's self-check refuses to start while interop is enabled.
+5. Git for the agent (it gets no GitHub credentials; push as yourself):
+   ```bash
+   sudo -u brokeoc git config --global user.name "broke-ai-coder agent"
+   sudo -u brokeoc git config --global user.email "agent@example.invalid"
+   sudo -u brokeoc git config --global --add safe.directory '*'
+   ```
+6. Install the sudoers rule. Never use `/tmp` for this, because `brokeoc` can write there:
+   ```bash
+   cd ~/broke-ai-coder
+   tmp=$(mktemp ~/broke-ai-coder.sudoers.XXXXXX)
+   .venv/bin/python -m app --print-sudoers --config config.yaml > "$tmp"
+   sudo visudo -cf "$tmp"
+   sudo install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/broke-ai-coder
+   rm "$tmp"
+   sudo visudo -c
+   ```
+   The file name has no dot, so sudo reads it. This needs `opencode.command[0]` to be `/usr/local/bin/opencode` (Part D1) in your `config.yaml`; regenerate it if you change it.
+7. Verify:
+   ```bash
+   sudo -k
+   sudo -n -u brokeoc -- /usr/local/bin/opencode --version   # works, no password prompt
+   sudo -n true                                              # must FAIL (no root)
+   sudo -n -u brokeoc -- /usr/bin/test -r ~/.config/broke-ai-coder/secrets.env; echo $?   # expect 1
+   .venv/bin/python -m app --check-os-user --config config.yaml                        # expect: os_user OK
+   ```
+
+Notes:
+- The daemon kills ALL processes of `brokeoc` at start, at stop and on every serve restart. Do not use `brokeoc` for anything else.
+- sudo logs each command line (including prompts) to the system journal / `auth.log`.
+- On Windows (tests/dev) set `opencode.os_user.mode: none`. That runs OpenCode as the daemon user and is unsupported for production.
 
 ---
 
@@ -165,18 +239,23 @@ sudo chown "$USER:$USER" /workspace
 curl -fsSL https://opencode.ai/install | bash
 source ~/.bashrc          # installer adds opencode to PATH
 opencode --version
+sudo install -m 0755 -o root -g root "$(command -v opencode)" /usr/local/bin/opencode
 ```
 
 (Alternative if the script fails: install Node.js LTS, then `npm install -g opencode-ai`.)
 
+`brokeoc` must not be able to modify the binary, so the daemon uses a root-owned copy at `/usr/local/bin/opencode` (the `opencode.command` default in `config.example.yaml`). Re-run the `install` line after every OpenCode upgrade. If you installed with npm, point `opencode.command` at the npm global binary path instead and regenerate the sudoers file (C6 step 6).
+
 ### D2. Give OpenCode no keys
 OpenCode is given **no** provider keys and no stored credentials. The controller launches it with a minimal environment and an inline config whose only provider is the built-in gateway.
 
+OpenCode runs as `brokeoc`, so check and log out there:
+
 ```bash
-opencode auth list
+sudo -n -u brokeoc -- /usr/local/bin/opencode auth list
 ```
 
-- If this lists any provider, run `opencode auth logout` for **each** one. The daemon refuses to start while `~/.local/share/opencode/auth.json` (or `$XDG_DATA_HOME/opencode/auth.json`) holds any provider entry.
+- If this lists any provider, run `sudo -n -u brokeoc -- /usr/local/bin/opencode auth logout` for **each** one. The daemon refuses to start while `/home/brokeoc/.local/share/opencode/auth.json` holds any provider entry.
 - Remove any `provider`, `model`, `small_model` or `enabled_providers` entries from `~/.config/opencode/opencode.json`. The controller sets them itself (D2b).
 - Take the model ids for `config.yaml` (`routing.policies.*.model_order`) from each provider's dashboard or models API, **not** from `opencode models`, which no longer lists your providers. OpenRouter must be `openrouter/free` or end in `:free`.
 
@@ -195,10 +274,11 @@ mkdir -p /workspace/hello && cd /workspace/hello && git init -q
 Start the daemon (Part E), then in Discord run `/code` on project `default` (`/workspace` in the example config) or, for `/workspace/hello`, add it under `opencode.projects` and use `/code project:hello`, asking for "Create hello.py that prints hello, then run it."
 
 ### D4. The controller runs `opencode serve` for you
-Do **not** run `opencode serve` yourself. The daemon starts it on `127.0.0.1:<opencode.server_port>` (default 4096) with a random Basic-auth password, a daemon-owned working directory (`opencode.server_directory`), a key-free environment and the inline gateway config. It restarts it with backoff if it crashes. Stop any old tmux `opencode serve` session:
+Do **not** run `opencode serve` yourself. The daemon starts it as `brokeoc` (through sudo, Part C6) on `127.0.0.1:<opencode.server_port>` (default 4096) with a random Basic-auth password, a daemon-owned working directory (`opencode.server_directory`), a key-free environment and the inline gateway config. It restarts it with backoff if it crashes. Stop any old tmux `opencode serve` session:
 
 ```bash
 tmux kill-session -t opencode 2>/dev/null; pgrep -af 'opencode serve' || true
+pgrep -u brokeoc -a          # inspect what runs as the OpenCode user
 ```
 
 Security rules (SPEC §11):
@@ -245,9 +325,10 @@ If startup fails the daemon prints one line and exits with status 3 (for example
 ## Checklist — send me these when done (no secrets)
 
 - [ ] `opencode --version` output
-- [ ] `opencode auth list` shows no providers (after `opencode auth logout`)
+- [ ] `sudo -n -u brokeoc -- /usr/local/bin/opencode auth list` shows no providers (after `opencode auth logout`)
+- [ ] `python -m app --check-os-user --config config.yaml` output (expect `os_user OK`)
 - [ ] Daemon started without a startup error; the log shows the gateway listening and no `did not become healthy`
-- [ ] The WSL user holds no ambient cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, Copilot tokens) until T072
+- [ ] `brokeoc`'s home holds no cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, Copilot tokens)
 - [ ] D3 smoke test worked (yes/no + any error text)
 - [ ] Exact model IDs chosen per provider, in order
 - [ ] Discord: bot invited to server (yes/no). IDs can stay in your local `config.yaml`; you don't need to send them.
@@ -265,10 +346,17 @@ Do **not** send: the Discord bot token, any API key, or the contents of `secrets
 | `opencode serve did not become healthy: ...` (exit 3) | See the exit code and stderr tail in the message; check `opencode.command`, that `opencode.server_port` is not already used (stop any old tmux `opencode serve`), and `opencode.server_start_timeout_s` |
 | `no enabled allowlisted models; check routing.provider_order/policies` | Enable at least one policy listed in `routing.provider_order` whose provider is enabled |
 | Tasks fail with `OPENCODE_UNSAFE_CONFIG` | Remove `provider`/`enabled_providers`/`disabled_providers` and non-`broke/...` model keys from project `opencode.json` files, and run `opencode auth logout` |
+| `a password is required` in the `--version` check | The sudoers file is not installed, or names the wrong user or binary path; regenerate it (C6 step 6) |
+| `user 'brokeoc' can access <path>` | `chmod` per C6 (home 700, `secrets.env` 600) and the `[automount] options="umask=077"` entry in `/etc/wsl.conf` |
+| `WSL interop is enabled` | C6 step 4, then `wsl --shutdown` |
+| `cannot write opencode.server_directory` | C6 step 3 (owner `brokeoc`, group `brokeai`, mode 2770) |
+| `does not enforce the password ... env_keep` | Reinstall the generated sudoers file (C6 step 6); its `env_keep` line is missing |
+| `will not restart by itself ... restart the daemon` | Stop whatever holds the serve port (`opencode.server_port`), then restart the daemon |
+| `mode 'sudo' needs Linux` | You are on Windows (dev): set `opencode.os_user.mode: none` |
 | Gateway returns 503 `upstream_credential_missing` | The daemon was started without `secrets.env` loaded; use the start command in C4/E |
 | 401 from a provider | Key copied wrong or revoked — regenerate in that dashboard, update `secrets.env` |
 | 429 in smoke test | Free-tier limit hit — the gateway answers 429 and the router falls back to the next free provider |
 | Health `curl` to 4096 returns 401 | Expected: the managed server needs its random password; check the controller log instead |
 | Bot token leaked | Developer Portal → Bot → **Reset Token**, update `secrets.env` |
-| Keys exported in `~/.bashrc` | Remove the `source ...secrets.env` line (residual risk R1) and open a new shell |
+| Keys exported in `~/.bashrc` | Remove the `source ...secrets.env` line and open a new shell |
 | Slash commands not visible on iPhone | Expected until round 3 registers them; then fully quit and reopen Discord |

@@ -14,10 +14,11 @@ environment), G5 (a custom-provider model's ``limit`` is optional), G7 (``OPENCO
 outranks global/project files; ``GET /config`` returns the merged config), G8 (``{env:``/``{file:``
 substitution also applies to the inline config, so model ids with braces are rejected at load).
 
-Residual risk R1: the agent runs as the same OS user and can still read the daemon's secrets file
-and ``/proc/<pid>/environ``. Closing it needs a separate OS user (T072).
-Ambient cloud credentials reachable via the allowed HOME/XDG_* (~/.aws, gcloud ADC, Azure CLI,
-Copilot tokens) are in the same class.
+OS user (T072, closes R1): with ``opencode.os_user.mode: sudo`` (default) serve is started through
+``sudo -n -u <os_user.name> --`` (``app/opencode/os_user.py``, which lists the assumptions S1-S5),
+so it runs as a dedicated unprivileged user with its own HOME. It cannot read the daemon's home,
+secrets file or ``/proc/<pid>/environ``. Mode ``none`` (tests/dev) runs it as the daemon user and
+keeps the old exposure. Every serve reap sweeps all of that user's processes (N1).
 """
 
 from __future__ import annotations
@@ -37,11 +38,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from app.config.models import GATEWAY_PROVIDER_ID, AppConfig
-from app.opencode.auth_store import auth_store_problem
 from app.opencode.endpoint import ServerEndpoint
-from app.opencode.env import build_opencode_env
 from app.opencode.health import check_opencode_health
-from app.opencode.process import kill_process_tree, resolve_executable, spawn_kwargs
+from app.opencode.os_user import DirectLauncher, OpenCodeLauncher
+from app.opencode.process import spawn_kwargs
 from app.redaction import SecretRedactor
 from app.runtime.interfaces import StartupError
 
@@ -128,8 +128,10 @@ class OpenCodeServerManager:
         environ: Mapping[str, str] | None = None,
         password: str | None = None,
         health_transport: httpx.AsyncBaseTransport | None = None,
+        launcher: OpenCodeLauncher | None = None,
     ) -> None:
         self._app = app_config
+        self._launcher: OpenCodeLauncher = launcher or DirectLauncher(environ)
         self._oc = app_config.opencode
         self._gateway = gateway
         self._redactor = redactor
@@ -167,7 +169,10 @@ class OpenCodeServerManager:
         if self.ready:
             return None
         if self._fatal_error is not None:
-            return f"managed OpenCode server is down: {self._fatal_error}"[:_DETAIL_CAP]
+            return (
+                "managed OpenCode server is down and will not restart by itself; fix the cause,"
+                " then restart the daemon: " + self._fatal_error
+            )[:_DETAIL_CAP]
         return "managed OpenCode server is down: restarting"
 
     def add_launch_listener(self, listener: Callable[[], None]) -> None:
@@ -189,10 +194,10 @@ class OpenCodeServerManager:
     # ---- lifecycle -------------------------------------------------
 
     async def start(self) -> None:
-        problem = await asyncio.to_thread(auth_store_problem, self._environ)
+        problem = await self._launcher.auth_store_problem()
         if problem is not None:
             raise StartupError(problem)
-        self._executable = resolve_executable(self._oc.command[0])
+        self._executable = self._launcher.executable(self._oc.command[0])
         await asyncio.to_thread(lambda: os.makedirs(self._oc.server_directory, exist_ok=True))
         self._stopping = False
         try:
@@ -242,11 +247,14 @@ class OpenCodeServerManager:
         self._ready = False
         proc, self._proc = self._proc, None
         if proc is not None:
-            await kill_process_tree(proc, grace_s=self._oc.kill_grace_s)
+            await self._launcher.kill_tree(proc, grace_s=self._oc.kill_grace_s)
         drain, self._drain = self._drain, None
         if drain is not None:
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
+        # N1: nothing the OpenCode user started may outlive this serve.
+        with contextlib.suppress(Exception):
+            await self._launcher.sweep()
 
     async def _spawn(self) -> asyncio.subprocess.Process:
         assert self._executable is not None
@@ -267,7 +275,7 @@ class OpenCodeServerManager:
             gateway_base_url=self._gateway.base_url,
             gateway_token=self._gateway.token,
         )
-        env = build_opencode_env(
+        env = self._launcher.environment(
             os.environ if self._environ is None else self._environ,
             passthrough=self._oc.env_passthrough,
             extra={
@@ -276,15 +284,17 @@ class OpenCodeServerManager:
                 "OPENCODE_SERVER_USERNAME": "opencode",
             },
         )
-        argv = [
-            self._executable,
-            *self._oc.command[1:],
-            "serve",
-            "--hostname",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ]
+        argv = self._launcher.command(
+            [
+                self._executable,
+                *self._oc.command[1:],
+                "serve",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ]
+        )
         self._stderr = bytearray()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -333,9 +343,14 @@ class OpenCodeServerManager:
                 if anon.detail == "HTTP 401" and proc.returncode is None:
                     return
                 if anon.healthy:
+                    hint = (
+                        " (or the sudoers env_keep line is missing, so serve got no password)"
+                        if self._launcher.isolated
+                        else ""
+                    )
                     raise _PortInUse(
                         f"port {self._port} is served by a server that does not enforce the "
-                        "password - stop any manually started `opencode serve`"
+                        f"password - stop any manually started `opencode serve`{hint}"
                     )
             await asyncio.sleep(min(_HEALTH_POLL_S, max(0.0, remaining)))
 
@@ -377,7 +392,11 @@ class OpenCodeServerManager:
                         break
                     except _PortInUse as e:
                         self.fatal_error = str(e)
-                        logger.error("opencode serve cannot restart, giving up: %s", e)
+                        logger.error(
+                            "opencode serve cannot restart; giving up until the daemon is"
+                            " restarted: %s",
+                            e,
+                        )
                         await self._reap()
                         return
                     except _ServeFailed as e:

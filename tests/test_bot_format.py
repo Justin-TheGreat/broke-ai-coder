@@ -107,6 +107,16 @@ def test_finished_failures():
     assert "OpenCode server is not reachable." in down
     assert "managed OpenCode server is down: port 1 already in use" in down
     assert "managed" not in unavailable
+    n10 = fmt.format_event(
+        ev(
+            "task_finished",
+            status="FAILED",
+            error_class="OPENCODE_UNAVAILABLE",
+            detail="managed OpenCode server is down and will not restart by itself; fix the"
+            " cause, then restart the daemon: port 1 already in use",
+        )
+    )
+    assert "restart the daemon" in n10 and "port 1 already in use" in n10
     cancelled = fmt.format_event(ev("task_finished", status="CANCELLED", short_id="abcdef12"))
     assert cancelled == "🛑 Task abcdef12 cancelled"
 

@@ -209,3 +209,39 @@ def test_model_ids_skip_disabled(make_config):
         }
     )
     assert opencode_model_ids(disabled) == frozenset()
+
+
+async def test_auth_problem_callable_is_used_when_given(cfg, allowed, tmp_path):
+    called = []
+
+    async def problem():
+        called.append(1)
+        return "OpenCode has stored provider credentials for: openai. callable"
+
+    def h(req):
+        raise AssertionError("GET /config must not run after an auth problem")
+
+    out, detail = await check_server_config(
+        ENDPOINT,
+        allowed,
+        gateway_base_url=GATEWAY_URL,
+        timeout_s=1,
+        transport=httpx.MockTransport(h),
+        auth_problem=problem,
+    )
+    assert out == SmallModelCheck.UNSAFE and "callable" in detail and called == [1]
+
+
+async def test_auth_problem_callable_none_continues_to_config(cfg, allowed):
+    async def problem():
+        return None
+
+    out, _ = await check_server_config(
+        ENDPOINT,
+        allowed,
+        gateway_base_url=GATEWAY_URL,
+        timeout_s=1,
+        transport=httpx.MockTransport(respond(good_config(cfg))),
+        auth_problem=problem,
+    )
+    assert out == SmallModelCheck.OK

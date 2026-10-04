@@ -379,6 +379,8 @@ Before every task the daemon requires: no stored OpenCode credentials (`opencode
 
 `opencode.managed_server: false` (use `opencode.server_url` without a password) is for tests and debugging only and is unsupported for production.
 
+In production, `opencode serve` and every `opencode run` execute as the dedicated Linux user `opencode.os_user.name` (default `brokeoc`) through `sudo -n -u <name> -- <exact argv>`, with an exact environment allowlist and no shell. A startup isolation self-check fails closed (daemon exit 3) if that user could read the daemon's home, secrets, database or `/proc` environ, if WSL interop is enabled, or if the sudoers rule is missing. `opencode.os_user.mode: none` runs OpenCode as the daemon user and is for tests and dev only.
+
 OpenCode currently supports headless server mode and non-interactive `opencode run`, including `--model`, `--session`, and `--attach`. It also supports provider/model configuration and custom OpenAI-compatible providers. The implementation should prefer documented OpenCode interfaces rather than relying on private internals.
 
 The orchestrator owns:
@@ -447,7 +449,13 @@ Keys are held only by the controller process (environment variables or a local s
 
 Residual risks:
 
-- **R1.** The agent runs as the same OS user as the daemon and can read the secrets file and `/proc/<pid>/environ`. Fix: run OpenCode as a separate OS user (T072). The same exposure covers ambient cloud credentials reachable through the allowed `HOME`/`XDG_*` (for example `~/.aws`, gcloud ADC, Azure CLI, GitHub Copilot tokens): do not keep such credentials for that user until T072.
+- **R1.** Resolved by T072 when `opencode.os_user.mode: sudo` (the default): OpenCode runs as a dedicated unprivileged Linux user that cannot read the daemon user's home, the secrets file, `/proc/<daemon pid>/environ` or ambient cloud credentials in the daemon's home. Remaining residuals:
+  - **R1a.** Agent-written code in /workspace (git hooks, scripts, package files) runs as whoever executes it. Do not run git or tests there as the daemon user on unreviewed changes.
+  - **R1b (was N4).** The agent holds the gateway token and serve password. It can call allowlisted free models and reconfigure or kill its own serve, but it has no keys. The per-task GET /config and auth checks fail closed, and the crafted-server identity gap is unchanged.
+  - **R1c.** The daemon parses agent-writable project config files. Only key names are reported. A FIFO or huge file can stall or fail that check.
+  - **R1d.** WSL interop and /mnt must stay closed (the startup self-check enforces this).
+  - **R1e.** Mode `none` keeps the original exposure (same OS user); it is for tests and dev only.
+  - **R1f.** sudo logs each command line, including prompts, to the system journal.
 - **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
 - **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
 - **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.

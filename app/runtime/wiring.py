@@ -9,6 +9,7 @@ from app.db.usage import UsageEvent, UsageRepository
 from app.gateway.server import LlmGateway
 from app.opencode.endpoint import ServerEndpoint
 from app.opencode.executor import OpenCodeExecutor
+from app.opencode.os_user import OpenCodeLauncher, build_launcher
 from app.opencode.server import OpenCodeServerManager
 from app.orchestrator.orchestrator import Orchestrator
 from app.providers.http import HttpProviderAdapter
@@ -29,6 +30,7 @@ class Runtime:
     adapters: dict[str, HttpProviderAdapter]
     gateway: LlmGateway
     server_manager: OpenCodeServerManager | None
+    launcher: OpenCodeLauncher
 
 
 def build_runtime(
@@ -63,13 +65,16 @@ def build_runtime(
     )
     redactor.add(gateway.token)
 
+    launcher = build_launcher(config, environ=environ)
     manager: OpenCodeServerManager | None = None
     endpoint: Callable[[], ServerEndpoint]
     unavailable: Callable[[], str | None] | None = None
     # --once only starts, cleans up and stops: it never runs a task, so it needs neither the
     # managed serve (and the opencode binary) nor the gateway.
     if config.opencode.managed_server and not once:
-        manager = OpenCodeServerManager(config, gateway=gateway, redactor=redactor, environ=environ)
+        manager = OpenCodeServerManager(
+            config, gateway=gateway, redactor=redactor, environ=environ, launcher=launcher
+        )
         redactor.add(manager.password)
         manager.add_launch_listener(
             lambda: orch_holder["orchestrator"].invalidate_server_config_cache()
@@ -93,6 +98,7 @@ def build_runtime(
         gateway_base_url=lambda: gateway.base_url,
         environ=environ,
         unavailable_reason=unavailable,
+        launcher=launcher,
     )
     orchestrator = Orchestrator(
         config, executor=executor, adapters=adapters, environ=environ, cooldowns=cooldowns
@@ -106,14 +112,15 @@ def build_runtime(
         from app.bot.discord_frontend import create_frontend
 
         frontend = create_frontend(config, redactor=redactor, environ=environ)
-    services: list[RuntimeService] = [] if once else [gateway]
+    # The launcher's self-check runs before serve starts; its stop sweeps after serve stops.
+    services: list[RuntimeService] = [] if once else [gateway, launcher]
     if manager is not None:
         services.append(manager)
     controller = AgentController(
         config, frontend=frontend, orchestrator=orchestrator, services=services
     )
     holder["controller"] = controller
-    return Runtime(controller, orchestrator, executor, adapters, gateway, manager)
+    return Runtime(controller, orchestrator, executor, adapters, gateway, manager, launcher)
 
 
 async def close_runtime(rt: Runtime) -> None:

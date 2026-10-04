@@ -492,3 +492,36 @@ def test_gateway_small_model_must_be_allowlisted():
     data["routing"]["policies"]["g1"]["enabled"] = False
     with pytest.raises(ConfigError, match="small_model"):
         parse_config(data)
+
+
+# ---- opencode.os_user ---------------------------------------------------------------------
+
+
+def test_os_user_defaults_fail_closed():
+    u = parse_config({}).opencode.os_user
+    assert u.mode == "sudo" and u.name == "brokeoc"
+    assert u.protected_paths == ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]
+
+
+@pytest.mark.parametrize("name", ["root", "ALL", "Bad", "a b", "x,y", "", "1abc", "a" * 33])
+def test_os_user_name_rejected(name):
+    with pytest.raises(ConfigError):
+        parse_config({"opencode": {"os_user": {"name": name}}})
+
+
+@pytest.mark.parametrize("path", ["relative/x", "", "   ", "~x", "/a\x00b", "~"])
+def test_os_user_protected_path_rejected(path):
+    with pytest.raises(ConfigError):
+        parse_config({"opencode": {"os_user": {"protected_paths": [path]}}})
+
+
+def test_os_user_protected_paths_are_stripped():
+    cfg = parse_config({"opencode": {"os_user": {"protected_paths": [" /mnt/c ", "~/s"]}}})
+    assert cfg.opencode.os_user.protected_paths == ["/mnt/c", "~/s"]
+
+
+def test_os_user_bad_mode_and_unknown_key_rejected():
+    for bad in ({"mode": "root"}, {"mode": "SUDO"}, {"bogus": 1}):
+        with pytest.raises(ConfigError):
+            parse_config({"opencode": {"os_user": bad}})
+    assert parse_config({"opencode": {"os_user": {"mode": "none"}}}).opencode.os_user.mode == "none"

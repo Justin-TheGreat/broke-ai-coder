@@ -690,15 +690,15 @@ Acceptance:
 
 ## T072 — Least-privilege OS account
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T002
 
 Run the service under a non-admin account whenever practical.
 
-**Required to close residual risk R1:** run OpenCode as a separate OS user that cannot read the controller's secrets file or `/proc/<pid>/environ`. Planned for the next round.
+Done: OpenCode (`opencode serve` and every `opencode run --attach`) runs as the dedicated Linux user `opencode.os_user.name` (default `brokeoc`) through `sudo -n -u <name> -- <exact argv>` with a generated narrow sudoers rule (`python -m app --print-sudoers`; the four commands opencode, pkill, test, head, as that user only). The environment is an exact allowlist. Processes are killed across users with `pkill` (per-session and a sweep at start/stop/every serve reap, N1). A startup self-check (`python -m app --check-os-user`) fails closed (exit 3) when the user can read the daemon home, secrets, database or `/proc` environ, when WSL interop is enabled, or when sudo is not set up. N9 (no spawn while the managed serve is down) and N10 (restart instruction in the fatal message) are included. Mode `none` is for tests and dev only. Setup: docs/SETUP-discord-opencode.md Part C6.
 
 Acceptance:
-- Agent cannot modify unrelated system directories as part of normal execution.
+- The agent cannot read the secrets file, the daemon home or the daemon's `/proc/<pid>/environ`, and cannot write system directories.
 
 ## T073 — Log redaction
 
@@ -765,6 +765,20 @@ Also verify these gateway assumptions against real services and OpenCode (each o
 - G7. `GET /config` returns the merged config including `enabled_providers` and `provider`; `OPENCODE_CONFIG_CONTENT` outranks global and project files.
 - G8. `{env:` / `{file:` substitution also applies to `OPENCODE_CONFIG_CONTENT` (model ids with braces are rejected at config load).
 - Pinning only `model` and `small_model` is enough (agent models do not override `--model`); revisit per-agent pinning here.
+
+OS-user live checks (T072). These are the only things that cannot be verified offline:
+
+- L1. `visudo -c` passes; `sudo -n -u brokeoc -- opencode --version` needs no password; `sudo -n true` fails.
+- L2. env_keep passes exactly the list: `OPENCODE_SERVER_USERNAME=x FOO=y sudo -n -u brokeoc -- /usr/bin/head -c 4096 /proc/self/environ | tr '\0' '\n'` shows the kept vars and no FOO. The daemon's serve passes the anonymous-401 check and the gateway-only `GET /config`.
+- L3 (S1/S2). During a task, `ps -o pid,ppid,sid,user,cmd -u brokeoc` shows opencode's sid == the sudo pid. After /cancel and a run timeout, no `opencode run` is left. After daemon stop, `pgrep -u brokeoc` is empty (N1).
+- L4. As brokeoc (`sudo -u brokeoc bash`, admin password), these must all be denied: `cat ~<you>/.config/broke-ai-coder/secrets.env`, `cat /proc/<daemon pid>/environ`, `ls ~<you>`, `ls /mnt/c`, and running any `.exe`.
+- L5. Agent-created files in /workspace are group brokeai with g+rw (default ACL). The daemon user's `git status` works, and the agent can commit (safe.directory).
+- L6. A planted entry in brokeoc's auth.json makes startup fail with the stored-credentials message, and per-task the task fails `OPENCODE_UNSAFE_CONFIG`.
+- L7 (W1). After the wsl.conf change and `wsl --shutdown`, no enabled `WSLInterop*` entry remains, including with systemd on.
+- L8. sudo journal entries contain prompts (documented, R1f).
+- L9. OpenCode's shell tool works with SHELL=/bin/bash from passwd. OpenCode's provider package download into /home/brokeoc/.cache works.
+- L10 (S4/B8). serve's cwd is server_directory and run's cwd is the project directory.
+- L11 (S5). The auth.json path under sudo env_reset is the default XDG path.
 
 Test flow:
 

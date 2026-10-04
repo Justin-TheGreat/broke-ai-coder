@@ -40,7 +40,7 @@ def _killpg(pid: int, sig: int) -> None:
         os.killpg(pid, sig)
 
 
-async def _wait(proc: asyncio.subprocess.Process, timeout: float) -> None:
+async def wait_quiet(proc: asyncio.subprocess.Process, timeout: float) -> None:
     with contextlib.suppress(TimeoutError, Exception):
         await asyncio.wait_for(proc.wait(), timeout=timeout)
 
@@ -67,12 +67,12 @@ async def _kill_posix(proc: asyncio.subprocess.Process, grace_s: float) -> None:
         _killpg(proc.pid, signal.SIGKILL)  # reap orphans of an already-exited root
         return
     _killpg(proc.pid, signal.SIGTERM)
-    await _wait(proc, grace_s)
+    await wait_quiet(proc, grace_s)
     _killpg(proc.pid, signal.SIGKILL)
     if proc.returncode is None:
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
-        await _wait(proc, grace_s)
+        await wait_quiet(proc, grace_s)
 
 
 async def _kill_windows(proc: asyncio.subprocess.Process, grace_s: float) -> None:
@@ -99,4 +99,4 @@ async def _kill_windows(proc: asyncio.subprocess.Process, grace_s: float) -> Non
     if proc.returncode is None:
         with contextlib.suppress(ProcessLookupError, OSError):
             proc.kill()
-    await _wait(proc, grace_s)
+    await wait_quiet(proc, grace_s)

@@ -41,12 +41,16 @@ opencode:
   server_url: http://127.0.0.1:4096   # only used when managed_server is false (tests/debug)
   managed_server: true     # false = tests/debug only, unsupported for production
   server_port: 4096        # 0 = pick a free port on each (re)start
-  server_directory: data/opencode-server   # cwd of `opencode serve`; created by the daemon
+  server_directory: /var/lib/broke-ai-coder/opencode-server   # cwd of `opencode serve`; must be writable by os_user, outside your home
   server_start_timeout_s: 30
   server_restart_max_backoff_s: 60   # crash restarts back off 1, 2, 4 ... up to this
-  env_passthrough: []      # extra env var names OpenCode may see; key/token-like names are rejected
+  env_passthrough: []      # must stay empty with os_user sudo (sudo resets the environment); key/token-like names are rejected
   working_directory: /workspace
-  command: [opencode]            # e.g. ["node", "C:/path/opencode/bin/opencode"]; .cmd/.bat refused
+  command: [/usr/local/bin/opencode]   # absolute path required with os_user sudo; copied there in setup Part D1
+  os_user:
+    mode: sudo          # none = OpenCode runs as the daemon user: tests/Windows dev only, unsupported for production (R1)
+    name: brokeoc       # dedicated user, see docs/SETUP-discord-opencode.md Part C6
+    protected_paths: ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]  # must be unreadable by os_user
   # projects: {myproj: /workspace/myproj}   # extra project names for /code project:<name>
   run_timeout_s: 1800
   kill_grace_s: 5
