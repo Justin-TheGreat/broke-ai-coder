@@ -13,6 +13,7 @@ ENV_NAME_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
 _CFG = ConfigDict(extra="forbid", frozen=True)
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_OPENCODE_PROVIDERS = frozenset({"openrouter", "google", "groq"})
 
 PAID_NOT_SUPPORTED = "paid inference is not supported: this project is free-only"
 _PAID_ROUTING_KEYS = (
@@ -250,9 +251,13 @@ class OpenCodeConfig(BaseModel):
             k, val = key.strip(), value.strip()
             if not k or not val:
                 raise ValueError("provider_map keys and values must be non-empty")
-            if "/" in val:
-                raise ValueError("provider_map values must not contain '/'")
+            if val not in _OPENCODE_PROVIDERS:
+                raise ValueError(
+                    f"provider_map values must be one of {sorted(_OPENCODE_PROVIDERS)}"
+                )
             out[k] = val
+        if len(set(out.values())) != len(out):
+            raise ValueError("provider_map must be one-to-one (no two keys may share a value)")
         return out
 
     @field_validator("projects")
@@ -323,7 +328,7 @@ class AppConfig(BaseModel):
         for pid, pol in self.routing.policies.items():
             if pol.provider not in self.providers:
                 raise ValueError(f"policy {pid!r} references undefined provider {pol.provider!r}")
-            if pol.provider == "openrouter":
+            if self.opencode.provider_map.get(pol.provider, pol.provider) == "openrouter":
                 for m in pol.model_order:
                     if not is_free_openrouter_model(m):
                         raise ValueError(

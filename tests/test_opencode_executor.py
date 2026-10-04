@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 from app.config.models import OpenCodeConfig
@@ -26,7 +27,12 @@ def make_exec(tmp_path, scenarios="success", *, redactor=None, env=None, **cfg):
     }
     extra.update(env or {})
     config = OpenCodeConfig(command=[sys.executable, FAKE], **cfg)
-    return OpenCodeExecutor(config, redactor=redactor, extra_env=extra)
+    return OpenCodeExecutor(
+        config,
+        redactor=redactor,
+        extra_env=extra,
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+    )
 
 
 async def run(ex, tmp_path, *, prompt="do it", session_id=None, cancel=None, on_event=None):

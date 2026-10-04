@@ -47,6 +47,7 @@ None blocking. Every uncertain external detail is listed under Assumptions (§0.
 | B8 | With `--attach`, the process cwd selects the project directory, so the executor sets `cwd` to the project directory. | `executor.py` |
 | B9 | `opencode run` reads piped stdin when stdin is not a TTY, so stdin is always `DEVNULL`. | `executor.py` |
 | B10 | Each `step_finish` event is one LLM request. For quota estimates, an attempt counts `max(steps, 1)` requests. | orchestrator |
+| B11 | `POST {server_url}/session/{id}/abort` stops the server-side agent loop of that OpenCode session. With `--attach` the loop runs in the server, so killing the CLI client is not enough. The executor sends it best effort (never raises, class-name-only logging, session id validated with `fullmatch` before use in the URL) on cancel, timeout and outer cancellation, once a session id is known. Gap: before the first event with a session id, nothing can be aborted. | `app/opencode/abort.py`, `executor.py` |
 
 ### 0.3 Decisions
 1. **Empty Discord allowlists mean DENY ALL.** A command is authorized only when the user id is in `allowed_user_ids`, the guild id is in `allowed_guild_ids` and the channel id is in `allowed_channel_ids`. Any empty list denies everyone. DMs (guild None) are always denied. Auth runs before anything else, including the defer.

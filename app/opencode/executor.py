@@ -8,6 +8,13 @@ B5. OpenCode's model argument is ``<opencode_provider>/<model>``. OpenCode split
     FIRST ``/``, so ``openrouter`` + ``openrouter/free`` becomes ``openrouter/openrouter/free``.
 B8. With ``--attach`` the process cwd selects the project directory, so cwd = project dir.
 B9. ``opencode run`` reads piped stdin when stdin is not a TTY, so stdin is always DEVNULL.
+B11. On cancel, timeout or outer cancellation the executor also sends a best-effort
+    ``POST {server_url}/session/{id}/abort`` (app/opencode/abort.py), because killing the
+    ``--attach`` client does not stop the server-side session.
+
+Known gap: for a brand-new session (no ``--session`` passed), no id is known until the first
+event carrying one has been read, so before that the server-side session cannot be aborted
+and may keep running after a kill. A resumed session is aborted using the id passed in.
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ from typing import Any
 import httpx
 
 from app.config.models import OpenCodeConfig
+from app.opencode.abort import abort_opencode_session
 from app.opencode.events import SESSION_ID_RE, OpenCodeError, classify_text, parse_event_line
 from app.opencode.health import check_opencode_health
 from app.opencode.process import kill_process_tree
@@ -133,6 +141,14 @@ class OpenCodeExecutor:
 
     async def aclose(self) -> None:
         return None
+
+    async def _abort_session(self, session_id: str | None) -> None:
+        await abort_opencode_session(
+            self._config.server_url,
+            session_id,
+            timeout_s=self._config.health_timeout_s,
+            transport=self._transport,
+        )
 
     # ---- helpers ---------------------------------------------------
 
@@ -346,10 +362,12 @@ class OpenCodeExecutor:
                 kind = "timeout"
             if kind != "exit":
                 await kill_process_tree(proc, grace_s=grace)
+                await self._abort_session(state.session_id or session_id)
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(drain, timeout=grace + 5)
         except asyncio.CancelledError:
             await asyncio.shield(kill_process_tree(proc, grace_s=grace))
+            await asyncio.shield(self._abort_session(state.session_id or session_id))
             raise
         finally:
             cancel_waiter.cancel()

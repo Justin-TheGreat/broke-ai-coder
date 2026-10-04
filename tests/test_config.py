@@ -327,3 +327,48 @@ def test_http_base_url_only_for_localhost():
 def test_resolve_secret_strips():
     assert resolve_secret("K", {"K": "  abc "}) == "abc"
     assert resolve_secret("K", {"K": "   "}) is None
+
+
+def _groq_policy_config(model, provider_map):
+    return {
+        "providers": {"groq": {"api_key_env": "GROQ_API_KEY"}},
+        "routing": {
+            "provider_order": ["g"],
+            "policies": {"g": {"provider": "groq", "model_order": [model]}},
+        },
+        "opencode": {"provider_map": provider_map},
+    }
+
+
+def test_provider_map_to_openrouter_requires_free_model():
+    cfg = _groq_policy_config("openai/gpt-oss-120b", {"groq": "openrouter"})
+    with pytest.raises(ConfigError, match="free"):
+        parse_config(cfg)
+
+
+def test_provider_map_to_openrouter_allows_free_model():
+    cfg = _groq_policy_config("qwen/qwen3-coder:free", {"groq": "openrouter"})
+    assert parse_config(cfg).opencode.provider_map == {"groq": "openrouter"}
+
+
+def test_openrouter_policy_remapped_away_is_not_free_checked():
+    cfg = {
+        "providers": {"openrouter": {"api_key_env": "K"}},
+        "routing": {
+            "provider_order": ["o"],
+            "policies": {"o": {"provider": "openrouter", "model_order": ["x/paid"]}},
+        },
+        "opencode": {"provider_map": {"openrouter": "groq"}},
+    }
+    assert parse_config(cfg)
+
+
+@pytest.mark.parametrize("value", ["anthropic", "openai", "opencode", "OpenRouter", "x"])
+def test_provider_map_value_must_be_known_opencode_provider(value):
+    with pytest.raises(ConfigError):
+        parse_config({"opencode": {"provider_map": {"groq": value}}})
+
+
+def test_provider_map_must_be_one_to_one():
+    with pytest.raises(ConfigError, match="one-to-one"):
+        parse_config({"opencode": {"provider_map": {"a": "groq", "b": "groq"}}})

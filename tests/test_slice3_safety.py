@@ -426,23 +426,92 @@ async def test_cancel_between_attempts_stops_before_next_candidate(tmp_path, mak
         assert len(ex.calls) == 1
 
 
-async def test_executor_exception_does_not_wedge_worker(tmp_path, make_config):
+def _finished(rec_events, task_id):
+    return [e for e in rec_events.events if e.name == "task_finished" and e.task_id == task_id]
+
+
+def _assert_failed_unknown(c, rec_events, task_id):
+    t = get(c, task_id)
+    assert t.status == TaskStatus.FAILED
+    assert t.error_class == "UNKNOWN"
+    fin = _finished(rec_events, task_id)
+    assert len(fin) == 1
+    assert fin[0].fields["status"] == "FAILED"
+    assert fin[0].fields["error_class"] == "UNKNOWN"
+    assert fin[0].fields["session_short"] is not None
+    assert "Outcome unknown; not replayed" in format_event(fin[0], redactor=None)
+
+
+async def test_executor_exception_does_not_wedge_worker(tmp_path, make_config, caplog):
     async def boom(**kw):
-        raise RuntimeError("executor exploded")
+        raise RuntimeError("executor exploded secret-msg")
 
     cfg, ex, orch = build(tmp_path, make_config, [boom, ok()])
-    async with started(cfg, orch) as c:
+    rec_events = Recorder()
+    with caplog.at_level(logging.DEBUG):
+        async with started(cfg, orch, rec_events) as c:
+            first = submit(c, "one")
+            second = submit(c, "two")
+            await drain(c)
+            # The worker survived; the second task ran and finished.
+            assert get(c, second.id).status == TaskStatus.SUCCEEDED
+            _assert_failed_unknown(c, rec_events, first.id)
+            assert len(ex.calls) == 2  # no replay, no fallback for the failed task
+            atts = FallbackAttemptRepository(c.conn).list_for_task(first.id)
+            assert [(a.status.value, a.error_class) for a in atts] == [("FAILED", "UNKNOWN")]
+            assert atts[0].finished_at is not None
+            assert orch.running is None
+    assert "RuntimeError" in caplog.text
+    assert "secret-msg" not in caplog.text and "exploded" not in caplog.text
+
+
+async def test_routing_exception_marks_task_failed_unknown(tmp_path, make_config, monkeypatch):
+    import app.orchestrator.orchestrator as om
+
+    calls = {"n": 0}
+    real = om.route_with_state
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("router exploded")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(om, "route_with_state", flaky)
+    cfg, ex, orch = build(tmp_path, make_config, [ok()])
+    rec_events = Recorder()
+    async with started(cfg, orch, rec_events) as c:
         first = submit(c, "one")
         second = submit(c, "two")
         await drain(c)
-        # The worker survived; the second task ran and finished.
+        _assert_failed_unknown(c, rec_events, first.id)
         assert get(c, second.id).status == TaskStatus.SUCCEEDED
-        assert get(c, first.id).status in (
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.RUNNING,
-        )
+        assert len(ex.calls) == 1
         assert orch.running is None
+
+
+async def test_db_exception_marks_task_failed_unknown(tmp_path, make_config, monkeypatch):
+    import sqlite3
+
+    real = FallbackAttemptRepository.start
+    calls = {"n": 0}
+
+    def flaky(self, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(self, **kw)
+
+    monkeypatch.setattr(FallbackAttemptRepository, "start", flaky)
+    cfg, ex, orch = build(tmp_path, make_config, [ok()])
+    rec_events = Recorder()
+    async with started(cfg, orch, rec_events) as c:
+        first = submit(c, "one")
+        second = submit(c, "two")
+        await drain(c)
+        _assert_failed_unknown(c, rec_events, first.id)
+        assert get(c, second.id).status == TaskStatus.SUCCEEDED
+        assert len(ex.calls) == 1
 
 
 # --------------------------------------------------------------------------
@@ -614,7 +683,12 @@ def _exec(tmp_path, scenarios="success", *, redactor=None, env=None, **cfg):
         **(env or {}),
     }
     config = OpenCodeConfig(command=[sys.executable, FAKE], **cfg)
-    return OpenCodeExecutor(config, redactor=redactor, extra_env=extra)
+    return OpenCodeExecutor(
+        config,
+        redactor=redactor,
+        extra_env=extra,
+        transport=httpx.MockTransport(lambda r: httpx.Response(200)),
+    )
 
 
 async def _run(ex, tmp_path, *, prompt="do it", cancel=None):

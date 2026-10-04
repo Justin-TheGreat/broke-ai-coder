@@ -125,6 +125,9 @@ def main() -> int:
         session_event()
         time.sleep(120)
         return 0
+    if scenario == "hang_no_session":
+        time.sleep(120)
+        return 0
     if scenario == "spawn_child":
         hb = os.environ["FAKE_OC_HEARTBEAT"]
         code = (

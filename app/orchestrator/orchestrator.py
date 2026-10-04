@@ -285,11 +285,47 @@ class Orchestrator:
             except (InvalidTransition, ConcurrentTransition, TaskNotFound, sqlite3.Error):
                 pass
             raise
+        except Exception as e:
+            # Outcome unknown: log the class name only; never replay and never fall back.
+            logger.error("task handler failed: %s", type(e).__name__)
+            self._fail_unknown(controller, record.id)
         finally:
             self._cancel_event = None
             self._current_task_id = None
             self._running = None
             self._finalize_session(conn, record.id)
+
+    def _fail_unknown(self, controller: AgentController, task_id: str) -> None:
+        """Best effort: mark the task FAILED/UNKNOWN, close open attempts, notify the user."""
+        conn = controller.conn
+        assert conn is not None
+        unknown = ErrorClass.UNKNOWN.value
+        try:
+            attempts = FallbackAttemptRepository(conn)
+            for att in attempts.list_for_task(task_id):
+                if att.status == AttemptStatus.RUNNING:
+                    attempts.finish(
+                        att.id,
+                        status=AttemptStatus.FAILED,
+                        error_class=unknown,
+                        http_status=None,
+                        retry_after_ms=None,
+                        now=self._clock(),
+                    )
+        except sqlite3.Error:
+            pass
+        try:
+            tasks = TaskRepository(conn)
+            current = tasks.get(task_id)
+            session_short = (
+                current.session_id[:8] if current and current.session_id is not None else None
+            )
+            done = tasks.transition(
+                task_id, TaskStatus.FAILED, now=self._clock(), error_class=unknown
+            )
+            self._emit_finished(controller, done, session_short=session_short, error_class=unknown)
+        except (InvalidTransition, ConcurrentTransition, TaskNotFound, sqlite3.Error):
+            pass
 
     def _finalize_session(self, conn: sqlite3.Connection, task_id: str) -> None:
         try:
