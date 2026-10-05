@@ -50,7 +50,21 @@ class FakeHostProbe:
         self.users: dict[str, UserInfo] = {"justin": DAEMON, "brokeoc": OC}
         self.groups: frozenset[str] = frozenset({"brokeoc", "brokeai"})
         self.interop = False
+        self.timeout_pid = 9999
         self.dirs: set[str] = set()
+        # raw /proc/<pid>/stat lines of the OpenCode user's processes: (pid, stat text)
+        self.oc_stats: list[tuple[int, str]] = []
+        self.proc_error = False
+
+    def user_processes(self, uid: int) -> list[tuple[int, int]]:
+        if self.proc_error:
+            raise OSError("proc exploded")
+        out = []
+        for pid, text in self.oc_stats:
+            sid = ou.parse_stat_session(text)
+            if sid is not None:
+                out.append((pid, sid))
+        return out
 
     def platform(self) -> str:
         return self._platform
@@ -79,13 +93,16 @@ class FakeHostProbe:
     def killpg(self, pgid: int, sig: str) -> None:
         self.killpgs.append((pgid, sig))
 
-    async def run(self, argv: Sequence[str], *, timeout_s: float) -> ProbeResult:
+    async def run(self, argv: Sequence[str], *, timeout_s: float, on_timeout=None) -> ProbeResult:
         self.runs.append(list(argv))
         if self.raise_on_run:
             raise RuntimeError("probe exploded")
         key = tuple(argv)
         if key in self.results:
-            return self.results[key]
+            result = self.results[key]
+            if result.returncode is None and on_timeout is not None:
+                await on_timeout(self.timeout_pid)  # what SystemHostProbe does on a timeout
+            return result
         inner = list(argv[5:])  # after sudo -n -u name --
         if inner and inner[0] == TEST:
             flag, path = inner[1], inner[2]
@@ -145,7 +162,6 @@ EXPECTED_SUDOERS = """\
 Defaults>brokeoc env_reset
 Defaults>brokeoc env_keep = "LANG OPENCODE_CONFIG_CONTENT \
 OPENCODE_SERVER_PASSWORD OPENCODE_SERVER_USERNAME"
-Defaults>brokeoc !use_pty
 Defaults>brokeoc !requiretty
 justin ALL=(brokeoc) NOPASSWD: /usr/local/bin/opencode, /usr/bin/pkill, /usr/bin/test, /usr/bin/head
 """
@@ -403,7 +419,8 @@ async def test_self_check_fails_closed(make_config, case, phrase):
     msg = str(ei.value)
     assert msg.startswith(ISOLATION_FAILED)
     assert phrase in msg
-    assert probe.pkills == []  # a failing check never sweeps
+    # a failing check never sweeps the user; only a timed-out probe is reaped by its session
+    assert all("-U" not in k for k in probe.pkills)
 
 
 async def test_version_failure_variants(make_config):
@@ -534,9 +551,9 @@ async def test_kill_tree_running_proc_exact_sequence(make_config):
     events: list[tuple] = []
     orig_run, orig_killpg = probe.run, probe.killpg
 
-    async def run(argv, *, timeout_s):
+    async def run(argv, *, timeout_s, on_timeout=None):
         events.append(("run", tuple(argv[5:])))
-        return await orig_run(argv, timeout_s=timeout_s)
+        return await orig_run(argv, timeout_s=timeout_s, on_timeout=on_timeout)
 
     def killpg(pgid, sig):
         events.append(("killpg", pgid, sig))
@@ -778,3 +795,230 @@ async def test_system_probe_timeout_kills_and_returns_none(monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
     r = await ou.SystemHostProbe().run(["a"], timeout_s=0.05)
     assert r.returncode is None and P.killed
+
+
+# ---- review fixes: R1 (no use_pty negation), R4 (binfmt fail closed), S1, S3, S4 -----------
+
+
+def test_sudoers_never_touches_use_pty():
+    assert "use_pty" not in render_sudoers("justin", "brokeoc", EXE)
+
+
+@pytest.mark.parametrize("status", [None, "", "garbage\n"])
+def test_interop_fails_closed_when_binfmt_not_mounted(tmp_path, monkeypatch, status):
+    d = tmp_path / "binfmt"
+    d.mkdir()  # an unmounted binfmt_misc is an empty directory: no status file, no entries
+    if status is not None:
+        (d / "status").write_text(status)
+    monkeypatch.setattr(ou, "_BINFMT_DIR", str(d))
+    assert ou.SystemHostProbe().interop_enabled() is True
+
+
+def test_interop_missing_binfmt_dir_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(ou, "_BINFMT_DIR", str(tmp_path / "nope"))
+    assert ou.SystemHostProbe().interop_enabled() is True
+
+
+def test_interop_mounted_and_disabled_is_ok(tmp_path, monkeypatch):
+    d = tmp_path / "binfmt"
+    d.mkdir()
+    (d / "status").write_text("enabled\n")
+    (d / "WSLInterop").write_text("disabled\n")
+    monkeypatch.setattr(ou, "_BINFMT_DIR", str(d))
+    assert ou.SystemHostProbe().interop_enabled() is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain text", "plain text"),
+        ("a\x1b]52;c;SGVsbG8=\x07b", "ab"),  # OSC 52 clipboard write, BEL terminated
+        ("a\x1b]0;title\x1b\\b", "ab"),  # OSC, ST terminated
+        ("a\x1b[31mred\x1b[0m", "ared"),  # CSI
+        ("a\x1b]52;c;unterminated", "a"),
+        ("a\x00b\x07c\x08d\x7fe", "abcde"),
+        ("a\x85b\x9bc\x9d52;x", "abc52;x"),  # C1
+        ("x\ty", "x\ty"),  # TAB survives
+        ("l1\r\nl2\nl3", "l1  l2 l3"),  # no log-line injection
+        ("\x1bc reset", "reset"),
+    ],
+)
+def test_strip_control(raw, expected):
+    assert ou.strip_control(raw).strip() == expected.strip()
+    assert "\x1b" not in ou.strip_control(raw)
+
+
+async def test_probe_timeout_kills_brokeoc_side_process_and_fails_closed(make_config):
+    sl, probe, _ = launcher(make_config)
+    path = "/home/brokeoc/.local/share/opencode/auth.json"
+    probe.set([TEST, "-e", path], ProbeResult(0))
+    probe.set([HEAD, "-c", "1048577", "--", path], ProbeResult(None))  # FIFO: head hangs
+    probe.timeout_pid = 31337
+    problem = await sl.auth_store_problem()
+    assert problem is not None  # still fails closed
+    assert [PKILL, "-KILL", "-s", "31337"] in probe.pkills
+
+
+async def test_exists_probe_timeout_also_kills_by_session(make_config):
+    sl, probe, _ = launcher(make_config)
+    path = "/home/brokeoc/.local/share/opencode/auth.json"
+    probe.set([TEST, "-e", path], ProbeResult(None))
+    probe.timeout_pid = 555
+    assert await sl.auth_store_problem() is not None
+    assert probe.pkills == [[PKILL, "-KILL", "-s", "555"]]
+
+
+async def test_no_extra_pkill_when_probes_succeed(make_config):
+    sl, probe, _ = launcher(make_config)
+    await sl.self_check()
+    assert probe.pkills == []
+
+
+async def test_pkill_itself_never_recurses_on_timeout(make_config):
+    sl, probe, _ = launcher(make_config)
+    probe.set([PKILL, "-KILL", "-s", "9999"], ProbeResult(None))
+    probe.set([TEST, "-e", "/home/brokeoc/.local/share/opencode/auth.json"], ProbeResult(None))
+    await sl.auth_store_problem()
+    assert probe.pkills == [[PKILL, "-KILL", "-s", "9999"]]
+
+
+async def test_system_probe_timeout_calls_on_timeout_with_session_pid(monkeypatch):
+    class P:
+        pid = 4321
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(3600)
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    async def fake(*argv, **kw):
+        return P()
+
+    got: list[int] = []
+
+    async def on_timeout(pid):
+        got.append(pid)
+        raise RuntimeError("callback failure must not escape")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+    r = await ou.SystemHostProbe().run(["a"], timeout_s=0.05, on_timeout=on_timeout)
+    assert r.returncode is None and got == [4321]
+
+
+def stat_line(pid: int, comm: str, sid: int, state: str = "S") -> str:
+    # pid (comm) state ppid pgrp session tty_nr ...
+    return f"{pid} ({comm}) {state} 1 {pid} {sid} 0 -1 4194560 100 0 0 0"
+
+
+async def test_sweep_stray_spares_the_serve_session(make_config):
+    sl, probe, _ = launcher(make_config)
+    probe.oc_stats = [
+        (4000, stat_line(4000, "opencode", 4000)),
+        (4001, stat_line(4001, "bun", 4000)),
+        (5000, stat_line(5000, "sleep", 5000)),
+        (5001, stat_line(5001, "my evil) S 1 2 3 4 (x", 6000)),
+        (5002, stat_line(5002, "sleep", 5000)),
+    ]
+    sl.register_serve(4000)
+    await sl.sweep_stray()
+    assert probe.pkills == [[PKILL, "-KILL", "-U", "brokeoc", "-s", "5000,6000"]]
+    assert "-v" not in probe.pkills[0]
+
+
+async def test_sweep_stray_noop_when_only_serve_session_remains(make_config):
+    sl, probe, _ = launcher(make_config)
+    probe.oc_stats = [(4000, stat_line(4000, "opencode", 4000))]
+    sl.register_serve(4000)
+    await sl.sweep_stray()
+    assert probe.runs == []
+
+
+async def test_sweep_stray_survives_proc_failure(make_config):
+    sl, probe, _ = launcher(make_config)
+    probe.proc_error = True
+    sl.register_serve(4000)
+    await sl.sweep_stray()
+    assert probe.runs == []
+
+
+def test_parse_stat_session_uses_last_paren():
+    assert ou.parse_stat_session(stat_line(9, "a b", 77)) == 77
+    assert ou.parse_stat_session(stat_line(9, ") S 1 2 3 (", 77)) == 77
+    assert ou.parse_stat_session(stat_line(9, "x) (y", 77).encode()) == 77
+    assert ou.parse_stat_session("garbage") is None
+    assert ou.parse_stat_session("1 (x) S 1") is None
+    assert ou.parse_stat_session("1 (x) S 1 2 notint") is None
+
+
+# procps-ng pkill options: -v exists only for pgrep, so it must never be produced.
+PKILL_FLAG_ALLOWLIST = {
+    "-KILL",
+    "-TERM",
+    "-0",
+    "-U",
+    "-s",
+    "-u",
+    "-P",
+    "-g",
+    "-x",
+    "-f",
+    "--signal",
+}
+
+
+def pkill_flags_invalid(argv: list[str]) -> list[str]:
+    bad = []
+    for arg in argv:
+        if arg.startswith("-") and arg not in PKILL_FLAG_ALLOWLIST:
+            bad.append(arg)
+    return bad
+
+
+def test_flag_checker_rejects_v():
+    assert pkill_flags_invalid(["-KILL", "-v", "-U", "x"]) == ["-v"]
+    assert pkill_flags_invalid(["-KILL", "-U", "x", "-s", "1,2"]) == []
+
+
+async def test_every_pkill_argv_uses_only_valid_procps_flags(make_config):
+    sl, probe, _ = launcher(make_config)
+    probe.oc_stats = [
+        (4000, stat_line(4000, "opencode", 4000)),
+        (5000, stat_line(5000, "sleep", 5000)),
+    ]
+    sl.register_serve(4000)
+    await sl.sweep_stray()
+    await sl.sweep()
+    await sl.kill_tree(FakeProc(777, returncode=None), grace_s=0.01)
+    await sl.kill_tree(FakeProc(778, returncode=1), grace_s=0.01)
+    await sl._reap_probe(9999)
+    assert len(probe.pkills) >= 6
+    for argv in probe.pkills:
+        assert argv[0] == PKILL
+        assert pkill_flags_invalid(argv[1:]) == [], argv
+
+
+async def test_sweep_stray_noop_without_registered_serve(make_config):
+    sl, probe, _ = launcher(make_config)
+    await sl.sweep_stray()
+    sl.register_serve(4000)
+    sl.register_serve(None)
+    await sl.sweep_stray()
+    assert probe.runs == []
+
+
+async def test_sweep_stray_never_raises(make_config):
+    sl, probe, _ = launcher(make_config)
+    sl.register_serve(4000)
+    probe.raise_on_run = True
+    await sl.sweep_stray()
+
+
+async def test_direct_launcher_sweep_stray_noop():
+    dl = ou.DirectLauncher()
+    dl.register_serve(5)
+    await dl.sweep_stray()

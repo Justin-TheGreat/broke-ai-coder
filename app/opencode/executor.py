@@ -440,6 +440,9 @@ class OpenCodeExecutor:
             if not drain.done():
                 drain.cancel()
             await asyncio.gather(cancel_waiter, drain, return_exceptions=True)
+            # The run is over (finished, timed out or killed): reap what it left behind.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(self._launcher.sweep_stray())
 
         exit_code = proc.returncode
         if kind == "cancel":

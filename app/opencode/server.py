@@ -40,7 +40,7 @@ import httpx
 from app.config.models import GATEWAY_PROVIDER_ID, AppConfig
 from app.opencode.endpoint import ServerEndpoint
 from app.opencode.health import check_opencode_health
-from app.opencode.os_user import DirectLauncher, OpenCodeLauncher
+from app.opencode.os_user import DirectLauncher, OpenCodeLauncher, strip_control
 from app.opencode.process import spawn_kwargs
 from app.redaction import SecretRedactor
 from app.runtime.interfaces import StartupError
@@ -222,7 +222,8 @@ class OpenCodeServerManager:
     # ---- internals -------------------------------------------------
 
     def _stderr_detail(self) -> str:
-        text = bytes(self._stderr).decode("utf-8", errors="replace").strip()
+        # The OpenCode user controls these bytes: no terminal control sequences in our log.
+        text = strip_control(bytes(self._stderr).decode("utf-8", errors="replace")).strip()
         if self._redactor is not None:
             text = self._redactor.redact(text)
         return text
@@ -246,6 +247,7 @@ class OpenCodeServerManager:
     async def _reap(self) -> None:
         self._ready = False
         proc, self._proc = self._proc, None
+        self._launcher.register_serve(None)
         if proc is not None:
             await self._launcher.kill_tree(proc, grace_s=self._oc.kill_grace_s)
         drain, self._drain = self._drain, None
@@ -309,6 +311,7 @@ class OpenCodeServerManager:
         except OSError as e:
             raise _ServeFailed(type(e).__name__) from None
         self._proc = proc
+        self._launcher.register_serve(proc.pid)  # its session id: run sweeps must spare it
         self._drain = asyncio.create_task(self._drain_stderr(proc), name="opencode-serve-stderr")
         return proc
 

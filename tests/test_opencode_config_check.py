@@ -184,7 +184,7 @@ async def test_stored_credentials_are_unsafe_without_contacting_server(cfg, allo
 
     out, detail = await probe(h, allowed, environ={"XDG_DATA_HOME": str(tmp_path)})
     assert out == SmallModelCheck.UNSAFE
-    assert "groq" in detail and "opencode auth logout" in detail
+    assert "groq" in detail and "rm -f" in detail
     assert "sk-leak-123" not in detail
     assert calls == []
 

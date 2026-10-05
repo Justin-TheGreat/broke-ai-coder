@@ -134,7 +134,7 @@ def test_unsafe_config_text_guides_user_and_leaks_nothing():
         redactor=SecretRedactor([SECRET]),
     )
     assert out is not None
-    assert "gateway" in out and "opencode auth logout" in out
+    assert "gateway" in out and "auth.json" in out
     assert "not reachable" not in out
     assert SECRET not in out
 

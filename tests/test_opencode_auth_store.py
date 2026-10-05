@@ -40,10 +40,9 @@ def test_keys_sorted_and_values_never_returned(tmp_path):
     write(tmp_path, json.dumps({"openai": {"key": "sk-SECRET-1"}, "anthropic": {"key": "sk-2"}}))
     assert stored_credential_providers(env(tmp_path)) == ["anthropic", "openai"]
     msg = auth_store_problem(env(tmp_path))
-    assert msg == (
-        "OpenCode has stored provider credentials for: anthropic, openai. "
-        "Run `opencode auth logout` for each; OpenCode must hold no provider keys."
-    )
+    assert msg.startswith("OpenCode has stored provider credentials for: anthropic, openai. ")
+    assert "rm -f " in msg and "auth.json" in msg  # delete the store; never `auth logout`
+    assert msg.endswith("OpenCode must hold no provider keys.")
     assert "SECRET" not in msg and "sk-2" not in msg
 
 

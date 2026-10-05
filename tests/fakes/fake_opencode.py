@@ -14,6 +14,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 SID = "ses_fake1"
 
 
+def max_lifetime_s() -> float:
+    """Hard cap so a hard-killed test run cannot leave fakes running forever."""
+    return float(os.environ.get("FAKE_OC_MAX_LIFETIME_S", "180"))
+
+
 def emit(obj: object) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -152,6 +157,13 @@ def serve(argv: list[str]) -> int:
             os._exit(7)
 
         threading.Thread(target=crash, daemon=True).start()
+    cap = max_lifetime_s()
+
+    def expire() -> None:
+        time.sleep(cap)
+        os._exit(0)
+
+    threading.Thread(target=expire, daemon=True).start()
     server.serve_forever()
     return 0
 
@@ -220,7 +232,11 @@ def main() -> int:
     if scenario == "spawn_child":
         hb = os.environ["FAKE_OC_HEARTBEAT"]
         code = (
-            f"import time\nwhile True:\n    open({hb!r}, 'a').write('x\\n')\n    time.sleep(0.1)\n"
+            "import time\n"
+            f"end = time.time() + {max_lifetime_s()!r}\n"
+            "while time.time() < end:\n"
+            f"    open({hb!r}, 'a').write('x\\n')\n"
+            "    time.sleep(0.1)\n"
         )
         subprocess.Popen(
             [sys.executable, "-c", code],
@@ -229,7 +245,7 @@ def main() -> int:
             stderr=subprocess.DEVNULL,
         )
         session_event()
-        time.sleep(120)
+        time.sleep(min(120.0, max_lifetime_s()))
         return 0
     if scenario == "flood":
         chunk = "x" * 1000

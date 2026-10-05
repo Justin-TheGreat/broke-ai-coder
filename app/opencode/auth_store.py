@@ -50,7 +50,9 @@ def credential_problem(keys: list[str] | None, path: str | Path) -> str | None:
     if keys:
         return (
             f"OpenCode has stored provider credentials for: {', '.join(keys)}. "
-            "Run `opencode auth logout` for each; OpenCode must hold no provider keys."
+            f"Delete the credential store as the OpenCode user (`rm -f {path}`; setup guide E3) "
+            "rather than running `opencode auth logout`, which loads agent-writable config. "
+            "OpenCode must hold no provider keys."
         )
     return None
 

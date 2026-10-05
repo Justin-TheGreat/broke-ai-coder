@@ -61,7 +61,7 @@ opencode:
   continue_prompt: "Continue the previous task from where it stopped. Do not repeat steps that already completed."
   # SAFETY: the daemon pins model/small_model to broke/<provider>/<model> and enabled_providers to
   # ["broke"] via OPENCODE_CONFIG_CONTENT. Before each task GET /config must show exactly that,
-  # `opencode auth` storage must be empty (run `opencode auth logout`), and project opencode.json /
+  # `opencode auth` storage must be empty (delete brokeoc's auth.json, see docs/SETUP-discord-opencode.md E3), and project opencode.json /
   # .opencode/*.json files (project dir up to the filesystem root) must not contain provider,
   # enabled_providers or disabled_providers, or model keys outside broke/... Otherwise tasks fail
   # closed with OPENCODE_UNSAFE_CONFIG. Policy providers must be openrouter, gemini or groq.

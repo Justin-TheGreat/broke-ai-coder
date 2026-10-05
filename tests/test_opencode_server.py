@@ -193,8 +193,14 @@ async def started_manager(make_config, tmp_path):
         return m
 
     yield _start
+    errors: list[BaseException] = []
     for m in managers:
-        await m.stop()
+        try:
+            await m.stop()
+        except Exception as e:  # keep stopping the rest; report afterwards
+            errors.append(e)
+    if errors:
+        raise errors[0]
 
 
 async def test_starts_healthy_with_key_free_env_and_inline_config(started_manager, tmp_path):
@@ -306,7 +312,7 @@ async def test_stored_credentials_block_startup_naming_ids_only(started_manager,
     with pytest.raises(StartupError) as ei:
         await started_manager()
     msg = str(ei.value)
-    assert "groq, openai" in msg and "opencode auth logout" in msg
+    assert "groq, openai" in msg and "rm -f" in msg
     assert "SECRET" not in msg
     assert serve_count(tmp_path) == 0  # never spawned
 
@@ -718,3 +724,71 @@ def test_unavailable_reason_after_fatal_leads_with_restart_instruction(make_conf
     assert "already in use" in (m.unavailable_reason() or "")
     m.fatal_error = None
     assert m.unavailable_reason() == "managed OpenCode server is down: restarting"
+
+
+# ---- review fixes: S1 (control characters) and S4 (serve session registration) ------------
+
+
+def _bare_manager(make_config, tmp_path, **kw) -> OpenCodeServerManager:
+    return OpenCodeServerManager(
+        lifecycle_config(make_config, tmp_path),
+        gateway=StubGateway(),  # type: ignore[arg-type]
+        environ=make_environ(tmp_path),
+        password="pw-server-0123456789",
+        **kw,
+    )
+
+
+def test_stderr_detail_strips_terminal_control_sequences(make_config, tmp_path):
+    m = _bare_manager(make_config, tmp_path)
+    m._stderr = bytearray(b"bad\x1b]52;c;ZXZpbA==\x07 thing\x1b[2J\x00\xc2\x85 end\r\nnext")
+    detail = m._stderr_detail()
+    assert detail == "bad thing end  next"
+    assert "\x1b" not in m._detail("exit code 1")
+
+
+def test_stderr_detail_strips_before_redacting(make_config, tmp_path):
+    m = _bare_manager(make_config, tmp_path, redactor=SecretRedactor(["hunter22"], min_length=4))
+    m._stderr = bytearray(b"hun\x1b[0mter22 leaked")  # split by an escape to dodge redaction
+    assert "hunter22" not in m._stderr_detail()
+    assert "[REDACTED]" in m._stderr_detail()
+
+
+async def test_manager_registers_serve_session_with_launcher(make_config, tmp_path):
+    from app.opencode.os_user import DirectLauncher
+
+    class Rec(DirectLauncher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.registered: list[int | None] = []
+
+        def register_serve(self, pid):
+            self.registered.append(pid)
+
+    rec = Rec()
+    m = _bare_manager(make_config, tmp_path, launcher=rec)
+    await m.start()
+    try:
+        assert rec.registered and isinstance(rec.registered[-1], int)
+        pid = rec.registered[-1]
+    finally:
+        await m.stop()
+    assert rec.registered[-1] is None and pid > 0
+
+
+def test_fake_serve_exits_by_itself_after_max_lifetime(tmp_path):
+    import subprocess
+    import sys
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    env = {**os.environ, "FAKE_OC_MAX_LIFETIME_S": "1"}
+    p = subprocess.Popen([sys.executable, FAKE, "serve", "--port", str(port)], env=env)
+    try:
+        assert p.wait(timeout=15) == 0
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()

@@ -86,7 +86,8 @@ def _finished_text(fields: dict[str, object], task_id: str | None, redactor) -> 
         lines.append(
             "OpenCode's config is not limited to the built-in free-model gateway, or OpenCode "
             "has stored provider credentials, so the task was not run. Remove provider "
-            "settings from opencode.json files and run `opencode auth logout`."
+            "settings from opencode.json files and delete OpenCode's stored credential file "
+            "(auth.json; setup guide E3)."
         )
         offending = _s(fields.get("config_detail"))
         if offending:

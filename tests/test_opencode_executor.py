@@ -539,3 +539,45 @@ async def test_check_server_config_uses_launcher_auth_problem(tmp_path):
     ex = make_exec_with(tmp_path, launcher=Problem())
     check, detail = await ex.check_server_config(frozenset({"broke/x"}))
     assert check.value == "UNSAFE" and "launcher-said-so" in detail
+
+
+# ---- S4: stray sweep after every run ---------------------------------------------------
+
+
+class StrayLauncher(RecordingLauncher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.strays = 0
+
+    async def sweep_stray(self):
+        self.strays += 1
+
+
+@pytest.mark.parametrize(
+    ("scenario", "cfg", "outcome"),
+    [
+        ("success", {}, ExecutionOutcome.SUCCEEDED),
+        ("hang", {"run_timeout_s": 1, "kill_grace_s": 1}, ExecutionOutcome.TIMED_OUT),
+    ],
+)
+async def test_stray_sweep_runs_once_after_each_run(tmp_path, scenario, cfg, outcome):
+    launcher = StrayLauncher()
+    r = await run(make_exec_with(tmp_path, scenario, launcher=launcher, **cfg), tmp_path)
+    assert r.outcome == outcome
+    assert launcher.strays == 1
+
+
+async def test_stray_sweep_failure_does_not_break_the_run(tmp_path):
+    class Boom(StrayLauncher):
+        async def sweep_stray(self):
+            raise RuntimeError("sudo exploded")
+
+    r = await run(make_exec_with(tmp_path, launcher=Boom()), tmp_path)
+    assert r.outcome == ExecutionOutcome.SUCCEEDED
+
+
+async def test_no_stray_sweep_when_run_never_spawns(tmp_path):
+    launcher = StrayLauncher()
+    ex = make_exec_with(tmp_path, launcher=launcher, reason=lambda: "down")
+    await run(ex, tmp_path)
+    assert launcher.strays == 0

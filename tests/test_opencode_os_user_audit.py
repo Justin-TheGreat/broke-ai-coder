@@ -272,6 +272,8 @@ async def test_self_check_error_messages_contain_no_env_secrets(make_config, mon
 def _binfmt(tmp_path: Path, monkeypatch, entries: dict[str, str | None]) -> None:
     d = tmp_path / "binfmt"
     d.mkdir()
+    if "status" not in entries:
+        (d / "status").write_text("enabled\n")  # binfmt_misc is mounted
     for name, content in entries.items():
         if content is not None:
             (d / name).write_text(content)
@@ -411,7 +413,7 @@ def test_startup_exits_3_when_isolation_check_fails_no_secrets_no_sweep(
     async def no_sweep(self):
         raise AssertionError("a failed self-check must never sweep")
 
-    async def no_run(self, argv, *, timeout_s):
+    async def no_run(self, argv, *, timeout_s, on_timeout=None):
         raise AssertionError("no probe may run when the platform check fails first")
 
     monkeypatch.setattr(SudoLauncher, "sweep", no_sweep)

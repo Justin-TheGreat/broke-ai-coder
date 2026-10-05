@@ -198,6 +198,6 @@ def test_unsafe_config_text_mentions_gateway_logout_and_offending_detail():
     )
     assert out is not None
     assert "built-in free-model gateway" in out
-    assert "stored provider credentials" in out and "opencode auth logout" in out
+    assert "stored provider credentials" in out and "auth.json" in out
     assert "Offending: server config key 'provider' is not gateway-only" in out
     assert "small_model" not in out

@@ -198,31 +198,23 @@ OpenCode runs as the unprivileged user `brokeoc` through `sudo -n -u brokeoc -- 
    options="umask=077"
    ```
    Then in PowerShell run `wsl --shutdown` and reopen Ubuntu. **Cost:** you can no longer launch Windows programs from WSL shells (`code .`, `explorer.exe`, `clip.exe`, `powershell.exe`). The daemon's self-check refuses to start while interop is enabled.
-5. Git for the agent (it gets no GitHub credentials; push as yourself):
+5. Git for the agent (it gets no GitHub credentials). These one-time commands only write `brokeoc`'s git config, before the agent has ever run:
    ```bash
    sudo -u brokeoc git config --global user.name "broke-ai-coder agent"
    sudo -u brokeoc git config --global user.email "agent@example.invalid"
    sudo -u brokeoc git config --global --add safe.directory '*'
    ```
-6. Install the sudoers rule. Never use `/tmp` for this, because `brokeoc` can write there:
+   **Never run git, tests, builds, or an editor/IDE git integration (VS Code Remote-WSL included) as yourself, or as the daemon user, inside `/workspace` once the agent has touched it.** The agent controls every repo's `.git/config` and `.git/hooks` (`core.fsmonitor`, `core.hooksPath`, `core.sshCommand`, `credential.helper`, filter/diff drivers, `include.path`, pre-commit and pre-push hooks). None of these show up in a diff, and even `git status` can run `core.fsmonitor`. That would be arbitrary code as you, with access to `secrets.env`.
+
+   Safe review workflow: keep your own clone OUTSIDE `/workspace`, fetch the agent's branch into it, review there and push from there:
    ```bash
-   cd ~/broke-ai-coder
-   tmp=$(mktemp ~/broke-ai-coder.sudoers.XXXXXX)
-   .venv/bin/python -m app --print-sudoers --config config.yaml > "$tmp"
-   sudo visudo -cf "$tmp"
-   sudo install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/broke-ai-coder
-   rm "$tmp"
-   sudo visudo -c
+   cd ~/review/<repo>                                   # your own clone, not under /workspace
+   git fetch file:///workspace/<repo> <branch>          # needs git >= 2.45.1 (local-clone CVE fixes)
+   git diff HEAD...FETCH_HEAD; git log -p HEAD..FETCH_HEAD
+   git checkout -b <branch> FETCH_HEAD && git push origin <branch>
    ```
-   The file name has no dot, so sudo reads it. This needs `opencode.command[0]` to be `/usr/local/bin/opencode` (Part D1) in your `config.yaml`; regenerate it if you change it.
-7. Verify:
-   ```bash
-   sudo -k
-   sudo -n -u brokeoc -- /usr/local/bin/opencode --version   # works, no password prompt
-   sudo -n true                                              # must FAIL (no root)
-   sudo -n -u brokeoc -- /usr/bin/test -r ~/.config/broke-ai-coder/secrets.env; echo $?   # expect 1
-   .venv/bin/python -m app --check-os-user --config config.yaml                        # expect: os_user OK
-   ```
+   Check `git --version` first. Never run an agent-controlled program as `brokeoc` from your own terminal either: no `sudo -u brokeoc bash`, no interactive shell, no `opencode`/`git` as `brokeoc` (they read agent-writable dotfiles, config and plugins). Use the non-tty form shown in E3 so the process gets no controlling terminal.
+6. The sudoers rule is installed in Part E (E2), after the clone, the venv and `config.yaml` exist and `/usr/local/bin/opencode` has been installed (D1). Do not skip it: nothing works without it.
 
 Notes:
 - The daemon kills ALL processes of `brokeoc` at start, at stop and on every serve restart. Do not use `brokeoc` for anything else.
@@ -244,18 +236,11 @@ sudo install -m 0755 -o root -g root "$(command -v opencode)" /usr/local/bin/ope
 
 (Alternative if the script fails: install Node.js LTS, then `npm install -g opencode-ai`.)
 
-`brokeoc` must not be able to modify the binary, so the daemon uses a root-owned copy at `/usr/local/bin/opencode` (the `opencode.command` default in `config.example.yaml`). Re-run the `install` line after every OpenCode upgrade. If you installed with npm, point `opencode.command` at the npm global binary path instead and regenerate the sudoers file (C6 step 6).
+`brokeoc` must not be able to modify the binary, so the daemon uses a root-owned copy at `/usr/local/bin/opencode` (the `opencode.command` default in `config.example.yaml`). Re-run the `install` line after every OpenCode upgrade. If you installed with npm, point `opencode.command` at the npm global binary path instead and regenerate the sudoers file (E2).
 
 ### D2. Give OpenCode no keys
-OpenCode is given **no** provider keys and no stored credentials. The controller launches it with a minimal environment and an inline config whose only provider is the built-in gateway.
+OpenCode is given **no** provider keys and no stored credentials. The controller launches it with a minimal environment and an inline config whose only provider is the built-in gateway. Checking and clearing `brokeoc`'s stored credentials needs the sudoers rule, so it is step E3 (after E2).
 
-OpenCode runs as `brokeoc`, so check and log out there:
-
-```bash
-sudo -n -u brokeoc -- /usr/local/bin/opencode auth list
-```
-
-- If this lists any provider, run `sudo -n -u brokeoc -- /usr/local/bin/opencode auth logout` for **each** one. The daemon refuses to start while `/home/brokeoc/.local/share/opencode/auth.json` holds any provider entry.
 - Remove any `provider`, `model`, `small_model` or `enabled_providers` entries from `~/.config/opencode/opencode.json`. The controller sets them itself (D2b).
 - Take the model ids for `config.yaml` (`routing.policies.*.model_order`) from each provider's dashboard or models API, **not** from `opencode models`, which no longer lists your providers. OpenRouter must be `openrouter/free` or end in `:free`.
 
@@ -294,7 +279,9 @@ Security rules (SPEC §11):
 
 ## Part E — Clone the controller into WSL
 
-The architecture runs the controller inside WSL next to OpenCode:
+The architecture runs the controller inside WSL next to OpenCode. Do D1 first (it creates `/usr/local/bin/opencode`), then follow E1 to E4 in order.
+
+### E1. Clone, install, configure
 
 ```bash
 cd ~
@@ -311,10 +298,55 @@ Edit `config.yaml`:
 - `routing.policies.*.model_order` ← the model IDs from each provider's dashboard (D2).
 - Optional `providers.<p>.limits` ← numbers from Part B dashboards.
 
-Then:
-
 ```bash
 .venv/bin/python -m app --check --config config.yaml
+```
+
+### E2. Install the sudoers rule and verify (one-time; needs C6 steps 1-5 and D1)
+Never use `/tmp` for the temporary file, because `brokeoc` can write there. The subshell with `set -e` stops at the first error, and the `-s` test refuses an empty file (which `visudo -cf` would accept):
+
+```bash
+cd ~/broke-ai-coder
+(
+  set -e
+  tmp=$(mktemp ~/broke-ai-coder.sudoers.XXXXXX)
+  trap 'rm -f "$tmp"' EXIT
+  .venv/bin/python -m app --print-sudoers --config config.yaml > "$tmp"
+  [ -s "$tmp" ]
+  sudo visudo -cf "$tmp"
+  sudo install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/broke-ai-coder
+  sudo visudo -c
+)
+```
+
+The file name has no dot, so sudo reads it. This needs `opencode.command[0]` to be `/usr/local/bin/opencode` (D1) in your `config.yaml`; regenerate the file if you change it. The generated file does not touch `use_pty`: leave Ubuntu's default `Defaults use_pty` alone.
+
+Verify (non-tty form for anything that runs as `brokeoc`, see the note in C6 step 5):
+
+```bash
+sudo -k
+setsid -w sudo -n -u brokeoc -- /usr/local/bin/opencode --version </dev/null 2>&1 | cat   # works, no password prompt
+sudo -n true                                                                              # must FAIL (no root)
+setsid -w sudo -n -u brokeoc -- /usr/bin/test -r ~/.config/broke-ai-coder/secrets.env </dev/null; echo $?   # expect 1
+.venv/bin/python -m app --check-os-user --config config.yaml                              # expect: os_user OK
+```
+
+### E3. Check that OpenCode holds no credentials (this is D2)
+OpenCode runs as `brokeoc`, so check there. Never open a shell as `brokeoc` and never run these from your terminal without `setsid -w ... </dev/null | cat` (no controlling tty):
+
+```bash
+setsid -w sudo -n -u brokeoc -- /usr/local/bin/opencode auth list </dev/null 2>&1 | cat
+```
+
+- If this lists any provider, delete the credential store (`rm` is not agent-controlled, unlike `opencode auth logout`, which loads agent-writable config and plugins):
+  ```bash
+  sudo -u brokeoc rm -f /home/brokeoc/.local/share/opencode/auth.json
+  ```
+  This is a plain `sudo` (it asks for your password; the narrow sudoers rule only covers the four daemon commands). The daemon refuses to start while that file holds any provider entry.
+
+### E4. First start
+
+```bash
 bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
 ```
 
@@ -325,7 +357,7 @@ If startup fails the daemon prints one line and exits with status 3 (for example
 ## Checklist — send me these when done (no secrets)
 
 - [ ] `opencode --version` output
-- [ ] `sudo -n -u brokeoc -- /usr/local/bin/opencode auth list` shows no providers (after `opencode auth logout`)
+- [ ] `setsid -w sudo -n -u brokeoc -- /usr/local/bin/opencode auth list </dev/null 2>&1 | cat` shows no providers (after deleting `/home/brokeoc/.local/share/opencode/auth.json` with `sudo -u brokeoc rm -f`, E3)
 - [ ] `python -m app --check-os-user --config config.yaml` output (expect `os_user OK`)
 - [ ] Daemon started without a startup error; the log shows the gateway listening and no `did not become healthy`
 - [ ] `brokeoc`'s home holds no cloud credentials (`~/.aws`, gcloud ADC, Azure CLI, Copilot tokens)
@@ -341,16 +373,16 @@ Do **not** send: the Discord bot token, any API key, or the contents of `secrets
 | Symptom | Fix |
 |---|---|
 | `opencode: command not found` | `source ~/.bashrc`, or open a new Ubuntu shell. The daemon prints `opencode executable not found` and exits 3 |
-| `OpenCode has stored provider credentials for: ...` (exit 3, or task `OPENCODE_UNSAFE_CONFIG`) | Run `opencode auth logout` for each listed provider; OpenCode must hold no provider keys |
+| `OpenCode has stored provider credentials for: ...` (exit 3, or task `OPENCODE_UNSAFE_CONFIG`) | Delete the store: `sudo -u brokeoc rm -f /home/brokeoc/.local/share/opencode/auth.json` (E3; do not run `opencode auth logout` as `brokeoc` from your terminal); OpenCode must hold no provider keys |
 | `OpenCode credential store unreadable: <path>` | `auth.json` is not valid JSON or not readable; fix or delete it |
 | `opencode serve did not become healthy: ...` (exit 3) | See the exit code and stderr tail in the message; check `opencode.command`, that `opencode.server_port` is not already used (stop any old tmux `opencode serve`), and `opencode.server_start_timeout_s` |
 | `no enabled allowlisted models; check routing.provider_order/policies` | Enable at least one policy listed in `routing.provider_order` whose provider is enabled |
-| Tasks fail with `OPENCODE_UNSAFE_CONFIG` | Remove `provider`/`enabled_providers`/`disabled_providers` and non-`broke/...` model keys from project `opencode.json` files, and run `opencode auth logout` |
-| `a password is required` in the `--version` check | The sudoers file is not installed, or names the wrong user or binary path; regenerate it (C6 step 6) |
+| Tasks fail with `OPENCODE_UNSAFE_CONFIG` | Remove `provider`/`enabled_providers`/`disabled_providers` and non-`broke/...` model keys from project `opencode.json` files, and delete `brokeoc`'s `auth.json` (E3) |
+| `a password is required` in the `--version` check | The sudoers file is not installed, or names the wrong user or binary path; regenerate it (E2) |
 | `user 'brokeoc' can access <path>` | `chmod` per C6 (home 700, `secrets.env` 600) and the `[automount] options="umask=077"` entry in `/etc/wsl.conf` |
 | `WSL interop is enabled` | C6 step 4, then `wsl --shutdown` |
 | `cannot write opencode.server_directory` | C6 step 3 (owner `brokeoc`, group `brokeai`, mode 2770) |
-| `does not enforce the password ... env_keep` | Reinstall the generated sudoers file (C6 step 6); its `env_keep` line is missing |
+| `does not enforce the password ... env_keep` | Reinstall the generated sudoers file (E2); its `env_keep` line is missing |
 | `will not restart by itself ... restart the daemon` | Stop whatever holds the serve port (`opencode.server_port`), then restart the daemon |
 | `mode 'sudo' needs Linux` | You are on Windows (dev): set `opencode.os_user.mode: none` |
 | Gateway returns 503 `upstream_credential_missing` | The daemon was started without `secrets.env` loaded; use the start command in C4/E |
