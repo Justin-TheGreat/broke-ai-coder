@@ -232,7 +232,7 @@ The orchestrator runs/attaches tasks with the documented CLI:
 opencode run --attach http://127.0.0.1:<port> --model broke/<provider>/<model> "<prompt>"
 ```
 
-(`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` are given to that CLI process through its environment.) Before each task the orchestrator verifies the server's `GET /config` is gateway-only and that OpenCode credential storage is empty. This keeps OpenCode responsible for the coding-agent loop while the orchestrator chooses the provider/model before each task.
+(`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` are given to that CLI process through its environment.) Before each task the orchestrator verifies the server's `GET /config` is gateway-only, that its `permission` block still denies the required operations (`app/opencode/permissions.py`), and that OpenCode credential storage is empty. This keeps OpenCode responsible for the coding-agent loop while the orchestrator chooses the provider/model before each task.
 
 ## 5. Routing algorithm
 
@@ -751,7 +751,7 @@ last_cleanup_at
 last_vacuum_at
 ```
 
-These metrics describe only the controller process and its SQLite file. They are not intended to measure OpenCode or project workload resource usage.
+These metrics describe only the controller process and its SQLite file. They are not intended to measure OpenCode or project workload resource usage. They are exposed by the Discord `/health` command and measured by `scripts/bench_idle.py` (idle benchmark, T024).
 
 ## 12. Failure modes
 

@@ -242,6 +242,9 @@ class LlmGateway:
             "llm gateway listening on 127.0.0.1:%d (%d models)", self._port, len(self.models)
         )
 
+    def is_running(self) -> bool:
+        return self._runner is not None
+
     async def stop(self) -> None:
         runner, self._runner = self._runner, None
         if runner is not None:

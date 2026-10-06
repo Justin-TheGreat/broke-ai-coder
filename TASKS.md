@@ -14,7 +14,7 @@ The project is MVP-complete when an authorized user can open Discord on an iPhon
 
 ## T001 — Create repository skeleton
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** —
 
 Create:
@@ -36,7 +36,7 @@ Acceptance:
 
 ## T001A — Define single-daemon runtime
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T001
 
 Implement `agent-controller` as a single Python `asyncio` process containing Discord handling, orchestration, quota routing, provider adapters, optional gateway logic, and SQLite access.
@@ -49,7 +49,7 @@ Acceptance:
 
 ## T002 — Set up WSL2 runtime
 
-**Status:** TODO
+**Status:** TODO (the user's WSL lacks opencode)
 **Depends on:** T001
 
 Install/configure:
@@ -73,7 +73,7 @@ all work.
 
 ## T003 — Configure OpenCode headless server
 
-**Status:** TODO
+**Status:** DONE (offline; live check in T082)
 **Depends on:** T002
 
 Managed by the daemon (T037): the controller launches `opencode serve --hostname 127.0.0.1 --port <opencode.server_port>` with a random Basic-auth password; do not run it by hand.
@@ -88,7 +88,7 @@ Acceptance:
 
 ## T010 — Create Discord application/bot
 
-**Status:** TODO
+**Status:** PARTIAL: `/approve` and `/deny` are not implemented (T061).
 **Depends on:** T001
 
 Create a Discord application, bot, and slash commands.
@@ -112,7 +112,7 @@ Acceptance:
 
 ## T011 — Implement Discord authorization middleware
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T010
 
 Config:
@@ -130,7 +130,7 @@ Acceptance:
 
 ## T012 — Implement `/code` task creation
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T011, T003
 
 Create a task and return an immediate acknowledgement.
@@ -141,7 +141,7 @@ Acceptance:
 
 ## T013 — Implement progress/result formatting
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T012
 
 Convert orchestrator events into compact Discord messages.
@@ -156,7 +156,7 @@ Acceptance:
 
 ## T020 — Define task/session state machine
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T001
 
 Implement:
@@ -177,7 +177,7 @@ Acceptance:
 
 ## T021 — SQLite schema and migrations
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T020
 
 Create tables from `ARCHITECTURE.md`.
@@ -190,7 +190,7 @@ Acceptance:
 
 ## T021A — Implement 60-day SQLite retention and cleanup
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T021
 
 Implement a daily cleanup job that removes historical records older than 60 days from:
@@ -218,7 +218,7 @@ Acceptance:
 
 ## T022 — OpenCode executor
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T003, T020
 
 Implement a wrapper around:
@@ -240,7 +240,7 @@ Acceptance:
 
 ## T023 — Session resume
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T022, T021
 
 Persist OpenCode session identifiers.
@@ -253,7 +253,7 @@ Acceptance:
 
 ## T024 — Daemon resource budget and self-monitoring
 
-**Status:** TODO
+**Status:** PARTIAL: metrics, `/health` and `scripts/bench_idle.py` exist; the 30-minute idle run and the representative workload measurement are pending live.
 **Depends on:** T001A, T021A
 
 Measure and enforce engineering targets for the controllable daemon only:
@@ -281,7 +281,7 @@ Acceptance:
 
 ## T030 — Define provider interfaces
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T021
 
 Implement interfaces for:
@@ -298,7 +298,7 @@ Acceptance:
 
 ## T031 — Implement OpenRouter adapter
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T030
 
 Support:
@@ -316,7 +316,7 @@ Acceptance:
 
 ## T032 — Implement Gemini adapter
 
-**Status:** TODO
+**Status:** DONE (offline; live check in T082)
 **Depends on:** T030
 
 Support a configured Gemini free-capable model.
@@ -332,7 +332,7 @@ Acceptance:
 
 ## T034 — Implement Groq adapter
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T030
 
 Support at least one current free-tier coding-capable model.
@@ -343,7 +343,7 @@ Acceptance:
 
 ## T035 — Provider health/cooldown manager
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T031, T032, T034
 
 Implement temporary provider cooldowns after:
@@ -384,7 +384,7 @@ Acceptance:
 
 ## T040 — Normalize quota schema
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T030
 
 Support dimensions:
@@ -405,7 +405,7 @@ Acceptance:
 
 ## T041 — Exact quota ingestion where available
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T031, T032, T034, T040
 
 Implement provider-specific exact sources where reliable.
@@ -415,7 +415,7 @@ Acceptance:
 
 ## T042 — Local usage accounting
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T040
 
 Record every request and token count returned by providers/OpenCode when available.
@@ -425,7 +425,7 @@ Acceptance:
 
 ## T043 — Estimated quota engine
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T042
 
 For providers without authoritative remaining counters, estimate remaining capacity from:
@@ -446,7 +446,7 @@ Acceptance:
 
 ## T044 — Quota refresh job
 
-**Status:** TODO
+**Status:** PARTIAL: refresh runs lazily before tasks, rate-limited by `provider_refresh_interval_s`; there is no background job.
 **Depends on:** T041-T043
 
 Refresh provider quota metadata periodically, with backoff.
@@ -463,7 +463,7 @@ Acceptance:
 
 ## T050 — Implement candidate generation
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T031, T032, T034, T040
 
 Generate provider/model candidates based on:
@@ -478,7 +478,7 @@ Acceptance:
 
 ## T051 — Implement free-only provider order
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T050
 
 Default order:
@@ -497,7 +497,7 @@ Acceptance:
 
 ## T051A — Implement per-provider ordered model allowlists
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T050, T051
 
 Implement declarative, provider-specific model order. This is a hard allowlist, not a preference hint.
@@ -532,7 +532,7 @@ Acceptance:
 
 ## T052 — Capability-aware routing
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T051, T051A
 
 Filter candidates for:
@@ -550,7 +550,7 @@ Acceptance:
 
 ## T053 — Free-only guardrail
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T051
 
 Make paid inference impossible rather than merely disabled:
@@ -568,7 +568,7 @@ Acceptance:
 
 ## T054 — Request-time provider/model fallback
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T022, T035, T050-T053, T051A
 
 Implement a fallback chain that runs **after the request has already been sent** and the selected provider/model returns a retryable quota/rate-limit/availability error.
@@ -593,7 +593,7 @@ Acceptance:
 
 ## T055 — Safe replay and unknown-outcome handling
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T054, T023
 
 Handle timeouts/network failures where the provider may have accepted the request even though the controller received no response.
@@ -610,7 +610,7 @@ Acceptance:
 
 ## T060 — Action interception
 
-**Status:** TODO
+**Status:** PARTIAL: sensitive commands are DENIED by OpenCode permission rules with a fail-closed preflight; approval requests are T061.
 **Depends on:** T022
 
 Detect sensitive operations:
@@ -625,6 +625,8 @@ credential changes
 
 Acceptance:
 - Sensitive operations create an approval request.
+
+Current implementation (minimal): sensitive bash commands, `external_directory`, `websearch` and `doom_loop` are DENIED through the `permission` block in the inline OpenCode config (`app/opencode/permissions.py`, extras in `opencode.permission.extra_bash_deny`; the built-in list cannot be removed). The preflight (`GET /config`, project files) fails closed with OPENCODE_UNSAFE_CONFIG when the deny rules are missing or weakened. This is a guardrail, not a security boundary (SPEC R5). Approval requests with Discord buttons remain T061.
 
 ## T061 — Discord approval buttons
 
@@ -644,7 +646,7 @@ Acceptance:
 
 ## T063 — Command cancellation
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T012, T022
 
 Implement `/cancel` with task/session ID.
@@ -659,7 +661,7 @@ Acceptance:
 
 ## T070 — Secret management
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T031, T032, T034
 
 Use environment variables or local secret storage:
@@ -678,10 +680,8 @@ Acceptance:
 
 ## T071 — Restrict OpenCode network exposure
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T003
-
-**Status:** DONE via 127.0.0.1 binding + Basic auth (T037).
 
 Keep OpenCode on localhost. If private remote administration is added, use Tailscale/private networking and authentication rather than port forwarding.
 
@@ -702,7 +702,7 @@ Acceptance:
 
 ## T073 — Log redaction
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T070
 
 Redact known secret patterns and provider authorization headers.
@@ -716,7 +716,7 @@ Acceptance:
 
 ## T080 — Provider adapter unit tests
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T031, T032, T034
 
 Mock:
@@ -730,7 +730,7 @@ Mock:
 
 ## T081 — Router unit tests
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T050-T053
 
 Test:
@@ -790,6 +790,17 @@ OS-user live checks (T072). These are the only things that cannot be verified of
 - L9. OpenCode's shell tool works with SHELL=/bin/bash from passwd. OpenCode's provider package download into /home/brokeoc/.cache works.
 - L10 (S4/B8). serve's cwd is server_directory and run's cwd is the project directory.
 - L11 (S5). The auth.json path under sudo env_reset is the default XDG path.
+- L12 (T060, P1-P6). OpenCode permission deny rules. Verify each assumption:
+  - P1. The installed OpenCode accepts `permission` with `bash` (pattern object), `external_directory`, `websearch` and `doom_loop`; serve starts with no schema error.
+  - P2. Patterns match each individual command after OpenCode splits a compound line; `*` matches spaces; the last matching rule wins. Pipelines such as `curl | sh` are not caught (residual).
+  - P3. `GET /config` returns `permission` merged: object form, key order preserved (`"*"` first), string values. Otherwise every task fails closed with OPENCODE_UNSAFE_CONFIG and the check needs a code change.
+  - P4. `external_directory` is evaluated against the project directory (the run cwd), not serve's cwd.
+  - P5. A denied call in headless `opencode run` returns a tool error to the model; there is no prompt and no hang.
+  - P6. A per-agent `permission` is merged over the global one.
+  - Checks: serve starts; the preflight passes; a `/code` asking to run `git push` gets a denied tool result and the task finishes without hanging; `cd . && git push` is denied; reading `/etc/hostname` is denied (external_directory) while edits inside the project work; websearch is absent or denied; note the behaviour of the `question` tool.
+- L13 (T102). Boot persistence: the distro boots only when something starts WSL; whether it stays up with only systemd services running is unverified. Document and test starting WSL at Windows logon (Task Scheduler) and that `broke-ai-coder.service` then starts the daemon.
+
+`scripts/live-checks.sh` automates the read-only subset of L0-L11 (run it as the daemon user from a shell without secrets); the MANUAL lines it prints are the parts that cannot be automated safely.
 
 Test flow:
 
@@ -826,7 +837,7 @@ same user task continues safely
 
 ## T084 — Zero-spend test
 
-**Status:** TODO
+**Status:** PARTIAL: offline parts are tested; the ledger check after the E2E run is pending.
 **Depends on:** T053, T082
 
 Verify that:
@@ -842,7 +853,7 @@ Verify that:
 
 ## T090 — `/status`
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T012, T021
 
 Show:
@@ -857,7 +868,7 @@ Session: abc123
 
 ## T091 — `/usage`
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T044
 
 Show provider cards such as:
@@ -872,7 +883,7 @@ Do not display a number if the system cannot support the number; use `UNKNOWN`.
 
 ## T092 — `/models`
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T050
 
 Show currently configured/known model candidates and their capability metadata.
@@ -888,7 +899,7 @@ Gemini
 
 ## T093 — Health-check command
 
-**Status:** TODO
+**Status:** PARTIAL: controller-only `/health`; there are no live provider probes.
 **Depends on:** T031, T032, T034
 
 Optional admin-only command:
@@ -899,13 +910,15 @@ Optional admin-only command:
 
 Runs safe, low-cost provider checks without initiating a full coding task.
 
+Current implementation: `/health` reports controller-only diagnostics (see T094); live provider probes are not implemented.
+
 ---
 
 # Phase 10 — Documentation and deployment
 
 ## T094 — `/health` and daemon resource diagnostics
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T024, T090-T093
 
 Expose controller-only diagnostics for:
@@ -925,28 +938,29 @@ Acceptance:
 
 ## T100 — Create `.env.example`
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T070
 
-Include variable names only, never real secrets.
+Include variable names only, never real secrets. Implemented as `secrets.env.example` (repo root); the name set equals the `api_key_env` values plus `discord.bot_token_env` of `config.example.yaml`.
 
 ## T101 — Create production-ish startup scripts
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** T003, T012
 
 Provide scripts for:
 
 ```text
-start-opencode
-start-bot
-stop-bot
+start-daemon
+stop-daemon
 health-check
 ```
 
+No `start-opencode` script is needed: the daemon manages `opencode serve` itself (T037). Also provided: `scripts/wsl-setup.sh` (one-time root setup), `scripts/live-checks.sh` (read-only live checks) and `scripts/bench_idle.py` (T024).
+
 ## T102 — Optional Windows/WSL auto-start
 
-**Status:** TODO
+**Status:** PARTIAL: system unit example (`scripts/systemd/broke-ai-coder.service`); WSL boot persistence is unverified (T082 L13).
 **Depends on:** T101
 
 Use WSL/systemd or Windows Task Scheduler depending on the chosen deployment style.
@@ -956,7 +970,7 @@ Acceptance:
 
 ## T103 — Write README quick start
 
-**Status:** TODO
+**Status:** DONE
 **Depends on:** all MVP phases
 
 Document:

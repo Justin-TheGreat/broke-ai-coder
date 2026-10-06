@@ -20,6 +20,7 @@ from app.config.models import AppConfig
 from app.config.secrets import resolve_secret
 from app.redaction import SecretRedactor
 from app.runtime.daemon import AgentController, ControllerEvent
+from app.runtime.diagnostics import RuntimeProbes
 from app.runtime.interfaces import ChatFrontend, NullFrontend
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,13 @@ def create_frontend(
     *,
     redactor: SecretRedactor | None,
     environ: Mapping[str, str] | None = None,
+    probes: RuntimeProbes | None = None,
 ) -> ChatFrontend:
     env_name = config.discord.bot_token_env
     if resolve_secret(env_name, environ) is None:
         logger.warning("discord frontend disabled: env %s is not set", env_name)
         return NullFrontend()
-    return DiscordFrontend(config, redactor=redactor, environ=environ)
+    return DiscordFrontend(config, redactor=redactor, environ=environ, probes=probes)
 
 
 class _Client(discord.Client):
@@ -64,8 +66,10 @@ class DiscordFrontend:
         *,
         redactor: SecretRedactor | None,
         environ: Mapping[str, str] | None = None,
+        probes: RuntimeProbes | None = None,
     ) -> None:
         self._config = config
+        self._probes = probes
         self._redactor = redactor
         # A closure, not an attribute, so the environment (and the token in it) is never
         # reachable through repr()/vars() of this object.
@@ -114,6 +118,12 @@ class DiscordFrontend:
         @tree.command(name="models", description="Show allowlisted and discovered models")
         async def models(interaction: discord.Interaction) -> None:
             await self._handle(interaction, "models", {})
+
+        @tree.command(
+            name="health", description="Controller diagnostics (daemon only; excludes OpenCode)"
+        )
+        async def health(interaction: discord.Interaction) -> None:
+            await self._handle(interaction, "health", {})
 
         @tree.command(name="sessions", description="List recent sessions")
         async def sessions(interaction: discord.Interaction) -> None:
@@ -179,7 +189,7 @@ class DiscordFrontend:
         if token is None:
             logger.warning("discord frontend disabled: token is not set")
             return
-        self._backend = ControllerBackend(controller, self._config)
+        self._backend = ControllerBackend(controller, self._config, probes=self._probes)
         client, _tree = self.build_client()
         self._client = client
         self._task = asyncio.create_task(client.start(token), name="discord-client")

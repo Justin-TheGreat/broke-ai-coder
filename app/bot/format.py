@@ -11,9 +11,10 @@ from app.db.tasks import TaskRecord
 from app.providers.base import QuotaConfidence, QuotaRecord
 from app.redaction import SecretRedactor
 from app.runtime.daemon import ControllerEvent
+from app.runtime.resources import IDLE_CPU_PCT, IDLE_RSS_MB, NORMAL_CPU_PCT, NORMAL_RSS_MB
 
 if TYPE_CHECKING:
-    from app.bot.commands import ProviderModels, StatusSnapshot, UsageSnapshot
+    from app.bot.commands import HealthSnapshot, ProviderModels, StatusSnapshot, UsageSnapshot
     from app.orchestrator.orchestrator import CancelResult
 
 DISCORD_MAX_CHARS = 1900
@@ -85,7 +86,8 @@ def _finished_text(fields: dict[str, object], task_id: str | None, redactor) -> 
     elif error_class == "OPENCODE_UNSAFE_CONFIG":
         lines.append(
             "OpenCode's config is not limited to the built-in free-model gateway, or OpenCode "
-            "has stored provider credentials, so the task was not run. Remove provider "
+            "has stored provider credentials, so the task was not run. Or its permission rules "
+            "do not deny sensitive commands (setup guide D2c). Remove provider "
             "settings from opencode.json files and delete OpenCode's stored credential file "
             "(auth.json; setup guide E3)."
         )
@@ -159,6 +161,77 @@ def format_status(snapshot: StatusSnapshot, *, redactor: SecretRedactor | None =
         lines.append(
             f"{t.id[:8]} {t.status.value} {t.selected_provider or '-'}/{t.selected_model or '-'}"
         )
+    return safe_text("\n".join(lines), redactor)
+
+
+_UNAVAILABLE = "unavailable on this platform"
+
+
+def _mb(value: int) -> str:
+    return f"{value / 1_048_576:.1f} MB"
+
+
+def _uptime(seconds: float) -> str:
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {rem % 60:02d}s"
+
+
+def format_health(snapshot: HealthSnapshot, *, redactor: SecretRedactor | None = None) -> str:
+    lines = [
+        "Controller health (daemon process only; excludes OpenCode and project child processes)"
+    ]
+    r = snapshot.resources
+    if r is None:
+        lines.append("Resources: unavailable")
+    else:
+        if r.rss_bytes is None:
+            rss = _UNAVAILABLE
+        else:
+            rss = _mb(r.rss_bytes)
+            if r.peak_rss_bytes is not None:
+                rss += f" (peak {_mb(r.peak_rss_bytes)})"
+        lines.append(f"RSS: {rss}; targets idle < {IDLE_RSS_MB} MB, normal < {NORMAL_RSS_MB} MB")
+        parts: list[str] = []
+        if r.cpu_percent_window is not None:
+            parts.append(
+                f"{r.cpu_percent_window:.1f}% of one core over the last {r.window_s:.0f} s"
+            )
+        since = "n/a" if r.cpu_percent_since_start is None else f"{r.cpu_percent_since_start:.1f}%"
+        parts.append(
+            f"{since} since start ({r.cpu_seconds_total:.1f} s CPU, up {_uptime(r.uptime_s)})"
+        )
+        lines.append(
+            "CPU: "
+            + "; ".join(parts)
+            + f"; targets idle < {IDLE_CPU_PCT:g}%, normal < {NORMAL_CPU_PCT:g}%"
+        )
+    db = _UNAVAILABLE if snapshot.sqlite_db_bytes is None else _mb(snapshot.sqlite_db_bytes)
+    lines.append(f"SQLite: {db}; last cleanup {snapshot.last_cleanup_at or 'never'}")
+    running = snapshot.running_task_id[:8] if snapshot.running_task_id else "none"
+    lines.append(
+        f"Queues: tasks {snapshot.task_queue_depth}, events {snapshot.event_queue_depth}"
+        f" (dropped {snapshot.event_dropped_count}); running task: {running}"
+    )
+    lines.append(
+        f"Provider cooldowns: {snapshot.provider_cooldowns} provider-wide,"
+        f" {snapshot.model_cooldowns} model"
+    )
+    gateway = {True: "up", False: "DOWN", None: "unknown"}[snapshot.gateway_up]
+    lines.append(f"Gateway: {gateway}")
+    if snapshot.serve_ready is None:
+        serve = "not managed (opencode.managed_server: false)"
+    elif snapshot.serve_ready:
+        serve = "ready"
+    elif snapshot.serve_fatal_error:
+        serve = f"FATAL (restart the daemon): {snapshot.serve_fatal_error[:200]}"
+    else:
+        serve = "down (restarting)"
+    lines.append(f"OpenCode serve: {serve}")
+    lines.append(f"OS user: {snapshot.os_user or 'unknown'}")
     return safe_text("\n".join(lines), redactor)
 
 

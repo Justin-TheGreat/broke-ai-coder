@@ -246,6 +246,31 @@ class OsUserConfig(BaseModel):
         return out
 
 
+class OpenCodePermissionConfig(BaseModel):
+    model_config = _CFG
+
+    extra_bash_deny: list[str] = Field(default_factory=list)
+
+    @field_validator("extra_bash_deny")
+    @classmethod
+    def _extra_bash_deny_valid(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            pattern = raw.strip()
+            if not pattern:
+                raise ValueError("extra_bash_deny entries must be non-empty")
+            if len(pattern) > 200:
+                raise ValueError("extra_bash_deny entries must be at most 200 characters")
+            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in pattern):
+                raise ValueError("extra_bash_deny entries must not contain control characters")
+            if "{" in pattern or "}" in pattern:
+                raise ValueError("extra_bash_deny entries must not contain braces")
+            if pattern == "*":
+                raise ValueError("extra_bash_deny must not contain the bare '*' pattern")
+            out.append(pattern)
+        return out
+
+
 class OpenCodeConfig(BaseModel):
     model_config = _CFG
 
@@ -266,6 +291,7 @@ class OpenCodeConfig(BaseModel):
     output_tail_chars: int = Field(4000, ge=200, le=20000)
     stderr_tail_bytes: int = Field(4096, ge=256, le=65536)
     os_user: OsUserConfig = Field(default_factory=OsUserConfig)
+    permission: OpenCodePermissionConfig = Field(default_factory=OpenCodePermissionConfig)
     continue_prompt: str = (
         "Continue the previous task from where it stopped. Do not repeat steps that already"
         " completed."

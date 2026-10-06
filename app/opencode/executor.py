@@ -48,6 +48,7 @@ from app.opencode.endpoint import ServerEndpoint
 from app.opencode.events import SESSION_ID_RE, OpenCodeError, classify_text, parse_event_line
 from app.opencode.health import check_opencode_health
 from app.opencode.os_user import DirectLauncher, OpenCodeLauncher
+from app.opencode.permissions import build_permission_block
 from app.opencode.process import spawn_kwargs
 from app.orchestrator.prompt import sanitize_prompt
 from app.providers.base import ErrorClass
@@ -177,6 +178,7 @@ class OpenCodeExecutor:
             transport=self._transport,
             environ=self._environ,
             auth_problem=self._launcher.auth_store_problem,
+            required_permission=build_permission_block(self._config.permission),
         )
 
     async def check_project_models(

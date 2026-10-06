@@ -126,7 +126,7 @@ chmod 600 ~/.config/broke-ai-coder/secrets.env
 nano ~/.config/broke-ai-coder/secrets.env
 ```
 
-Contents (replace the placeholders; no quotes or spaces around `=`):
+Contents (replace the placeholders; no quotes or spaces around `=`). The names match `secrets.env.example` in the repo, which you can copy as a template:
 
 ```bash
 export DISCORD_BOT_TOKEN=paste-here
@@ -146,8 +146,10 @@ Start the controller with the file loaded for that one command (this is also wha
 
 ```bash
 cd ~/broke-ai-coder
-bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
+scripts/start-daemon.sh
 ```
+
+`scripts/start-daemon.sh` refuses to start if the secrets file is not a regular file you own with mode 600 or 400, or has malformed lines (it prints line numbers only, never content), and loads the file only inside the daemon process.
 
 Do **not** `source` `secrets.env` from `~/.bashrc`: every shell, including the agent's shell tool, would then carry your keys. Residual risk R1 (OpenCode reading your secrets) is closed by Part C6: OpenCode runs as the separate Linux user `brokeoc`, which cannot read your home, `secrets.env` or the daemon's `/proc`. The remaining residuals (R1a-R1f) are listed in SPEC.md section 11. Keep account-level billing off as the second layer (Part B).
 
@@ -167,6 +169,8 @@ sudo setfacl -R -d -m g:brokeai:rwX /workspace
 ```
 
 Then log in again so that `id` shows `brokeai`: type `exit`, and in PowerShell run `wsl --terminate Ubuntu-24.04`, then reopen Ubuntu. Never put the controller repo (`~/broke-ai-coder`) in `/workspace`.
+
+> **Fast path:** after D1 and E1, `sudo scripts/wsl-setup.sh --yes` performs C5, C6 steps 1-5 and E2 in one go (it prints every action first and is idempotent). The manual steps stay here as reference.
 
 ### C6. OpenCode user (one-time)
 OpenCode runs as the unprivileged user `brokeoc` through `sudo -n -u brokeoc -- ...` with a narrow sudoers rule: you may run exactly four commands (the opencode binary, `pkill`, `test`, `head`) as `brokeoc`, never as root. `brokeoc` has its own home and cannot read yours.
@@ -249,6 +253,25 @@ OpenCode makes small background calls (for example session title generation) wit
 
 Before every task the controller checks `GET /config` of its own server (exactly that gateway-only shape) and that no OpenCode credentials are stored. It also checks project files on disk: `opencode.json`/`opencode.jsonc` and `*.json`/`*.jsonc` directly inside `.opencode/`, in the project directory and every parent up to the filesystem root. Project files must not contain `provider`, `enabled_providers` or `disabled_providers`, and `model`, `small_model`, `agent.<name>.model`, `mode.<name>.model` and `command.<name>.model` must be absent or of the form `broke/<provider>/<model>` from your allowlist. Anything else (or an unparseable file) makes the task fail with `OPENCODE_UNSAFE_CONFIG`; nothing is run and no fallback happens.
 
+### D2c. OpenCode permissions (deny list)
+The controller adds a `permission` block to the inline OpenCode config. Sensitive operations are **denied** (not approved on request): the tool call returns an error to the model and the task continues. Default deny categories for `bash` commands:
+
+- publication and push (`git push`, `gh auth`, `npm publish`, `docker push`, `cargo publish`, ...);
+- bulk delete (`rm -r` and variants, `find -delete`, `git clean`, `shred`);
+- deploy and production (`kubectl`, `helm`, `terraform apply`, `gcloud`, `aws`, `ssh`, ...);
+- environment-changing installs (`sudo`, `apt`, global `npm`/`pip --user` installs, `cargo install`, ...);
+- credential changes (`git config --global`, `opencode auth`, `ssh-keygen`, `npm login`, `docker login`, `passwd`, ...).
+
+Also denied: `external_directory` (paths outside the project), `websearch` and `doom_loop`. Add your own patterns in `config.yaml`:
+
+```yaml
+opencode:
+  permission:
+    extra_bash_deny: ["make deploy*"]
+```
+
+The built-in defaults cannot be removed or overridden; config can only add patterns. Deny is stricter than approval: Discord approval buttons (T061) are future work. The list is a **guardrail, not a security boundary**: wrapper scripts, interpreters, plugins and `git -C dir push` bypass it. The boundary is the OS user (Part C6). Project files must not contain a `permission` key, and `agent`/`mode` entries must not weaken these rules, or the task fails with `OPENCODE_UNSAFE_CONFIG`. See SPEC §11 R5 and TASKS T082 L12.
+
 ### D3. Smoke test (uses free quota)
 With no keys in OpenCode, a manual `opencode run` cannot work, so test through the controller:
 
@@ -272,8 +295,8 @@ Security rules (SPEC §11):
 - `opencode.managed_server: false` (daemon does not start `serve`, uses `opencode.server_url` without a password) exists for tests and debugging only and is unsupported for production: an externally started server cannot pass the gateway-only preflight.
 
 ### D5. Keep it running
-- Keep the controller itself running in a terminal or tmux window; it supervises `opencode serve`.
-- Automatic start on reboot is task T102 and will be done in a later round (systemd user service or Task Scheduler).
+- Keep the controller itself running in a terminal or tmux window (`scripts/start-daemon.sh`); it supervises `opencode serve`.
+- To start it as a service, see Part F (systemd unit example). Whether WSL stays up after a reboot is unverified (T082 L13).
 
 ---
 
@@ -303,6 +326,8 @@ Edit `config.yaml`:
 ```
 
 ### E2. Install the sudoers rule and verify (one-time; needs C6 steps 1-5 and D1)
+You can also let `sudo scripts/wsl-setup.sh --yes` do this (and C5, C6 steps 1-5). The manual steps:
+
 Never use `/tmp` for the temporary file, because `brokeoc` can write there. The subshell with `set -e` stops at the first error, and the `-s` test refuses an empty file (which `visudo -cf` would accept):
 
 ```bash
@@ -347,10 +372,32 @@ setsid -w sudo -n -u brokeoc -- /usr/local/bin/opencode auth list </dev/null 2>&
 ### E4. First start
 
 ```bash
-bash -c 'set -a; . ~/.config/broke-ai-coder/secrets.env; set +a; exec .venv/bin/python -m app --config config.yaml'
+scripts/start-daemon.sh
 ```
 
 If startup fails the daemon prints one line and exits with status 3 (for example `OpenCode has stored provider credentials for: ...` or `opencode serve did not become healthy: ...`); see Troubleshooting.
+
+---
+
+## Part F — Operate
+
+All scripts live in `scripts/`, run as your normal WSL user (not root) unless stated.
+
+- **Start:** `scripts/start-daemon.sh` (foreground; use tmux). It refuses root, a missing venv or config, unsafe secrets files and a second daemon.
+- **Stop:** `scripts/stop-daemon.sh` (`--timeout N`, `--force`). Under systemd use `sudo systemctl stop broke-ai-coder`.
+- **Health check:** `scripts/health-check.sh` runs `python -m app --check` and `--check-os-user` and reports whether the daemon runs. It loads no secrets.
+- **Live checks:** `scripts/live-checks.sh` is a read-only automated subset of TASKS T082 L0-L11. Run it from a shell without secrets; it prints `[MANUAL]` lines for what cannot be automated safely.
+- **Discord:** `/health` shows controller RSS/CPU, SQLite size, queue depth, cooldown counts, gateway and serve state. It excludes OpenCode and project child processes.
+- **Idle benchmark (T024):** `.venv/bin/python scripts/bench_idle.py --seconds 1800` measures the daemon process only (temporary database, no keys, no network) against the idle targets (RSS < 250 MB, CPU < 2%).
+- **systemd (example, system unit):** `scripts/systemd/broke-ai-coder.service` uses `User=` so it starts at distro boot without `loginctl enable-linger` and logs to the journal. Install:
+  ```bash
+  sed "s|@USER@|$USER|; s|@REPO@|$HOME/broke-ai-coder|" scripts/systemd/broke-ai-coder.service | sudo tee /etc/systemd/system/broke-ai-coder.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now broke-ai-coder
+  journalctl -u broke-ai-coder -f
+  ```
+  Do not add `NoNewPrivileges=` (the daemon needs setuid sudo for the OpenCode user) or `EnvironmentFile=` (secrets are loaded by `start-daemon.sh` only). Exit codes 2 and 3 are not restarted. Systemd needs `[boot] systemd=true` in `/etc/wsl.conf`. Whether the distro stays up with only systemd services running is unverified (T082 L13); starting WSL at Windows logon through Task Scheduler is the documented fallback.
+- **git version:** the agent workflow needs git 2.45.1 or newer (L5). If `git --version` is older: `sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install -y git`.
 
 ---
 
@@ -377,6 +424,10 @@ Do **not** send: the Discord bot token, any API key, or the contents of `secrets
 | `OpenCode credential store unreadable: <path>` | `auth.json` is not valid JSON or not readable; fix or delete it |
 | `opencode serve did not become healthy: ...` (exit 3) | See the exit code and stderr tail in the message; check `opencode.command`, that `opencode.server_port` is not already used (stop any old tmux `opencode serve`), and `opencode.server_start_timeout_s` |
 | `no enabled allowlisted models; check routing.provider_order/policies` | Enable at least one policy listed in `routing.provider_order` whose provider is enabled |
+| `server config key 'permission...' does not deny the required operations` | OpenCode's merged `GET /config` does not show the deny rules from D2c (assumptions P3/P1, TASKS T082 L12): check the OpenCode version and `opencode.permission.extra_bash_deny`, then restart the daemon |
+| `key 'permission' is not allowed in project config` | Remove `permission` from the project's `opencode.json`/`.opencode/*.json` (and agent entries that weaken bash/external_directory rules) |
+| `start-daemon: refused: secrets file mode is ...` or `malformed lines` | `chmod 600 ~/.config/broke-ai-coder/secrets.env`; fix the listed line numbers (`export NAME=value`, no spaces around `=`) |
+| `start-daemon: refused: the daemon is already running` | Stop it with `scripts/stop-daemon.sh` (or `systemctl stop broke-ai-coder`) |
 | Tasks fail with `OPENCODE_UNSAFE_CONFIG` | Remove `provider`/`enabled_providers`/`disabled_providers` and non-`broke/...` model keys from project `opencode.json` files, and delete `brokeoc`'s `auth.json` (E3) |
 | `a password is required` in the `--version` check | The sudoers file is not installed, or names the wrong user or binary path; regenerate it (E2) |
 | `user 'brokeoc' can access <path>` | `chmod` per C6 (home 700, `secrets.env` 600) and the `[automount] options="umask=077"` entry in `/etc/wsl.conf` |

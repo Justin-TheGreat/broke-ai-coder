@@ -148,6 +148,8 @@ Reason: OpenCode requested this command.
 [Approve] [Deny]
 ```
 
+**Current implementation:** sensitive operations are denied by default through OpenCode permission rules (`app/opencode/permissions.py`; see §11 R5). Discord approval (T061) is future work. Deny is stricter than approval. The "trusted local project" exemption is not supported yet: the built-in deny list cannot be removed, and config can only add patterns (`opencode.permission.extra_bash_deny`).
+
 ## 6. Model-routing requirements
 
 ### 6.1 Router input
@@ -459,6 +461,7 @@ Residual risks:
 - **R2.** `opencode` run by the user outside the daemon with their own keys or config is outside this guarantee.
 - **R3.** Managed or MDM system OpenCode configs outrank inline config (admin-only).
 - **R4.** Account-level billing must stay off (OpenRouter $0 balance, Gemini project without billing, Groq Free plan) as the second layer.
+- **R5.** The OpenCode permission deny list (`git push`, recursive delete, deploy, global installs, credential changes, `external_directory`, `websearch`) is a guardrail, not a security boundary. It can be bypassed by wrapper scripts (`bash x.sh`), interpreters, pipelines such as `curl | sh`, plugins, project agent markdown (`.opencode/agent/*.md` is not checked) and `git -C dir push`. The boundary is the dedicated OS user (R1: no credentials, no sudo, no secrets). The per-task preflight rejects a missing or weakened `permission` block and `permission` keys in project JSON files.
 
 ### Network
 
@@ -686,6 +689,8 @@ opencode:
   server_start_timeout_s: 30
   server_restart_max_backoff_s: 60
   env_passthrough: []                   # extra env names for OpenCode; key-like names rejected
+  permission:
+    extra_bash_deny: []                 # extra bash patterns to deny; built-in list cannot be removed
 
 gateway:
   port: 0                               # 127.0.0.1 only; 0 = ephemeral

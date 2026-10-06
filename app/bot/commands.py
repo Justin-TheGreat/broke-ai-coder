@@ -21,10 +21,11 @@ from app.providers.base import ModelCapability, QuotaRecord
 from app.redaction import SecretRedactor
 from app.router.policy import ModelListing
 from app.runtime.interfaces import ExecutorHealth
+from app.runtime.resources import ResourceSample
 
 logger = logging.getLogger(__name__)
 
-COMMAND_NAMES = ("code", "status", "usage", "models", "sessions", "cancel")
+COMMAND_NAMES = ("code", "status", "usage", "models", "sessions", "cancel", "health")
 REF_RE = re.compile(r"^[0-9a-f-]{6,36}$")
 
 
@@ -65,6 +66,23 @@ class ProviderModels:
     capabilities: Mapping[str, ModelCapability]
 
 
+@dataclass(frozen=True, slots=True)
+class HealthSnapshot:
+    resources: ResourceSample | None
+    sqlite_db_bytes: int | None
+    last_cleanup_at: str | None
+    task_queue_depth: int
+    event_queue_depth: int
+    event_dropped_count: int
+    running_task_id: str | None
+    provider_cooldowns: int  # active entries with model None
+    model_cooldowns: int  # active entries with a model
+    gateway_up: bool | None  # None = unknown/not wired
+    serve_ready: bool | None  # None = not managed
+    serve_fatal_error: str | None
+    os_user: str | None
+
+
 class SubmitStatus(StrEnum):
     QUEUED = "QUEUED"
     QUEUE_FULL = "QUEUE_FULL"
@@ -96,6 +114,8 @@ class BotBackend(Protocol):
     def models(self) -> list[ProviderModels]: ...
 
     def sessions(self, limit: int = 10) -> list[SessionRecord]: ...
+
+    def health(self) -> HealthSnapshot: ...
 
 
 _SUBMIT_MESSAGES = {
@@ -177,4 +197,6 @@ async def _dispatch(
         return Reply(fmt.format_models(backend.models(), redactor=redactor), True)
     if name == "sessions":
         return Reply(fmt.format_sessions(backend.sessions(), redactor=redactor), True)
+    if name == "health":
+        return Reply(fmt.format_health(backend.health(), redactor=redactor), True)
     return Reply("Unknown command.", True)

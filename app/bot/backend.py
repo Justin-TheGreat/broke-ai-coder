@@ -4,6 +4,7 @@ from collections.abc import Mapping
 
 from app.bot.commands import (
     CommandContext,
+    HealthSnapshot,
     ProviderModels,
     StatusSnapshot,
     SubmitResult,
@@ -21,6 +22,7 @@ from app.quota.estimator import estimate_quota
 from app.quota.normalize import ESTIMATE_SOURCE_PREFIX
 from app.router.policy import ModelRoutingStatus, model_listing
 from app.runtime.daemon import AgentController, TaskSubmission
+from app.runtime.diagnostics import RuntimeProbes
 from app.timeutil import utcnow
 
 
@@ -33,9 +35,11 @@ class ControllerBackend:
         config: AppConfig,
         *,
         environ: Mapping[str, str] | None = None,
+        probes: RuntimeProbes | None = None,
     ) -> None:
         self._controller = controller
         self._config = config
+        self._probes = probes
         self._environ = environ
 
     def _conn(self):  # noqa: ANN202
@@ -133,6 +137,50 @@ class ControllerBackend:
             caps = {c.model: c for c in repo.allowed_capabilities(self._config, provider)}
             out.append(ProviderModels(pid, provider, listings, caps))
         return out
+
+    def health(self) -> HealthSnapshot:
+        m = self._controller.metrics()
+        orch = self._controller.orchestrator
+        cooldowns = orch.cooldowns.active(utcnow()) if orch is not None else {}
+        probes = self._probes
+
+        def _int(key: str) -> int:
+            value = m.get(key)
+            return int(value) if isinstance(value, int) else 0
+
+        def _str(key: str) -> str | None:
+            value = m.get(key)
+            return value if isinstance(value, str) else None
+
+        db_bytes = m.get("sqlite_db_bytes")
+        gateway_up: bool | None = None
+        serve_ready: bool | None = None
+        serve_fatal: str | None = None
+        os_user: str | None = None
+        resources = None
+        if probes is not None:
+            resources = probes.sampler.sample()
+            if probes.gateway_up is not None:
+                gateway_up = bool(probes.gateway_up())
+            if probes.serve_state is not None:
+                serve_ready, serve_fatal = probes.serve_state()
+            if probes.os_user_summary is not None:
+                os_user = probes.os_user_summary()
+        return HealthSnapshot(
+            resources=resources,
+            sqlite_db_bytes=db_bytes if isinstance(db_bytes, int) else None,
+            last_cleanup_at=_str("last_cleanup_at"),
+            task_queue_depth=_int("task_queue_depth"),
+            event_queue_depth=_int("event_queue_depth"),
+            event_dropped_count=_int("event_dropped_count"),
+            running_task_id=_str("running_task_id"),
+            provider_cooldowns=sum(1 for (_, model) in cooldowns if model is None),
+            model_cooldowns=sum(1 for (_, model) in cooldowns if model is not None),
+            gateway_up=gateway_up,
+            serve_ready=serve_ready,
+            serve_fatal_error=serve_fatal,
+            os_user=os_user,
+        )
 
     def sessions(self, limit: int = 10) -> list[SessionRecord]:
         return SessionRepository(self._conn()).list_recent(limit)

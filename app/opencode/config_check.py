@@ -22,6 +22,12 @@ B13. OpenCode merges configs (later wins): global ``~/.config/opencode/opencode.
      project file must not contain ``provider``, ``enabled_providers`` or
      ``disabled_providers``. OPENCODE_* variables never reach the OpenCode child (env
      allowlist).
+
+B14. The inline config also carries a ``permission`` block (``permissions.py``). The effective
+     ``GET /config`` must still deny the built-in bash patterns (plus the configured extras),
+     ``external_directory``, ``websearch`` and ``doom_loop``, and every bash rule after the leading
+     ``"*"`` must be a deny. A project file must not contain ``permission`` at all, and its
+     ``agent``/``mode`` entries must not weaken the deny rules (assumption P6).
 """
 
 from __future__ import annotations
@@ -37,6 +43,11 @@ import httpx
 from app.config.models import GATEWAY_PROVIDER_ID, AppConfig
 from app.opencode.auth_store import auth_store_problem
 from app.opencode.endpoint import ServerEndpoint
+from app.opencode.permissions import (
+    agent_permission_problem,
+    default_permission_block,
+    permission_problem,
+)
 from app.runtime.interfaces import SmallModelCheck
 
 _NPM_PACKAGE = "@ai-sdk/openai-compatible"
@@ -112,6 +123,7 @@ async def check_server_config(
     transport: httpx.AsyncBaseTransport | None = None,
     environ: Mapping[str, str] | None = None,
     auth_problem: Callable[[], Awaitable[str | None]] | None = None,
+    required_permission: Mapping[str, Any] | None = None,
 ) -> tuple[SmallModelCheck, str]:
     """Never raises. Returns (OK|UNSAFE|UNAVAILABLE, detail naming key paths only)."""
     if auth_problem is not None:
@@ -140,6 +152,13 @@ async def check_server_config(
     bad = _gateway_shape_problem(body, allowed, gateway_base_url)
     if bad is not None:
         return SmallModelCheck.UNSAFE, f"server config key '{bad}' is not gateway-only"
+    required = default_permission_block() if required_permission is None else required_permission
+    bad = permission_problem(body, required)
+    if bad is not None:
+        return (
+            SmallModelCheck.UNSAFE,
+            f"server config key '{bad}' does not deny the required operations",
+        )
     return SmallModelCheck.OK, ""
 
 
@@ -223,6 +242,18 @@ def check_project_config(project_dir: str, allowed: frozenset[str]) -> tuple[Sma
                 return (
                     SmallModelCheck.UNSAFE,
                     f"{path}: key '{forbidden}' is not allowed in project config",
+                )
+        if "permission" in data:
+            return (
+                SmallModelCheck.UNSAFE,
+                f"{path}: key 'permission' is not allowed in project config",
+            )
+        for section in ("agent", "mode"):
+            bad = agent_permission_problem(section, data.get(section))
+            if bad is not None:
+                return (
+                    SmallModelCheck.UNSAFE,
+                    f"{path}: key '{bad}' would weaken the OpenCode deny rules",
                 )
         bad = _bad_model_key(data, allowed)
         if bad is not None:

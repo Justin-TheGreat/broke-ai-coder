@@ -451,3 +451,59 @@ async def _run_full(tmp_path, make_config, steps):
         return tasks, argv.exists(), n, orch.cooldowns.active(NOW), True
     finally:
         await c.stop()
+
+
+# ---- T060: permission keys in project files ------------------------------------------------
+
+
+def _project_with(tmp_path, data):
+    (tmp_path / "opencode.json").write_text(json.dumps(data), encoding="utf-8")
+    return str(tmp_path)
+
+
+def test_project_permission_key_is_unsafe(tmp_path):
+    out, detail = check_project_config(_project_with(tmp_path, {"permission": {}}), ALLOWED)
+    assert out == SmallModelCheck.UNSAFE
+    assert "key 'permission' is not allowed in project config" in detail
+
+
+def test_project_agent_permission_bash_allow_is_unsafe(tmp_path):
+    data = {"agent": {"build": {"permission": {"bash": {"*": "allow"}}}}}
+    out, detail = check_project_config(_project_with(tmp_path, data), ALLOWED)
+    assert out == SmallModelCheck.UNSAFE
+    assert "agent.build.permission.bash" in detail and "would weaken" in detail
+
+
+def test_project_agent_permission_edit_deny_is_ok(tmp_path):
+    data = {"agent": {"build": {"permission": {"edit": "deny"}}}}
+    assert check_project_config(_project_with(tmp_path, data), ALLOWED)[0] == SmallModelCheck.OK
+
+
+@pytest.mark.parametrize("value", [{}, {"bash": "allow"}, "allow", None, []])
+def test_project_permission_key_any_value_is_unsafe_and_names_key_only(tmp_path, value):
+    out, detail = check_project_config(_project_with(tmp_path, {"permission": value}), ALLOWED)
+    assert out == SmallModelCheck.UNSAFE
+    assert "key 'permission' is not allowed in project config" in detail
+    assert "allow" not in detail.replace("not allowed", "")
+
+
+@pytest.mark.parametrize(
+    ("data", "path"),
+    [
+        ({"mode": {"x": {"permission": {"bash": "allow"}}}}, "mode.x.permission.bash"),
+        (
+            {"agent": {"x": {"permission": {"external_directory": "allow"}}}},
+            "agent.x.permission.external_directory",
+        ),
+        ({"agent": {"x": {"permission": {"doom_loop": "ask"}}}}, "agent.x.permission.doom_loop"),
+        (
+            {"agent": {"x": {"permission": {"bash": {"git push*": "allow"}}}}},
+            "agent.x.permission.bash",
+        ),
+        ({"agent": {"x": {"permission": "allow"}}}, "agent.x.permission"),
+    ],
+)
+def test_project_agent_permission_weakening_variants_are_unsafe(tmp_path, data, path):
+    out, detail = check_project_config(_project_with(tmp_path, data), ALLOWED)
+    assert out == SmallModelCheck.UNSAFE
+    assert f"'{path}'" in detail and "git push" not in detail

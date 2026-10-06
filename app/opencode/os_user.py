@@ -56,6 +56,7 @@ import sys
 import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -66,6 +67,7 @@ from app.opencode.auth_store import credential_problem, credential_providers_fro
 from app.opencode.env import build_opencode_env
 from app.opencode.process import kill_process_tree, resolve_executable, wait_quiet
 from app.runtime.interfaces import StartupError
+from app.timeutil import utcnow
 
 if TYPE_CHECKING:
     from app.config.models import AppConfig
@@ -338,6 +340,8 @@ class OpenCodeLauncher(Protocol):
 
     async def stop(self) -> None: ...
 
+    def status_summary(self) -> str: ...
+
 
 class DirectLauncher:
     """Mode ``none``: OpenCode runs as the daemon user (today's behaviour)."""
@@ -378,6 +382,12 @@ class DirectLauncher:
 
     async def stop(self) -> None:
         return None
+
+    def status_summary(self) -> str:
+        return (
+            "mode none: OpenCode runs as the daemon user"
+            " (tests/dev only, unsupported for production)"
+        )
 
 
 def _under(path: str, home: str) -> bool:
@@ -426,6 +436,7 @@ class SudoLauncher:
         self._probe = probe
         self.name = config.opencode.os_user.name
         self._serve_session: int | None = None
+        self._checked_at: datetime | None = None
 
     # ---- launching -------------------------------------------------
 
@@ -670,12 +681,31 @@ class SudoLauncher:
 
     async def start(self) -> None:
         await self.self_check()
+        self._checked_at = utcnow()
         await self.sweep()
         user = self._probe.user_by_name(self.name)
         logger.info("OpenCode runs as %s (uid %d) via sudo", self.name, user.uid if user else -1)
 
     async def stop(self) -> None:
         await self.sweep()
+
+    def status_summary(self) -> str:
+        """One secret-free line for /health. Never raises."""
+        checked = self._checked_at
+        if checked is None:
+            return f"sudo as {self.name}: self-check not run yet"
+        try:
+            state = (
+                "ENABLED (unsafe; restart required)"
+                if self._probe.interop_enabled()
+                else "disabled"
+            )
+        except Exception:
+            state = "unknown"
+        return (
+            f"sudo as {self.name}: isolation self-check passed at {checked:%Y-%m-%d %H:%M} UTC;"
+            f" WSL interop now {state}"
+        )
 
 
 def render_sudoers(daemon_user: str, oc_user: str, opencode_path: str) -> str:

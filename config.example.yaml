@@ -51,6 +51,10 @@ opencode:
     mode: sudo          # none = OpenCode runs as the daemon user: tests/Windows dev only, unsupported for production (R1)
     name: brokeoc       # dedicated user, see docs/SETUP-discord-opencode.md Part C6
     protected_paths: ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]  # must be unreadable by os_user
+  permission:
+    # Extra OpenCode bash patterns to DENY on top of the built-in list (git push, recursive rm,
+    # deploy, global installs, credential changes). The built-in list cannot be removed.
+    extra_bash_deny: []
   # projects: {myproj: /workspace/myproj}   # extra project names for /code project:<name>
   run_timeout_s: 1800
   kill_grace_s: 5
@@ -65,6 +69,8 @@ opencode:
   # .opencode/*.json files (project dir up to the filesystem root) must not contain provider,
   # enabled_providers or disabled_providers, or model keys outside broke/... Otherwise tasks fail
   # closed with OPENCODE_UNSAFE_CONFIG. Policy providers must be openrouter, gemini or groq.
+  # The same preflight requires the `permission` deny rules (see `permission:` above) in GET /config
+  # and rejects a `permission` key in project files.
 gateway:
   port: 0                        # 127.0.0.1 only; 0 = ephemeral (the daemon tells OpenCode)
   max_request_bytes: 16777216    # reject larger request bodies (413)

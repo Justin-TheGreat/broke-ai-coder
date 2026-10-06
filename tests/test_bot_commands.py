@@ -7,6 +7,7 @@ from test_bot_format import task
 
 from app.bot.commands import (
     CommandContext,
+    HealthSnapshot,
     StatusSnapshot,
     SubmitResult,
     SubmitStatus,
@@ -60,6 +61,11 @@ class FakeBackend:
         self.calls.append(("models",))
         self._check()
         return []
+
+    def health(self):
+        self.calls.append(("health",))
+        self._check()
+        return HealthSnapshot(None, None, None, 0, 0, 0, None, 0, 0, None, None, None, None)
 
     def sessions(self, limit=10):
         self.calls.append(("sessions",))
@@ -148,3 +154,15 @@ async def test_secret_in_backend_data_redacted():
     b.session_text = f"proj-{SECRET}"
     r = await cmd("sessions", b, redactor=SecretRedactor([SECRET]))
     assert SECRET not in r.content and "[REDACTED]" in r.content
+
+
+async def test_health_authorized_and_unauthorized():
+    b = FakeBackend()
+    r = await cmd("health", b)
+    assert r.ephemeral and r.content.startswith("Controller health")
+    assert "excludes OpenCode" in r.content
+    assert b.calls == [("health",)]
+    b2 = FakeBackend()
+    denied = await cmd("health", b2, CommandContext(99, 2, 3))
+    assert denied.content == "Not authorized."
+    assert b2.calls == []

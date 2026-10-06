@@ -1,674 +1,763 @@
-# Spec: run OpenCode as a separate Linux user (T072, closes R1) + N9 + N10 (branch feat/opencode-user)
+# Spec: go-live readiness round (branch feat/go-live, on 331ae69)
 
-Goal: `opencode serve` and every `opencode run --attach` child run as a dedicated unprivileged
-Linux user (default `brokeoc`) through `sudo -n -u brokeoc -- <exact argv>`. That user has its own
-HOME and cannot read the daemon user's home, the secrets file, or `/proc/<daemon pid>/environ`.
-The daemon never needs root. It keeps the keys, and OpenCode reaches models only through the
-gateway.
+## OPEN QUESTIONS
 
-Run everything with `.venv/Scripts/python` (`-m pytest -q`, `-m ruff check .`,
-`-m ruff format --check .`, `-m app --check --config config.example.yaml`). Tests make no real
-network calls and never run real sudo.
+None of these block the work. The decisions below were made by the planner. Flag any of them in changes.md if the code shows it is wrong.
 
-## OPEN QUESTION — RESOLVED by the user on 2026-10-04: implement the default (disable interop) exactly as written below.
+- D1. **Defaults cannot be removed.** The built-in deny list cannot be removed or overridden; config can only add patterns. SPEC §5.2's "unless explicitly disabled for a trusted local project" stays future work, together with T061.
+- D2. **Permission keys.**
+  - `doom_loop` is also set to `"deny"`. OpenCode's default for it is `"ask"`, and "ask" is undocumented in headless mode.
+  - `webfetch`, `question`, `edit` and `read` are left at OpenCode's defaults (not requested).
+- D3. **websearch is denied.** It sends queries to a third-party search service (Exa) outside the gateway. Its cost and billing terms are not verified, and the free-only rule says that unverified means deny. It is probably not even registered without `OPENCODE_ENABLE_EXA`, so this is belt and braces.
+- D4. **T102 uses a system unit.** The unit is `scripts/systemd/broke-ai-coder.service` with `User=`, not a user unit, because:
+  - it starts at distro boot without `loginctl enable-linger`;
+  - it does not depend on the WSL user-session/dbus manager;
+  - it logs to the system journal.
+  It is an example only: the user installs it with sudo.
+- D5. **No repository Python code runs as root.** `wsl-setup.sh` runs every Python helper as the daemon user through `runuser -u "$SUDO_USER" --` and does only file and user operations as root.
 
-**Q1. WSL interop and `/mnt/c` must be closed, or R1 stays open on WSL.**
-- With WSL interop on, ANY Linux user (including `brokeoc`) can run a Windows `.exe` as the
-  logged-in Windows account. It can also download one into its own home and run it. That
-  Windows process can read `\\wsl$\...\home\<daemon user>\...\secrets.env` and every Windows
-  file.
-- With the default DrvFs mount, `/mnt/c` is world-readable.
-- **Default:**
-  - The setup guide adds `[interop] enabled=false`, `appendWindowsPath=false` and
-    `[automount] options="umask=077"` to `/etc/wsl.conf`.
-  - The self-check FAILS CLOSED while any `WSLInterop*` binfmt entry is enabled.
-  - `/mnt/c` is in the default `protected_paths`, so the agent must not be able to read it.
-- **Cost to the user:** no launching Windows programs from WSL shells (`code .`,
-  `explorer.exe`, `clip.exe`, `powershell.exe`). The user must confirm. Everything else in this
-  spec is settled.
+---
 
-## Design decisions (settled)
+## 1. T060 minimal: OpenCode permission deny list
 
-1. **Launch mechanism: sudo with a NOPASSWD rule whose runas is restricted to `brokeoc`.**
-   - Every command runs as `brokeoc`, never root. Running a command as the LESS-privileged user
-     cannot raise the daemon's privileges, so the rule is safe by construction.
-   - Commands are exact absolute paths with any arguments: the opencode binary, plus
-     `/usr/bin/pkill`, `/usr/bin/test` and `/usr/bin/head`. Arguments cannot be pinned because
-     the prompt is an argument.
-   - argv goes to sudo after `--`, with no shell anywhere. sudo itself runs no shell.
-   - Rejected alternatives:
-     - `runuser`/`setpriv` need root.
-     - A systemd unit (`User=brokeoc`) needs polkit or sudo for `systemctl` anyway. It would also
-       force the per-run password and token onto disk as env files, and it does not cover the
-       per-task `opencode run`.
-     - ssh to localhost needs sshd and key management.
-2. **Environment.**
-   - sudoers sets `env_reset` and `env_keep = "<exact list>"` (replace, not append) in a
-     `Defaults>brokeoc` entry.
-   - The env given to the sudo process is only `PATH=/usr/bin:/bin`, `LANG` (if present), and
-     the allowlisted `OPENCODE_*` extras.
-   - The daemon's HOME/XDG_*/keys never reach sudo. sudo sets HOME/USER/LOGNAME/SHELL/PATH from
-     brokeoc's passwd entry and secure_path.
-   - `OPENCODE_CONFIG_CONTENT` (gateway token, not a provider key) and the serve password are
-     acceptable for the agent to hold.
-3. **Killing processes across users.**
-   - The daemon cannot signal brokeoc processes, so it uses `sudo -n -u brokeoc -- /usr/bin/pkill`.
-   - Per launch, it targets the session id: the launcher pid, because `spawn_kwargs()` uses
-     `start_new_session=True`.
-   - On every serve reap/stop and at startup it runs a sweep, `pkill -KILL -U brokeoc`.
-     `brokeoc` runs nothing else. This closes **N1** (detached agent processes outliving serve).
-4. **Filesystem.**
-   - Daemon home is 700 and the secrets file is 600.
-   - Shared group `brokeai` = {daemon user, brokeoc}.
-   - `/workspace` is `daemon:brokeai 2770` with default ACL `g:brokeai:rwX`.
-   - The serve cwd is `/var/lib/broke-ai-coder/opencode-server` (`brokeoc:brokeai 2770`).
-   - The opencode binary is root-owned at `/usr/local/bin/opencode`.
-   - brokeoc's home is 700. The daemon never reads it directly: the auth.json check runs
-     `test`/`head` AS brokeoc.
-5. **/proc.**
-   - `/proc/<pid>/environ` is mode 0400. Reading it also requires PTRACE_MODE_READ (same uid or
-     CAP_SYS_PTRACE), so another unprivileged uid cannot read it.
-   - hidepid is NOT used: WSL `/proc` remount is awkward, and the daemon's cmdline holds no
-     secrets.
-   - The self-check probes it anyway.
-6. **TIOCSTI.**
-   - All sudo children are spawned with `start_new_session=True` (no controlling tty),
-     `stdin=DEVNULL` and the default `close_fds=True`, so no tty fd is reachable.
-   - The sudoers file therefore sets `!use_pty`. That keeps stdin/stdout as our pipes and
-     /dev/null, which the executor relies on (B9).
-7. **Default mode.**
-   - `opencode.os_user.mode` defaults to `"sudo"` (fail closed).
-   - `"none"` = today's behaviour (same user), for tests, Windows and dev. It is loudly warned
-     as unsupported for production.
-   - The test config sets `"none"`.
-8. **Self-check.**
-   - Runs as a `RuntimeService.start()` placed before the managed serve. Failure raises
-     `StartupError`, so the daemon exits 3 and runs no tasks.
-   - Also available as `python -m app --check-os-user`.
+### 1.1 New file `app/opencode/permissions.py`
 
-## Recorded assumptions (put in the `app/opencode/os_user.py` docstring; verify live, see T082 L1-L11)
-
-- S1. sudo relays SIGTERM it receives to the command. It cannot relay SIGKILL.
-- S2. Without a pty, the command stays in sudo's session, so sid == launcher pid. If sudo instead
-  execs directly, the pid is the command's and sid is the same.
-- S3. `Defaults>brokeoc env_keep = "..."` applies to commands run as brokeoc.
-- S4. Under env_reset, Ubuntu sudo sets HOME/USER/LOGNAME/SHELL from the target passwd entry and
-  PATH from secure_path. sudo keeps the caller's cwd.
-- S5. With XDG_DATA_HOME unset for brokeoc, OpenCode's auth store is
-  `<brokeoc home>/.local/share/opencode/auth.json` (G6).
-- P1. /proc environ: see decision 5.
-- P2. TIOCSTI: see decision 6.
-- W1. WSL interop binfmt entries are named `WSLInterop` and/or `WSLInterop-late` under
-  `/proc/sys/fs/binfmt_misc/`. Their first line is `enabled` or `disabled`.
-
-## Files
-
-### Create `app/opencode/os_user.py`
-
-Copy patterns from:
-- `app/opencode/process.py`: subprocess spawn, never-raise kill, `logger.warning(type(e).__name__)`.
-- `app/runtime/interfaces.py`: Protocol style.
-
-Rules:
-- No top-level `pwd`/`grp` import. Import them lazily inside `SystemHostProbe`, so the module
-  imports on Windows.
-- Signals are passed as names ("TERM"/"KILL"), never `signal.SIGKILL` at module level.
+Module docstring: the deny list is a **guardrail, not a security boundary**. Bypasses exist: wrapper scripts (`bash x.sh`), interpreters, plugins, project agent markdown, and `git -C dir push`. The boundary is the OS user (no credentials, no sudo, no secrets; T072). Deny is stricter than approval: T061 approval buttons are future work. List the assumptions P1-P6 (section 1.6) in the docstring, in the same style as `app/opencode/os_user.py`.
 
 ```python
-SUDO = "/usr/bin/sudo"; PKILL = "/usr/bin/pkill"; TEST = "/usr/bin/test"; HEAD = "/usr/bin/head"
-SUDO_CHILD_PATH = "/usr/bin:/bin"
-KEEP_ENV: tuple[str, ...] = ("LANG", "OPENCODE_CONFIG_CONTENT", "OPENCODE_SERVER_PASSWORD",
-                             "OPENCODE_SERVER_USERNAME")
-SUDOERS_NAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
-SUDOERS_PATH_RE = re.compile(r"^/[A-Za-z0-9._+/-]+$")
-PRIVILEGED_GROUPS = frozenset({"root", "sudo", "admin", "wheel", "adm", "docker", "lxd", "disk", "shadow"})
-_PROBE_TIMEOUT_S = 10.0; _VERSION_TIMEOUT_S = 30.0; _AUTH_MAX_BYTES = 1_048_576
-ISOLATION_FAILED = "OpenCode user isolation (opencode.os_user) check failed: "
+DENY = "deny"
+ALLOW = "allow"
+DENIED_TOOLS: tuple[str, ...] = ("external_directory", "websearch", "doom_loop")
+DEFAULT_BASH_DENY: tuple[str, ...] = (...)  # exact list below, in this order
 
-@dataclass(frozen=True, slots=True)
-class UserInfo: name: str; uid: int; gid: int; home: str
+def bash_deny_patterns(cfg: OpenCodePermissionConfig) -> tuple[str, ...]:
+    """DEFAULT_BASH_DENY followed by cfg.extra_bash_deny; duplicates dropped, first occurrence kept."""
 
-@dataclass(frozen=True, slots=True)
-class ProbeResult: returncode: int | None; stdout: bytes = b""; stderr: bytes = b""
-# returncode None = timeout or OSError
+def build_permission_block(cfg: OpenCodePermissionConfig) -> dict[str, Any]:
+    """{"bash": {"*": "allow", <p>: "deny", ...}, "external_directory": "deny",
+        "websearch": "deny", "doom_loop": "deny"}. "*" is the FIRST bash key (last match wins)."""
 
-class HostProbe(Protocol):
-    def platform(self) -> str: ...                     # sys.platform
-    def euid(self) -> int: ...
-    def pid(self) -> int: ...
-    def user_by_uid(self, uid: int) -> UserInfo | None: ...
-    def user_by_name(self, name: str) -> UserInfo | None: ...
-    def group_names(self, user: UserInfo) -> frozenset[str]: ...   # os.getgrouplist + grp
-    def interop_enabled(self) -> bool: ...  # any /proc/sys/fs/binfmt_misc/WSLInterop* whose first
-                                            # line is "enabled"; unreadable entry -> True
-    def is_dir(self, path: str) -> bool: ...
-    def killpg(self, pgid: int, sig: str) -> None: ...  # quiet; sig in {"TERM","KILL"}
-    async def run(self, argv: Sequence[str], *, timeout_s: float) -> ProbeResult: ...
+def default_permission_block() -> dict[str, Any]:
+    return build_permission_block(OpenCodePermissionConfig())
 
-class SystemHostProbe:  # real implementation
+def permission_problem(body: Mapping[str, Any], required: Mapping[str, Any]) -> str | None:
+    """Key path of the first problem in a merged OpenCode config, or None. Never includes pattern text."""
+
+def agent_permission_problem(section: str, entries: Any) -> str | None:
+    """Shared with the project-file check (see 1.4)."""
 ```
 
-`SystemHostProbe.run` rules:
-- Call `asyncio.create_subprocess_exec(*argv, stdin=DEVNULL, stdout=PIPE, stderr=PIPE, env={"PATH": SUDO_CHILD_PATH}, start_new_session=True)`.
-- Then `communicate()` under `wait_for(timeout_s)`.
-- On timeout: `proc.kill()` (suppress errors), wait, and return `ProbeResult(None)`.
-- On OSError: return `ProbeResult(None)`.
+`DEFAULT_BASH_DENY`, exactly these strings in this order. Comments group them by category: publication/push, bulk delete, deploy/production, environment-changing installs, credentials. None may contain `API_KEY` or `sk-`; `tests/test_opencode_server.py:115` asserts that.
+
+```
+"*git push*", "gh auth*", "gh repo delete*", "gh release*", "docker push*", "npm publish*",
+"pnpm publish*", "yarn publish*", "yarn npm publish*", "cargo publish*", "twine upload*",
+"gem push*", "poetry publish*", "uv publish*",
+"rm -r*", "rm -R*", "rm -fr*", "rm -fR*", "rm -f -r*", "rm --recursive*", "rm * -r*",
+"rm * -R*", "rm * -fr*", "rm * -fR*", "rm * --recursive*", "find * -delete*", "git clean*",
+"git rm -r*", "shred *",
+"kubectl *", "helm *", "terraform apply*", "terraform destroy*", "pulumi up*",
+"pulumi destroy*", "vercel*", "netlify deploy*", "fly deploy*", "flyctl deploy*",
+"firebase deploy*", "heroku *", "serverless deploy*", "sls deploy*", "gcloud *", "aws *",
+"az *", "ansible-playbook*", "ssh *", "scp *",
+"sudo*", "su *", "apt *", "apt-get *", "aptitude *", "dpkg -i*", "snap *", "brew *",
+"npm install -g*", "npm install --global*", "npm i -g*", "npm i --global*", "npm -g *",
+"pnpm add -g*", "pnpm add --global*", "pnpm install -g*", "yarn global*",
+"pip install --user*", "pip3 install --user*", "python -m pip install --user*",
+"python3 -m pip install --user*", "*--break-system-packages*", "pipx *", "uv tool install*",
+"cargo install*", "go install*", "gem install*",
+"git config --global*", "git config --system*", "git credential*", "opencode auth*",
+"ssh-keygen*", "ssh-add*", "ssh-copy-id*", "npm login*", "npm adduser*", "npm token*",
+"docker login*", "passwd*", "chpasswd*"
+```
+
+`permission_problem(body, required)` rules. Return the first matching key path:
+
+1. `body["permission"]` is missing or not a dict → `"permission"`.
+2. For each `k` in `DENIED_TOOLS` that is present in `required`: if `perm.get(k) != "deny"` → `f"permission.{k}"`.
+3. `bash = perm.get("bash")` is not a dict → `"permission.bash"`.
+4. Walk `bash.items()` in order. Any value that is not the string `"deny"` → `"permission.bash"`, except index 0 with key `"*"`, which may hold any string. This is what makes last-match-wins safe: every rule after the leading `"*"` is a deny.
+5. For each pattern `p` in `required["bash"]` other than `"*"`: if `bash.get(p) != "deny"` → `"permission.bash"`.
+6. For `section` in `("agent", "mode")`, return `agent_permission_problem(section, body.get(section))` if it is not None.
+
+`agent_permission_problem(section, entries)`:
+- If `entries` is not a dict, return None. The model check already reports a non-dict section.
+- For each `name, entry` whose `entry` is a dict containing `"permission"`, with `p = entry["permission"]`:
+  - `p` is not a dict → `f"{section}.{name}.permission"`.
+  - For `k` in `DENIED_TOOLS`: if `k in p and p[k] != "deny"` → `f"{section}.{name}.permission.{k}"`.
+  - If `"bash"` is in `p`:
+    - `p["bash"] == "deny"` is OK;
+    - a dict whose values are all `"deny"` is OK;
+    - anything else → `f"{section}.{name}.permission.bash"`.
+  - Other keys (edit, read, ...) are not checked.
+
+### 1.2 Config: `app/config/models.py`
 
 ```python
-class OpenCodeLauncher(Protocol):  # also a RuntimeService
-    isolated: bool
-
-    def executable(self, command0: str) -> str: ...  # raises StartupError
-    def command(self, argv: Sequence[str]) -> list[str]: ...
-    def environment(
-        self, environ: Mapping[str, str], *, passthrough: Sequence[str], extra: Mapping[str, str]
-    ) -> dict[str, str]: ...
-    async def kill_tree(self, proc: asyncio.subprocess.Process, *, grace_s: float) -> None: ...
-    async def sweep(self) -> None: ...
-    async def auth_store_problem(self) -> str | None: ...
-    async def start(self) -> None: ...
-    async def stop(self) -> None: ...
-```
-
-**`DirectLauncher(environ: Mapping[str, str] | None = None)`** (`isolated = False`) keeps today's
-behaviour exactly:
-- `executable` = `resolve_executable`.
-- `command` = `list(argv)`.
-- `environment` = `build_opencode_env(...)`.
-- `kill_tree` = `kill_process_tree`.
-- `sweep`/`stop` do nothing.
-- `auth_store_problem` = `await asyncio.to_thread(auth_store_problem, environ)`.
-- `start()` logs ONE warning: `"opencode.os_user.mode is 'none': OpenCode runs as the daemon user and can read its secrets (residual risk R1); unsupported for production"`.
-
-**`SudoLauncher(config: AppConfig, *, probe: HostProbe)`** (`isolated = True`). `name` =
-`config.opencode.os_user.name`. Methods:
-
-- `executable(c0)`: return `c0` if `PurePosixPath(c0).is_absolute()`. Otherwise raise
-  `StartupError("opencode.command[0] must be an absolute path when opencode.os_user.mode is sudo")`.
-- `command(argv)`: `[SUDO, "-n", "-u", name, "--", *argv]`.
-- `environment(environ, *, passthrough, extra)`:
-  - Return `{"PATH": SUDO_CHILD_PATH}`, plus `LANG` if it is in `environ`, plus the extras whose
-    key is in `KEEP_ENV`. Other extras are dropped, because sudo would drop them anyway.
-  - `passthrough` is ignored: the self-check rejects a non-empty passthrough.
-- `_pkill(*args)`:
-  - `await probe.run(self.command([PKILL, *args]), timeout_s=_PROBE_TIMEOUT_S)`.
-  - Never raises. Log a warning if the return code is not in (0, 1).
-- `kill_tree(proc, *, grace_s)`: never raises; wrap everything in `try/except Exception` and log.
-  `pid = proc.pid` (always > 0).
-  - If `proc.returncode is not None`: `_pkill("-KILL", "-s", str(pid))` and return.
-  - Otherwise, in this order:
-    1. `probe.killpg(pid, "TERM")`
-    2. `_pkill("-TERM", "-s", str(pid))`
-    3. wait up to `grace_s` for `proc.wait()`
-    4. `_pkill("-KILL", "-s", str(pid))`
-    5. `probe.killpg(pid, "KILL")`
-    6. if still running: `proc.kill()` (suppress errors) and wait `grace_s`
-- `sweep()`: `_pkill("-KILL", "-U", name)`. If the return code is 0, log
-  `"killed leftover processes of OpenCode user %s"` at info level.
-- `auth_store_problem()`: never raises.
-  - `path = f"{user.home}/.local/share/opencode/auth.json"`, where `user = probe.user_by_name(name)`.
-    If the user is None, return `"OpenCode user missing: <name>"`.
-  - Run `r = run(command([TEST, "-e", path]))`.
-    - `r.returncode == 1`: return None.
-    - Any return code other than 0 or 1: unreadable.
-  - Run `h = run(command([HEAD, "-c", str(_AUTH_MAX_BYTES + 1), "--", path]))`.
-    - `h.returncode != 0` or `len(h.stdout) > _AUTH_MAX_BYTES`: unreadable.
-  - Decode `h.stdout` as utf-8-sig. A decode error means unreadable.
-  - Compute keys with `credential_providers_from_text`, then return `credential_problem(keys, path)`.
-  - "Unreadable" means `credential_problem(None, path)`, i.e. the existing
-    "OpenCode credential store unreadable: <path>" message.
-- `self_check() -> None`:
-  - Raises `StartupError(ISOLATION_FAILED + reason)` at the FIRST failing check, in this order.
-    Messages are exact; `{name}` and `{path}` are substituted.
-  - It never sweeps and never starts serve.
-
-  1. `not probe.platform().startswith("linux")`: `"mode 'sudo' needs Linux (WSL); set opencode.os_user.mode: none for tests/dev (unsupported for production)"`
-  2. `probe.euid() == 0`: `"the daemon must not run as root"`
-  3. `daemon = probe.user_by_uid(euid)` is None: `"cannot look up the daemon user"`
-  4. `oc = probe.user_by_name(name)` is None: `"user '{name}' does not exist; create it (docs/SETUP-discord-opencode.md, Part C6)"`
-  5. `oc.uid in (0, daemon.uid)`: `"user '{name}' must differ from the daemon user and must not be root"`
-  6. `bad = probe.group_names(oc) & PRIVILEGED_GROUPS`: `"user '{name}' is in privileged group(s) {', '.join(sorted(bad))}; remove it (sudo gpasswd -d {name} <group>)"`
-  7. command[0] is not absolute: `"opencode.command[0] must be an absolute path (e.g. /usr/local/bin/opencode)"`. If it is under the daemon home: `"opencode.command[0] must not be inside the daemon user's home"`.
-  8. `config.opencode.env_passthrough` is non-empty: `"opencode.env_passthrough must be empty (sudo resets the environment)"`
-  9. Only if `managed_server`: `server_directory` is not absolute, or is under the daemon home: `"opencode.server_directory must be an absolute path outside the daemon user's home (e.g. /var/lib/broke-ai-coder/opencode-server)"`
-  10. `probe.interop_enabled()`: `"WSL interop is enabled: the OpenCode user could start Windows programs as your Windows account; set [interop] enabled=false in /etc/wsl.conf, then run wsl --shutdown"`
-  11. Run `run(command([exe, *command[1:], "--version"]), timeout_s=_VERSION_TIMEOUT_S)`. If the return code is not 0: `` "`sudo -n -u {name} -- {exe} --version` failed ({detail}); install the sudoers file from `python -m app --print-sudoers`" ``.
-      - `detail` is `"timed out"` when the return code is None.
-      - Otherwise `detail` is `f"exit {rc}"`, plus `": " + tail` when the stderr tail is non-empty.
-      - The stderr tail is the last 200 chars, decoded with `errors="replace"`, control characters
-        removed and whitespace stripped.
-  12. Access probes, each `run(command([TEST, flag, path]))`:
-      - Targets, in order:
-        - `(daemon.home, "-r")`
-        - `(daemon.home, "-x")`
-        - each `protected_paths` entry with a leading `~/` replaced by `daemon.home + "/"`, as `"-r"`
-        - `os.path.abspath(config.database.path)` as `"-r"`
-        - `f"/proc/{probe.pid()}/environ"` as `"-r"`
-      - rc 1 passes.
-      - rc 0: `"user '{name}' can access {path} ({flag}); fix permissions (Part C6: chmod 700 your home, chmod 600 the secrets file, automount umask=077 in /etc/wsl.conf)"`
-      - Any other rc (including None): `"access probe failed for {path}"`.
-      - Use a POSIX join; never `os.path.expanduser`.
-  13. Only if `managed_server`: `test -w server_directory` and `test -x server_directory` must both return 0. Otherwise: `"user '{name}' cannot write opencode.server_directory {path}"`.
-  14. Not fatal. For each directory in `[working_directory, *projects.values()]` where
-      `probe.is_dir(d)`: if `test -w` or `test -x` returns non-zero, log the warning
-      `"OpenCode user %s cannot write project directory %s; tasks there cannot edit files"`.
-  - "Under the daemon home" means `path == home` or `path.startswith(home.rstrip("/") + "/")`,
-    using POSIX string comparison.
-- `start()`:
-  1. `await self_check()`.
-  2. `await sweep()`, to clear processes left by a previous daemon.
-  3. Log info `"OpenCode runs as %s (uid %d) via sudo"`.
-- `stop()`: `await sweep()`.
-
-**`render_sudoers(daemon_user: str, oc_user: str, opencode_path: str) -> str`**:
-- Raise `ValueError` with a short reason if a name fails `SUDOERS_NAME_RE`, a name is
-  `root`/`ALL`, the two names are equal, or the path fails `SUDOERS_PATH_RE`.
-- Output, exactly, ending with a newline:
-
-```
-# /etc/sudoers.d/broke-ai-coder (generated by `python -m app --print-sudoers`)
-# Lets {daemon} run OpenCode and three helper tools as {oc} only - never as root - without a
-# password. {oc} is the less privileged user, so this grants {daemon} nothing it lacks.
-# Validate with `visudo -cf` before installing (docs/SETUP-discord-opencode.md, Part C6).
-Defaults>{oc} env_reset
-Defaults>{oc} env_keep = "LANG OPENCODE_CONFIG_CONTENT OPENCODE_SERVER_PASSWORD OPENCODE_SERVER_USERNAME"
-Defaults>{oc} !use_pty
-Defaults>{oc} !requiretty
-{daemon} ALL=({oc}) NOPASSWD: {opencode}, /usr/bin/pkill, /usr/bin/test, /usr/bin/head
-```
-
-- Build the env_keep list from `KEEP_ENV` so the two stay in sync.
-
-**`build_launcher(config, *, environ=None, probe: HostProbe | None = None) -> OpenCodeLauncher`**:
-mode `"none"` returns `DirectLauncher(environ)`; mode `"sudo"` returns
-`SudoLauncher(config, probe=probe or SystemHostProbe())`.
-
-### Modify `app/config/models.py` (copy the `GatewayConfig` style)
-
-```python
-class OsUserConfig(BaseModel):
+class OpenCodePermissionConfig(BaseModel):
     model_config = _CFG
-    mode: Literal["sudo", "none"] = "sudo"
-    name: str = Field("brokeoc", pattern=r"^[a-z_][a-z0-9_-]{0,31}$")
-    protected_paths: list[str] = Field(
-        default_factory=lambda: ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]
-    )
+    extra_bash_deny: list[str] = Field(default_factory=list)
 ```
 
-Validators:
-- `name` must not be `root` (pydantic `ValueError`).
-- Each `protected_paths` entry is stripped, non-empty, has no NUL, and starts with `/` or `~/`.
+Add a `field_validator("extra_bash_deny")`, following the style of `PolicyConfig._models_valid`. Strip each entry, then raise `ValueError` if any of these is true:
+- the entry is empty;
+- it is longer than 200 characters;
+- it contains a control character (`ord < 0x20` or `0x7f`);
+- it contains `{` or `}` (OpenCode `{env:`/`{file:` substitution, G8);
+- it equals `"*"` (it would collide with the leading allow key).
 
-Add to `OpenCodeConfig`: `os_user: OsUserConfig = Field(default_factory=OsUserConfig)`.
+Duplicates are allowed; they are de-duplicated later. `extra="forbid"` already rejects any attempt to set a different key such as `bash_deny`.
 
-Do NOT add OS-dependent validation to pydantic. Path and passthrough rules live only in
-`self_check`.
+Add `permission: OpenCodePermissionConfig = Field(default_factory=OpenCodePermissionConfig)` to `OpenCodeConfig`. Do not import `app.opencode` from models; that would create a cycle.
 
-### Modify `app/opencode/auth_store.py`
+### 1.3 `app/opencode/server.py`
 
-Refactor without changing behaviour. Add:
-- `credential_providers_from_text(text: str) -> list[str] | None`: the JSON-object key logic
-  that exists today, with sanitizing and the `_MAX_KEYS` cap.
-- `credential_problem(keys: list[str] | None, path: str | Path) -> str | None`: today's two
-  messages.
+- `build_opencode_config` adds `"permission": build_permission_block(config.opencode.permission)` to the returned dict. Put it after `"small_model"`.
+- In `_spawn`, log once per launch at INFO: `"opencode permissions: %d bash patterns denied (%d from config); external_directory, websearch, doom_loop denied"`.
+- Update the docstring bullet list to mention the permission block.
 
-`stored_credential_providers` and `auth_store_problem` must use them. Add an S5 note to the docstring.
+### 1.4 Preflight: `app/opencode/config_check.py`
 
-### Modify `app/opencode/config_check.py`
+- `check_server_config(..., required_permission: Mapping[str, Any] | None = None)`. `None` means `default_permission_block()`, so the defaults are always required.
+- After `_gateway_shape_problem` returns None, call `permission_problem(body, required)`. If it returns a key path, return `(SmallModelCheck.UNSAFE, f"server config key '{bad}' does not deny the required operations")`.
+- `check_project_config`, for each parsed file:
+  - a top-level `"permission"` key → UNSAFE, `f"{path}: key 'permission' is not allowed in project config"`;
+  - then `agent_permission_problem` for `agent` and `mode` → UNSAFE, `f"{path}: key '{bad}' would weaken the OpenCode deny rules"`.
+- Update the module docstring (B12/B13) to mention both checks.
 
-`check_server_config(..., environ=None, auth_problem: Callable[[], Awaitable[str | None]] | None = None)`.
-When `auth_problem` is given, use `await auth_problem()`. Otherwise keep the current
-`to_thread(auth_store_problem, environ)`.
+`app/opencode/executor.py`: `OpenCodeExecutor.check_server_config` passes `required_permission=build_permission_block(self._config.permission)`. `self._config` is the `OpenCodeConfig`. The `AgentExecutor` protocol signature does not change.
 
-### Modify `app/opencode/process.py`
+`app/bot/format.py`, OPENCODE_UNSAFE_CONFIG text: insert the sentence "Or its permission rules do not deny sensitive commands (setup guide D2c)." after the existing first sentence. Keep the existing assertions in `tests/test_bot_format.py` true.
 
-Rename `_wait` to `wait_quiet`, which is public so `os_user.py` can reuse it. Update the internal
-callers. Nothing else changes.
+### 1.5 Edge cases
 
-### Modify `app/opencode/server.py`
+- Extras that duplicate a default are not repeated.
+- Extras keep their config order, after the defaults.
+- `json.dumps` keeps `"*"` first. Test this on the dumped string.
+- A body whose bash object has `"*"` in a non-first position with `"allow"` → UNSAFE.
+- An `"ask"` value anywhere in bash → UNSAFE.
+- A body built for a config with extras, checked with defaults only → OK (superset).
+- A body built from defaults, checked against required extras → UNSAFE.
+- Detail strings never contain a pattern or any config value.
 
-- `OpenCodeServerManager.__init__(..., launcher: OpenCodeLauncher | None = None)`. The default is
-  `DirectLauncher(environ)`.
-- `start()`:
-  - `problem = await self._launcher.auth_store_problem()`.
-  - `self._executable = self._launcher.executable(self._oc.command[0])`.
-- `_spawn()`:
-  - `argv = self._launcher.command([...today's serve argv...])`.
-  - `env = self._launcher.environment(os.environ if self._environ is None else self._environ, passthrough=..., extra={...same three...})`.
-- `_reap()`:
-  - Replace `kill_process_tree` with `await self._launcher.kill_tree(proc, grace_s=...)`.
-  - After the drain is handled, ALWAYS `await self._launcher.sweep()`, guarded by
-    `contextlib.suppress(Exception)`.
-- `_wait_healthy`: when `self._launcher.isolated`, append
-  `" (or the sudoers env_keep line is missing, so serve got no password)"` to the
-  "does not enforce the password" `_PortInUse` message.
-- **N10**:
-  - `unavailable_reason()` for a fatal error returns
-    `("managed OpenCode server is down and will not restart by itself; fix the cause, then restart the daemon: " + fatal)[:_DETAIL_CAP]`.
-  - The fatal log line becomes
-    `"opencode serve cannot restart; giving up until the daemon is restarted: %s"`.
-  - The "restarting" text stays unchanged.
-- Docstring: replace the R1 paragraph with the os_user model and point to the os_user.py
-  assumptions.
+### 1.6 Assumptions (copy into the module docstring, and add to TASKS T082 as L12)
 
-### Modify `app/opencode/executor.py`
+- **P1.** The installed OpenCode accepts `permission` with `bash` (a pattern object), `external_directory`, `websearch` and `doom_loop`. Serve starts with no schema error.
+- **P2.** Bash patterns are matched against the text of each individual command after OpenCode splits a compound line (`&&`, `;`, `|`). `*` matches any characters including spaces, and the last matching rule wins. Pipelines such as `curl | sh` are therefore not caught (residual).
+- **P3.** `GET /config` returns `permission` as merged: object form, key order preserved, string values. If not, every task fails closed with OPENCODE_UNSAFE_CONFIG and the check needs a code change.
+- **P4.** `external_directory` is evaluated against the session's project directory (the run cwd), not serve's cwd.
+- **P5.** A denied call in headless `opencode run` comes back to the model as a tool error. There is no prompt and no hang, and the run continues.
+- **P6.** A per-agent `permission` is merged over the global one, which is why agent-level non-deny bash entries are rejected.
 
-- `__init__(..., launcher: OpenCodeLauncher | None = None)`. The default is `DirectLauncher(environ)`.
-- `check_server_config` passes `auth_problem=self._launcher.auth_store_problem`.
-- `_child_env()` uses `self._launcher.environment(...)` with the same extras as today.
-- In `run()`:
-  - `executable = self._launcher.executable(...)` replaces `resolve_executable`. `StartupError`
-    maps to `_unavailable(str(e))`.
-  - **N9**: right after the project-directory check and before the spawn: if
-    `self._unavailable_reason is not None` and `(reason := self._unavailable_reason()) is not None`,
-    return `_unavailable(reason)`. Nothing is spawned.
-  - `argv = self._launcher.command(self.build_argv(...))`. `build_argv` itself is unchanged.
-  - Both kill calls become `self._launcher.kill_tree(proc, grace_s=grace)`. The shielded one
-    stays shielded.
-- Add B14 to the docstring: in sudo mode the process runs as `opencode.os_user.name`, and N9
-  holds.
+---
 
-### Modify `app/runtime/wiring.py`
+## 2. T093/T094 `/health` and T024 self-metrics
 
-- `launcher = build_launcher(config, environ=environ)` is built once and passed to BOTH the
-  manager and the executor.
-- `Runtime` gains `launcher: OpenCodeLauncher`, as the last field.
-- `services = [] if once else [gateway, launcher]`, then `append(manager)` when a manager exists.
-- The launcher's `start` runs the self-check before serve, and its `stop` sweeps after the
-  manager stops (services stop in reverse order).
+### 2.1 New file `app/runtime/resources.py` (stdlib only, no psutil)
 
-### Modify `app/cli.py`
+```python
+IDLE_RSS_MB = 250; NORMAL_RSS_MB = 512; IDLE_CPU_PCT = 2.0; NORMAL_CPU_PCT = 10.0
 
-Add two options to the mutually exclusive group.
+def read_rss_bytes(status_path: str = "/proc/self/status") -> int | None:
+    """VmRSS (kB * 1024) from /proc; None if missing/unparseable (Windows, macOS)."""
+def read_peak_rss_bytes() -> int | None:
+    """Linux only: resource.getrusage(RUSAGE_SELF).ru_maxrss * 1024; None if `resource` is
+    missing (Windows) or sys.platform does not start with 'linux'."""
+def cpu_seconds() -> float:  # os.times() user + system (works on Windows)
 
-**`--print-sudoers`**
-- Load the config (exit 2 on `ConfigError`).
-- If `os.name != "posix"`: print `"run --print-sudoers inside WSL as the daemon user"` to stderr
-  and exit 2.
-- daemon user = `SystemHostProbe().user_by_uid(os.geteuid()).name`.
-- Print `render_sudoers(daemon, cfg.opencode.os_user.name, cfg.opencode.command[0])` to stdout.
-  Print nothing else on stdout.
-- `ValueError`: print it to stderr and exit 2.
+@dataclass(frozen=True, slots=True)
+class ResourceSample:
+    rss_bytes: int | None
+    peak_rss_bytes: int | None
+    cpu_seconds_total: float
+    uptime_s: float
+    cpu_percent_since_start: float | None   # None if uptime < 0.5 s
+    cpu_percent_window: float | None        # since the previous sample; None if window < 1.0 s
+    window_s: float
 
-**`--check-os-user`**
-- mode `none`: print
-  `"opencode.os_user.mode is none: OpenCode would run as the daemon user (unsupported for production)"`
-  to stderr and exit 3.
-- Otherwise run `asyncio.run(build_launcher(cfg).self_check())`.
-  - On success, print `"os_user OK: OpenCode runs as <name>; isolation checks passed"` and exit 0.
-  - On `StartupError`, print it to stderr and exit 3.
-- It must NOT sweep: a running daemon's serve must survive.
-
-### Modify `config.example.yaml` (under `opencode:`)
-
-- `command: [/usr/local/bin/opencode]`. Comment: absolute path required with os_user sudo;
-  copied in Part D1.
-- `server_directory: /var/lib/broke-ai-coder/opencode-server`. Comment: must be writable by
-  os_user, outside your home.
-- Add:
-
-```yaml
-  os_user:
-    mode: sudo          # none = OpenCode runs as the daemon user: tests/Windows dev only, unsupported for production (R1)
-    name: brokeoc       # dedicated user, see docs/SETUP-discord-opencode.md Part C6
-    protected_paths: ["~/.config/broke-ai-coder/secrets.env", "/mnt/c"]  # must be unreadable by os_user
+class ProcessSampler:
+    def __init__(self, *, clock=time.monotonic, cpu=cpu_seconds, rss=read_rss_bytes,
+                 peak=read_peak_rss_bytes) -> None   # records start (clock(), cpu())
+    def sample(self) -> ResourceSample              # updates the "previous" point
 ```
 
-- `env_passthrough: []` comment: must stay empty with os_user sudo.
+- CPU percent means percent of one core: `100 * dcpu / dwall`.
+- No reader may raise. Exceptions are caught, and the reader returns None (or 0.0 for cpu).
 
-### Tests
+### 2.2 Probes: new file `app/runtime/diagnostics.py`
 
-- `tests/conftest.py`: `_base_config_dict()` gains `"opencode": {"os_user": {"mode": "none"}}`.
-  `make_config`'s dict-merge keeps it when tests override other `opencode` keys.
-- Fix any other test that builds a runtime from a config without `mode: none` by adding it. Do
-  NOT weaken assertions.
-- `test_wiring.py`: service lists become `[rt.gateway, rt.launcher, rt.server_manager]` and
-  `[rt.gateway, rt.launcher]`.
+```python
+@dataclass(slots=True)
+class RuntimeProbes:
+    sampler: ProcessSampler = field(default_factory=ProcessSampler)
+    gateway_up: Callable[[], bool] | None = None
+    serve_state: Callable[[], tuple[bool, str | None]] | None = None   # (ready, fatal_error)
+    os_user_summary: Callable[[], str] | None = None
+```
 
-New `tests/test_opencode_os_user.py`:
-- Use a `FakeHostProbe` that records `run` argv lists and `killpg` calls, and returns programmed
-  `ProbeResult`s keyed by argv (default rc 1 for `test` probes, 0 otherwise).
-- Use a fake proc object with `pid`, `returncode`, `wait()` and `kill()`.
+Supporting changes:
+- `app/gateway/server.py`: add `def is_running(self) -> bool: return self._runner is not None`.
+- `app/opencode/os_user.py`: add `def status_summary(self) -> str` to the `OpenCodeLauncher` Protocol, `DirectLauncher` and `SudoLauncher`. Neither may raise.
+  - `DirectLauncher`: `"mode none: OpenCode runs as the daemon user (tests/dev only, unsupported for production)"`.
+  - `SudoLauncher`:
+    - Keep `self._checked_at: datetime | None`, set with `app.timeutil.utcnow()` in `start()` after `self_check()` passes.
+    - Before that: `f"sudo as {name}: self-check not run yet"`.
+    - After: `f"sudo as {name}: isolation self-check passed at {checked:%Y-%m-%d %H:%M} UTC; WSL interop now {state}"`. `state` is `"disabled"`, `"ENABLED (unsafe; restart required)"` from a live `self._probe.interop_enabled()`, or `"unknown"` if that raises.
+- `app/runtime/wiring.py`:
+  - Build `RuntimeProbes(gateway_up=gateway.is_running, serve_state=(lambda: (manager.ready, manager.fatal_error)) if manager else None, os_user_summary=launcher.status_summary)`.
+  - Add a `probes: RuntimeProbes` field to `Runtime` (last field).
+  - Pass it as `create_frontend(config, redactor=..., environ=..., probes=probes)`.
+- `app/bot/discord_frontend.py`:
+  - `create_frontend` and `DiscordFrontend.__init__` take `probes: RuntimeProbes | None = None`.
+  - `start` builds `ControllerBackend(controller, self._config, probes=self._probes)`.
+  - Register `@tree.command(name="health", description="Controller diagnostics (daemon only; excludes OpenCode)")`, which calls `self._handle(interaction, "health", {})`.
 
-1. `render_sudoers("justin", "brokeoc", "/usr/local/bin/opencode")` equals the exact text.
-   Its env_keep matches `KEEP_ENV`. `ValueError` for: `"ALL"`, `"root"`, `"Bad"`, `"a b"`,
-   `"x,y"`, equal names, a relative path, and paths containing space, `,`, `*`, `:`, `=`, `\`.
-2. `SudoLauncher.command`:
-   - Output starts with `[SUDO, "-n", "-u", "brokeoc", "--"]`.
-   - A prompt containing `; $(rm -rf ~) "q" 'x'` and newlines stays one unchanged element.
-   - A prompt built by `build_argv` that starts with `" -x"` comes after `--`.
-3. `SudoLauncher.environment`:
-   - Input environ has PATH, HOME, XDG_DATA_HOME, LANG, OPENROUTER_API_KEY, AWS_SECRET_ACCESS_KEY
-     and DISCORD_BOT_TOKEN.
-   - Extras are the three OPENCODE_* plus `FOO`.
-   - Result keys are exactly {PATH, LANG, the three}, and PATH == "/usr/bin:/bin".
-4. `self_check`:
-   - Happy path passes, and the recorded probe argv sequence matches spec order 11 → 13.
-   - Each failure 1-13 raises `StartupError`, whose message starts with `ISOLATION_FAILED` and
-     contains the key phrase. Cases:
-     - the stderr text `"a password is required"` appears in the 11 message;
-     - rc None gives "timed out";
-     - rc 2 on an access probe gives "access probe failed";
-     - `~/x` expands with the probe's daemon home.
-   - With `managed_server: false`, checks 9 and 13 are skipped.
-   - A non-writable project directory only logs a warning (use caplog), and the check passes.
-   - `self_check` never calls pkill.
-5. `start()`: self_check, then exactly one `pkill -KILL -U brokeoc`. When self_check fails,
-   `start()` raises and no pkill is called. `stop()` sweeps.
-6. `kill_tree`:
-   - A running proc that exits during the grace period gives the exact sequence (killpg TERM,
-     pkill -TERM -s pid, pkill -KILL -s pid, killpg KILL).
-   - An exited proc gives only `pkill -KILL -s pid`.
-   - A probe that raises or returns rc None/3 never propagates.
-7. `auth_store_problem`:
-   - Missing file (rc 1) gives None.
-   - `{}` gives None.
-   - `{"openai": {"key": "sk-x"}}` gives the stored-credentials message, which names `openai`
-     and never contains `sk-x`.
-   - head rc 1, invalid JSON, oversize output and test rc None each give "unreadable".
-   - The head argv is `[..., HEAD, "-c", "1048577", "--", "/home/brokeoc/.local/share/opencode/auth.json"]`.
-8. `DirectLauncher` matches today's helpers. `start()` logs "unsupported for production".
-   `build_launcher` selects by mode.
+### 2.3 Commands and format
 
-Additions to existing files:
-- `test_config.py`: os_user defaults; the name `root`/`ALL`/`Bad` is rejected; a relative
-  protected path is rejected; a bad mode is rejected.
-- `test_opencode_server.py`: use a recording `DirectLauncher` subclass so the fake serve still
-  runs. Check that:
-  - serve argv/env come from the launcher;
-  - `_reap` calls `kill_tree` and then `sweep`;
-  - `start` uses `launcher.auth_store_problem` (a problem raises `StartupError`);
-  - the "does not enforce the password" message gains the env_keep hint only when `isolated`.
-  - N10: after a fatal error, `unavailable_reason()` starts with "managed OpenCode server is
-    down", contains "restart the daemon" and "already in use", and is ≤ 300 chars.
-- `test_opencode_executor.py`:
-  - N9: the reason is set, so `run()` returns `EXECUTOR_UNAVAILABLE` with `detail == reason`
-    and `create_subprocess_exec` is never called (monkeypatch it to fail the test).
-  - Reason None gives a normal spawn.
-  - The spawned argv equals `launcher.command(build_argv(...))`.
-  - A timeout calls `launcher.kill_tree`.
-- `test_managed_crash_window_e2e.py` (copy its setup), N9 fallback test:
-  - Attempt 1 ends with a fallback-eligible class (rate limit) and the manager becomes
-    not-ready before attempt 2.
-  - Attempt 2 returns `EXECUTOR_UNAVAILABLE` with no spawn.
-  - The task is FAILED `OPENCODE_UNAVAILABLE` with 2 attempt rows, the second with status
-    `EXECUTOR_UNAVAILABLE`.
-  - A cooldown is recorded only for attempt 1.
-  - The Discord text contains the reason.
-  - Also update the fatal e2e test to assert "restart the daemon" in the Discord text.
-- `test_bot_format.py`: N10 fatal detail text appears.
-- `test_opencode_config_check.py`: the `auth_problem` callable is used when given.
-- `test_cli.py`:
-  - `--print-sudoers` (monkeypatch `os.name`/the user lookup) prints the exact text with exit 0;
-    a relative command gives exit 2.
-  - `--check-os-user` gives exit 3 in mode none, and exit 0 with a monkeypatched `self_check`.
+`app/bot/commands.py`:
+- `COMMAND_NAMES` gains `"health"`. `tests/test_discord_frontend.py:75` then forces the registration.
+- Add this dataclass:
 
-### Docs
+```python
+@dataclass(frozen=True, slots=True)
+class HealthSnapshot:
+    resources: ResourceSample | None
+    sqlite_db_bytes: int | None
+    last_cleanup_at: str | None
+    task_queue_depth: int
+    event_queue_depth: int
+    event_dropped_count: int
+    running_task_id: str | None
+    provider_cooldowns: int   # active entries with model None
+    model_cooldowns: int      # active entries with a model
+    gateway_up: bool | None   # None = unknown/not wired
+    serve_ready: bool | None  # None = not managed
+    serve_fatal_error: str | None
+    os_user: str | None
+```
 
-**`docs/SETUP-discord-opencode.md`**
-- Overview tree: add `brokeoc` (OpenCode user, own home `/home/brokeoc`),
-  `/usr/local/bin/opencode`, `/var/lib/broke-ai-coder/opencode-server`, and `/workspace`
-  (group `brokeai`).
-- C4: replace the R1 paragraph. R1 is closed by Part C6 (OpenCode runs as `brokeoc`, which
-  cannot read your home, `secrets.env` or the daemon's `/proc`). Keep "never source from
-  .bashrc". Link the remaining residuals.
-- Replace C5 with group-shared /workspace:
-  ```bash
-  sudo apt install -y acl
-  sudo groupadd brokeai && sudo usermod -aG brokeai "$USER"
-  ```
-  Then `/workspace`: `chown "$USER:brokeai"`, `chmod 2770`, `chgrp -R brokeai`,
-  `find /workspace -type d -exec chmod g+s {} +`, `setfacl -R -m g:brokeai:rwX`,
-  `setfacl -R -d -m g:brokeai:rwX`. Then re-login (`exit`; in PowerShell
-  `wsl --terminate Ubuntu-24.04`) so that `id` shows brokeai. Never put the controller repo in
-  /workspace.
-- New C6 "OpenCode user (one-time)", in this order:
-  1. `sudo useradd --create-home --home-dir /home/brokeoc --shell /bin/bash --user-group brokeoc`; `sudo usermod -aG brokeai brokeoc`; `sudo chmod 700 /home/brokeoc`; `id brokeoc` (must not list sudo/adm/docker/lxd).
-  2. `chmod 700 "$HOME" ~/.config/broke-ai-coder`; `chmod 600 ~/.config/broke-ai-coder/secrets.env`.
-  3. `sudo install -d -m 0755 -o root -g root /var/lib/broke-ai-coder`; `sudo install -d -m 2770 -o brokeoc -g brokeai /var/lib/broke-ai-coder/opencode-server`.
-  4. `/etc/wsl.conf`: MERGE these into the file with `sudo nano` and keep `[boot] systemd=true`:
-     `[interop] enabled=false`, `appendWindowsPath=false`, `[automount] options="umask=077"`.
-     Then in PowerShell run `wsl --shutdown` and reopen. Explain the cost (Q1).
-  5. Git for the agent: `sudo -u brokeoc git config --global user.name "broke-ai-coder agent"`, a user.email placeholder, and `safe.directory '*'`. brokeoc gets no GitHub credentials: push as yourself.
-  6. Sudoers. Never use /tmp, because brokeoc can write there:
-     ```bash
-     tmp=$(mktemp ~/broke-ai-coder.sudoers.XXXXXX)
-     .venv/bin/python -m app --print-sudoers --config config.yaml > "$tmp"
-     sudo visudo -cf "$tmp"
-     sudo install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/broke-ai-coder
-     rm "$tmp"
-     sudo visudo -c
-     ```
-     The file name has no dot, so sudo reads it.
-  7. Verify:
-     - `sudo -k`
-     - `sudo -n -u brokeoc -- /usr/local/bin/opencode --version` works with no password prompt.
-     - `sudo -n true` must FAIL (no root).
-     - `sudo -n -u brokeoc -- /usr/bin/test -r ~/.config/broke-ai-coder/secrets.env; echo $?` expects 1.
-     - `.venv/bin/python -m app --check-os-user --config config.yaml` expects `os_user OK`.
-  - Note: the daemon kills ALL brokeoc processes at start, at stop and on every serve restart.
-    Do not use brokeoc for anything else.
-  - Note: sudo logs each command line (including prompts) to the system journal/auth.log.
-- D1: after installing, run
-  `sudo install -m 0755 -o root -g root "$(command -v opencode)" /usr/local/bin/opencode`.
-  Re-run it after every OpenCode upgrade. If you installed with npm, point `opencode.command` at
-  the npm global binary path and regenerate sudoers.
-- D2: run `sudo -n -u brokeoc -- /usr/local/bin/opencode auth list` and log out there. The
-  checked file is now `/home/brokeoc/.local/share/opencode/auth.json`.
-- D4: serve runs as brokeoc via sudo. Add `pgrep -u brokeoc -a` to inspect.
-- Checklist:
-  - Replace the "no ambient cloud credentials ... until T072" item with "brokeoc's home holds no
-    cloud credentials".
-  - Add "`--check-os-user` output".
+- `BotBackend` gains `def health(self) -> HealthSnapshot: ...`.
+- `_dispatch`: `"health"` → `Reply(fmt.format_health(backend.health(), redactor=redactor), True)`.
+- Authorization is the existing `authorize`, so allowed users count as admins.
+
+`app/bot/backend.py`, `ControllerBackend.__init__(..., probes: RuntimeProbes | None = None)` and `health()`:
+- Use `controller.metrics()` for the queue depths, the dropped count, `last_cleanup_at`, `sqlite_db_bytes` and `running_task_id`.
+- Get the cooldown counts from `orch.cooldowns.active(utcnow())` when `orch` is not None, else 0.
+- Read the remaining fields from the probes. A missing probe gives None; with no probes, `resources` is None.
+
+`app/bot/format.py`, `format_health(snapshot, *, redactor=None) -> str`, through `safe_text`. The lines, in order:
+
+```
+Controller health (daemon process only; excludes OpenCode and project child processes)
+RSS: 85.2 MB (peak 90.1 MB); targets idle < 250 MB, normal < 512 MB
+CPU: 0.4% of one core over the last 120 s; 0.3% since start (12.3 s CPU, up 2h 03m); targets idle < 2%, normal < 10%
+SQLite: 1.2 MB; last cleanup 2026-10-06T10:00:00Z
+Queues: tasks 0, events 0 (dropped 0); running task: none
+Provider cooldowns: 1 provider-wide, 2 model
+Gateway: up
+OpenCode serve: ready
+OS user: <summary>
+```
+
+Formatting rules:
+- MB means `bytes / 1_048_576` with one decimal place.
+- An unknown RSS or peak prints `unavailable on this platform`. Omit the peak part when it is None.
+- Omit the window part when `cpu_percent_window` is None.
+- With `resources` None: `Resources: unavailable`.
+- `last_cleanup_at` None → `never`.
+- The running task is shown by its first 8 characters.
+- Gateway: True → `up`, False → `DOWN`, None → `unknown`.
+- Serve:
+  - `serve_ready` None → `not managed (opencode.managed_server: false)`;
+  - True → `ready`;
+  - a fatal error → `FATAL (restart the daemon): <fatal[:200]>`;
+  - otherwise → `down (restarting)`.
+- `os_user` None → `unknown`.
+- Never print an endpoint URL, a password, a token, an environment value or a path.
+
+### 2.4 T024 benchmark: new `app/runtime/bench.py` and thin wrapper `scripts/bench_idle.py`
+
+`scripts/bench_idle.py`:
+- Inserts the repo root (the parent of `scripts/`) at `sys.path[0]`.
+- Calls `raise SystemExit(main())` from `app.runtime.bench`.
+
+`app/runtime/bench.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class BenchResult:
+    duration_s: float; interval_s: float; samples: int
+    rss_max_bytes: int | None; rss_last_bytes: int | None
+    cpu_avg_percent: float | None; cpu_max_interval_percent: float | None
+
+async def run_idle_benchmark(config: AppConfig, *, seconds: float, interval: float,
+                             warmup: float, import_discord: bool,
+                             sampler_factory: Callable[[], ProcessSampler] = ProcessSampler) -> BenchResult
+def format_report(result: BenchResult) -> str
+def main(argv: Sequence[str] | None = None) -> int
+```
+
+CLI options:
+- `--seconds` (float, default 1800);
+- `--interval` (default 5);
+- `--warmup` (default 5);
+- `--config` (default `config.yaml` if it exists in the cwd, else `<repo>/config.example.yaml`);
+- `--no-discord-import`.
+
+Steps:
+1. Load the config with `load_config`. On ConfigError, print to stderr and return 2.
+2. Override the database path to `<tempfile.TemporaryDirectory()>/bench.db` with `model_copy(update=...)` on `database`, then on the config. Never touch the user's DB. The temp dir is removed afterwards.
+3. Unless `--no-discord-import`, `import app.bot.discord_frontend` so that module memory is counted. It does not connect.
+4. `rt = build_runtime(config, redactor=SecretRedactor(), environ={}, once=True)`. The empty environ means no key is ever read and no Discord client runs.
+5. `await rt.controller.start()`, then `await rt.gateway.start()`. Sleep `warmup`, then create the sampler.
+6. Every `interval`, `sample()` until `seconds` have passed. Always take at least one final sample.
+7. In `finally`: `await rt.controller.stop()`, then `await close_runtime(rt)`.
+
+Results:
+- `cpu_avg_percent` is the CPU delta over the wall delta for the whole measured window.
+- `cpu_max_interval_percent` is the maximum of the `cpu_percent_window` values.
+
+Report:
+- The first line says `controller daemon only; excludes OpenCode and child processes`.
+- Then one line per metric with PASS, FAIL or UNKNOWN against IDLE_RSS_MB (rss max) and IDLE_CPU_PCT (cpu avg).
+- The normal targets are printed for reference.
+
+Exit codes: 1 if any FAIL, otherwise 0; UNKNOWN does not fail. No network calls are made.
+
+ARCHITECTURE §11.1: add a sentence saying the metrics are exposed by `/health` and measured by `scripts/bench_idle.py`. Drop nothing.
+
+---
+
+## 3. T100 `secrets.env.example` (repo root)
+
+```
+# Copy to ~/.config/broke-ai-coder/secrets.env, chmod 600, fill in values there only.
+# Loaded only by scripts/start-daemon.sh (never from ~/.bashrc). Never commit real values.
+export DISCORD_BOT_TOKEN=
+export OPENROUTER_API_KEY=
+export GEMINI_API_KEY=
+export GROQ_API_KEY=
+```
+
+Every `export` line has an empty value. The set of names must equal the `api_key_env` values in `config.example.yaml` plus `discord.bot_token_env` (test).
+
+---
+
+## 4. T101 scripts (bash; LF only; executable bit)
+
+All scripts must meet these rules:
+- They start with `#!/usr/bin/env bash`, followed by `set -eu` (the two check scripts may use `set -euo pipefail`). Write them in shellcheck-clean style: quote every expansion, use `$(...)`, and use `# shellcheck source=/dev/null` before sourcing.
+- They support `-h/--help` (exit 0) and reject unknown arguments (exit 2).
+- They set `REPO_DIR=$(cd "$(dirname "$0")/.." && pwd -P)`, `PY="$REPO_DIR/.venv/bin/python"`, and `CONFIG` from `--config PATH`, defaulting to `$REPO_DIR/config.yaml`.
+- Exit codes: 0 OK, 1 check failed, 2 usage error or refusal.
+- They never print a secret value.
+
+Add a `.gitattributes` with these rules:
+
+```
+*.sh text eol=lf
+scripts/systemd/* text eol=lf
+secrets.env.example text eol=lf
+```
+
+Set the executable bit in the index with `git update-index --add --chmod=+x scripts/*.sh scripts/bench_idle.py` after `git add`.
+
+### 4.1 `scripts/start-daemon.sh`
+
+Runs the daemon in the foreground, for tmux or systemd. Options: `--config`, plus `--secrets PATH`, defaulting to `$HOME/.config/broke-ai-coder/secrets.env`.
+
+Refuse with exit 2 and a one-line reason in each of these cases:
+- running as root (`id -u` is 0);
+- `$PY` is not executable;
+- the config is missing;
+- the secrets file is missing, is not a regular file, is a symlink, is not owned by `id -u`, or `stat -c %a` is not `600` or `400`;
+- any non-blank, non-`#` line of the secrets file fails `^(export )?[A-Za-z_][A-Za-z0-9_]*=`. Print only the line numbers, via `grep -nvE ... | cut -d: -f1`, never the content;
+- the daemon is already running.
+
+PID file: `${XDG_STATE_HOME:-$HOME/.local/state}/broke-ai-coder/daemon.pid`, with its directory created `mkdir -p` and `chmod 700`.
+- "Already running" means the PID file exists, `kill -0` succeeds, and `/proc/$pid/cmdline` (with NUL bytes turned into spaces) contains `-m app`.
+- A stale PID file is removed.
+
+Then:
+1. `cd "$REPO_DIR"`, `umask 077`.
+2. `echo $$ > "$PIDFILE"`.
+3. `set -a; . "$SECRETS"; set +a`.
+4. `exec "$PY" -m app --config "$CONFIG"`. After the exec the PID is the same.
+
+Secrets are loaded only in this process.
+
+### 4.2 `scripts/stop-daemon.sh`
+
+Options: `--timeout N` (default 30) and `--force`.
+
+1. Read the PID file. If it is missing, or the process is dead: print `not running`, remove a stale file, and exit 0.
+2. Verify the cmdline contains `-m app` and the process owner is `id -un`. If not, refuse with exit 2.
+3. `kill -TERM`, then poll once per second until the timeout.
+4. If the daemon has exited, remove the PID file and exit 0.
+5. If it is still alive after the timeout:
+   - with `--force`: `kill -KILL`, remove the PID file, and print `OpenCode user processes are swept at the next daemon start`;
+   - without `--force`: exit 1.
+
+Under systemd, use `sudo systemctl stop broke-ai-coder` instead, and say so in the help text.
+
+### 4.3 `scripts/health-check.sh`
+
+It loads no secrets. It runs and reports each step as `PASS`/`FAIL` (`set +e` around each):
+- `"$PY" -m app --check --config "$CONFIG"`;
+- `"$PY" -m app --check-os-user --config "$CONFIG"`;
+- the daemon state from the PID file (`running (pid N)` / `not running`, informational).
+
+Exit 1 if either check failed. Run it from `$REPO_DIR`.
+
+### 4.4 Python helpers called by the setup scripts: new package `app/ops/` (`__init__.py`)
+
+`app/ops/setup_values.py`, run as `python -m app.ops.setup_values --config PATH`:
+- Loads the config. On ConfigError, prints the error to stderr and exits 2.
+- Prints these `KEY=value` lines, in this order:
+  - `OS_USER_MODE`
+  - `OC_USER`
+  - `OPENCODE_BIN` (command[0])
+  - `SERVER_DIRECTORY`
+  - `WORKING_DIRECTORY`
+  - `DATABASE_PATH` (`os.path.abspath`)
+  - `MANAGED_SERVER` (`true`/`false`)
+- Every value must match `^[A-Za-z0-9._/+-]+$`. Otherwise print `unsafe value for KEY` to stderr and exit 2, so the scripts can parse the output with `IFS='=' read -r` and never `eval`.
+- It never prints an environment value.
+- Function: `def setup_values(config: AppConfig) -> list[tuple[str, str]]`.
+
+`app/ops/wslconf.py`: `merge_wsl_conf(text: str) -> tuple[str, list[str]]` returns the new text and human-readable changes; an empty list means already compliant. It is line-based:
+- comments (`#`, `;`), unknown sections and keys (e.g. `[boot] systemd=true`) are preserved;
+- the output uses `\n` line endings, and CRLF input is accepted;
+- section names and keys match case-insensitively, keeping the original spelling;
+- whitespace around `=` is allowed.
+
+Requirements:
+- `[interop] enabled=false` and `[interop] appendWindowsPath=false`:
+  - the value is compared case-insensitively, with quotes stripped;
+  - a wrong value is fixed in EVERY occurrence of the key in EVERY `[interop]` section;
+  - a missing key is inserted after the last key line of the first `[interop]` section;
+  - a missing section is appended at the end (preceded by a blank line).
+- `[automount] options`:
+  - strip the surrounding quotes and split on `,`;
+  - for each of `umask`, `fmask` and `dmask` present: if `int(v, 8) & 0o077 != 0o077` (or the value is unparseable), replace it with `077`;
+  - if `umask` is absent, append `umask=077`;
+  - write the result back as `options="..."`;
+  - a missing key or section is added as above.
+
+CLI: `python -m app.ops.wslconf check PATH` and `python -m app.ops.wslconf merge PATH`.
+- `check`: exit 0 if compliant; exit 1 if not, printing the changes; exit 2 if PATH exists but is unreadable. A missing file counts as empty, so it is non-compliant.
+- `merge` writes the merged text to stdout; it never writes files.
+- Idempotent: `merge(merge(x)[0])` returns no changes.
+
+### 4.5 `scripts/wsl-setup.sh` (the user runs it: `sudo scripts/wsl-setup.sh --yes`)
+
+Arguments:
+- Without `--yes`: print usage and what the script would do, then exit 2.
+- Also accepts `--config`.
+- Argument parsing comes before anything else.
+
+Output: every action is printed before it runs.
+- `run() { printf '[setup] RUN: %s\n' "$*"; "$@"; }`
+- `ok "<what>"` prints `[setup] OK: ...`
+- `fail` prints `[setup] FAIL: ...` and exits 2.
+
+The script never reads, prints or prompts for keys or tokens, never sources the secrets file, never installs packages, and never runs repository Python as root (D5).
+
+**Phase A: preconditions.** Check ALL of these before any change. List every failure, then exit 2.
+- EUID is 0, and `SUDO_USER` is set, is not root, and exists (getent). Call this `$U`, with home `$H` from getent.
+- `/proc/version` matches `microsoft` (case-insensitive).
+- These commands exist: `getent groupadd useradd usermod gpasswd setfacl getfacl visudo install runuser setsid stat id mktemp cmp`. For a missing `setfacl`, print `apt install -y acl`.
+- `$REPO_DIR` is owned by `$U`, is not under `/workspace`, and `$PY` is executable.
+- `values=$(runuser -u "$U" -- "$PY" -m app.ops.setup_values --config "$CONFIG")` succeeds. Parse it.
+- `OS_USER_MODE=sudo`.
+- `OPENCODE_BIN` is a regular file, owned by root, and not group/other-writable (`stat -c '%U %a'`). Otherwise point to docs D1.
+- `SERVER_DIRECTORY` and `WORKING_DIRECTORY` are absolute and not under `$H`.
+- The sudoers text renders: `runuser -u "$U" -- "$PY" -m app --print-sudoers --config "$CONFIG"` is non-empty into `tmp=$(mktemp -p /root broke-ai-coder.sudoers.XXXXXX)` (cleaned up by an EXIT trap), and contains `"($OC_USER)"`.
+- If `$OC_USER` exists: its uid is not 0 and not `$U`'s uid, and it is in none of the groups `root sudo admin wheel adm docker lxd disk shadow`. For a privileged group, print the `gpasswd -d` instruction; the script does not remove groups itself.
+- If `$H/.config/broke-ai-coder/secrets.env` exists, it is a regular non-symlink file owned by `$U`.
+- If `WORKING_DIRECTORY` exists, it is a directory and not a symlink.
+
+**Phase B: actions.** All are idempotent; each checks state, then prints OK or runs.
+1. Create group `brokeai` if it is missing.
+2. Add `$U` to `brokeai` if needed. Remember to tell the user to log in again.
+3. `useradd --create-home --home-dir /home/$OC_USER --shell /bin/bash --user-group $OC_USER` if the user is missing. Add `$OC_USER` to `brokeai`. `chmod 700` its home.
+4. `chmod 700 "$H"`, printing the old mode.
+5. `runuser -u "$U" -- mkdir -p "$H/.config/broke-ai-coder"`, `chmod 700` on that directory. If the secrets file is missing: `runuser -u "$U" -- touch` it, then `chmod 600`. If it exists: `chmod 600`. Content is never read.
+6. WORKING_DIRECTORY:
+   - if missing: `install -d -m 2770 -o "$U" -g brokeai`;
+   - else `chown "$U:brokeai"` and `chmod 2770` on the directory itself only;
+   - then `setfacl -m g:brokeai:rwX` and `setfacl -d -m g:brokeai:rwX` on the directory itself.
+   - Non-recursive. If it is non-empty, print a note pointing to docs C5 for existing content.
+7. Parent of SERVER_DIRECTORY: `install -d -m 0755 -o root -g root` if missing. SERVER_DIRECTORY itself: `install -d -m 2770 -o "$OC_USER" -g brokeai`.
+8. `/etc/wsl.conf`:
+   - `merged=$(runuser -u "$U" -- "$PY" -m app.ops.wslconf merge /etc/wsl.conf)`, and get the change list via `check`.
+   - If there are no changes: OK.
+   - Otherwise:
+     - copy the existing file to `/etc/wsl.conf.bak-broke-ai-coder-$(date +%Y%m%d%H%M%S)`;
+     - write `$merged` to a `mktemp -p /root` file;
+     - `install -m 0644 -o root -g root` it to `/etc/wsl.conf`;
+     - set `NEED_SHUTDOWN=1`.
+   - Also set `NEED_SHUTDOWN=1` if `/proc/sys/fs/binfmt_misc/WSLInterop*` reads `enabled`.
+9. Sudoers:
+   - `visudo -cf "$tmp"`;
+   - if `/etc/sudoers.d/broke-ai-coder` exists and `cmp -s`: OK;
+   - else: back up the existing file to `/root/broke-ai-coder.sudoers.bak-<ts>`, then `install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/broke-ai-coder`, then `visudo -c`;
+   - if the final `visudo -c` fails: restore the backup (or remove the new file) and exit 1.
+10. OpenCode user's git identity (docs C6 step 5):
+    - only if `/home/$OC_USER/.gitconfig` does NOT exist. Run each command as `setsid -w runuser -u "$OC_USER" -- env HOME="/home/$OC_USER" git config --global ... </dev/null 2>&1 | cat`:
+      - `user.name "broke-ai-coder agent"`;
+      - `user.email agent@example.invalid`;
+      - `--add safe.directory '*'`.
+    - If the file exists: print `exists; not touched`.
+
+**Phase C: summary.** Print:
+- the changed items;
+- `NEXT:` steps:
+  - in PowerShell `wsl --shutdown`, then reopen Ubuntu (if `NEED_SHUTDOWN` is set or the group changed);
+  - fill in the secrets file (`nano`; names in `secrets.env.example`);
+  - `scripts/live-checks.sh`;
+  - `scripts/start-daemon.sh`.
+- The git version advice: if `git --version` is below 2.45.1 (compare with `sort -V`), print `sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install -y git` as an instruction only.
+
+### 4.6 `scripts/live-checks.sh` (read-only; run as the daemon user, not root)
+
+Refuse with exit 2 if run as root. If any of `DISCORD_BOT_TOKEN`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY` or `GROQ_API_KEY` is set, warn, print the names only, and exit 2: "run it from a shell without secrets".
+
+Helpers:
+- `as_oc() { setsid -w sudo -n -u "$OC_USER" -- "$@" </dev/null; }`. Never let it see a tty.
+- `pass`/`fail`/`skip`/`manual`/`info` print `[PASS] L1 ...`.
+- The values come from `setup_values`, run as the current user.
+
+The script must not contain any of these (enforced by test): `sudo -S`, `read -rs`, `rm -`, `chmod`, `chown`, `setfacl -m`, `useradd`, `usermod`, `install -`, `tee `, `mkfifo`, `> /etc`.
+
+Checks, in order:
+- **L0**:
+  - WSL;
+  - `$PY` present;
+  - `OPENCODE_BIN` root-owned and not group/other-writable;
+  - git >= 2.45.1 (FAIL plus the PPA instruction as text);
+  - `python -m app.ops.wslconf check /etc/wsl.conf` → PASS/FAIL.
+- **L1**:
+  - `sudo -n true` must FAIL (→ PASS);
+  - `as_oc "$OPENCODE_BIN" --version` must succeed;
+  - **positive control** `as_oc /usr/bin/test -d "/home/$OC_USER"` must return 0. If it does not, mark every remaining brokeoc check SKIP (`sudo rule not working`), because sudo's own failure is also rc 1.
+  - MANUAL: `sudo visudo -c`.
+- **L2**: `OPENCODE_SERVER_USERNAME=x FOO=y as_oc /usr/bin/head -c 4096 /proc/self/environ | tr '\0' '\n' | cut -d= -f1` contains `OPENCODE_SERVER_USERNAME` and not `FOO` (print names only).
+- **L11**: the same output has no `XDG_DATA_HOME`.
+- **L3/N1**: daemon PID from the PID file.
+  - If the daemon is running:
+    - for each `pgrep -u "$OC_USER" -f 'opencode serve'` pid, `ps -o tty= -p` must be `?`;
+    - `as_oc /usr/bin/test -p /proc/<pid>/fd/1` must return 0 (pipe).
+  - If not running: `pgrep -u "$OC_USER"` must be empty.
+- **L4**:
+  - with `rc=$(as_oc /usr/bin/test -r X)`, rc 1 is PASS;
+  - for `/usr/bin/head -c 1 X`, a non-zero rc is PASS.
+  - Targets: the secrets file, `$HOME` (also `-x`), `DATABASE_PATH`, `/mnt/c`, and `/proc/<daemon pid>/environ` when the daemon is running.
+  - MANUAL: the `.exe`/`sh -c` checks; see TASKS T082 L4.
+- **L5**: `stat -c '%G %a' "$WORKING_DIRECTORY"` = `brokeai 2770`, and `getfacl -p` shows `default:group:brokeai:rwx`. MANUAL: the agent-commit part.
+- **L6** (read-only part): `as_oc /usr/bin/test -e /home/$OC_USER/.local/share/opencode/auth.json` returns 1 → PASS. MANUAL: the planted-file test.
+- **L7**:
+  - `/proc/sys/fs/binfmt_misc/status` exists, and every `WSLInterop*` entry's first line is `disabled`;
+  - for each `/run/WSL/*_interop` socket, `as_oc /usr/bin/test -w SOCKET` must return 1;
+  - `info` with `cat /proc/sys/dev/tty/legacy_tiocsti`;
+  - MANUAL: `/init` and `.exe` execution.
+- **L8**: MANUAL.
+- **L9**: `getent passwd "$OC_USER" | cut -d: -f7` = `/bin/bash`. MANUAL: `.cache`.
+- **L10**:
+  - if the daemon is running, `as_oc /usr/bin/test /proc/<serve pid>/cwd -ef "$SERVER_DIRECTORY"` returns 0;
+  - MANUAL: the run cwd.
+- **check-os-user**: `"$PY" -m app --check-os-user --config "$CONFIG"` → PASS/FAIL.
+- **L12**: MANUAL. Refer to the TASKS L12 prompts.
+- Final line: the counts. Exit 1 if any FAIL.
+
+---
+
+## 5. T102: `scripts/systemd/broke-ai-coder.service` (example, not installed)
+
+```
+[Unit]
+Description=broke-ai-coder agent controller daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/scripts/start-daemon.sh
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+# Exit 2 (bad config) and 3 (startup/isolation check failed) need a human: no restart loop.
+RestartPreventExitStatus=2 3
+UMask=0077
+# Do NOT add NoNewPrivileges=: the daemon needs setuid sudo for the OpenCode user.
+# Secrets are loaded by start-daemon.sh only: do NOT add EnvironmentFile=.
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Document the installation in the docs (Part F):
+1. `sed "s|@USER@|$USER|; s|@REPO@|$HOME/broke-ai-coder|" scripts/systemd/broke-ai-coder.service | sudo tee /etc/systemd/system/broke-ai-coder.service`
+2. `sudo systemctl daemon-reload`
+3. `sudo systemctl enable --now broke-ai-coder`
+4. `journalctl -u broke-ai-coder -f`
+
+Unverified assumption, added to T082 as L13: the distro boots only when something starts WSL, and whether it stays up with only systemd services running is unverified. Starting WSL at Windows logon (Task Scheduler) is documented as a live-check item. T102 stays PARTIAL.
+
+---
+
+## 6. Docs
+
+**README.md**
+- Add `## Quick start (WSL, production)` at the top, as a numbered end-to-end list. Each step links to the setup guide part:
+  1. Discord app (A);
+  2. provider keys (B);
+  3. packages (C2);
+  4. OpenCode (D1);
+  5. clone, venv and `config.yaml` (E1);
+  6. `sudo scripts/wsl-setup.sh --yes`, then `wsl --shutdown`;
+  7. fill in the secrets from `secrets.env.example`;
+  8. `scripts/live-checks.sh` and `scripts/health-check.sh`;
+  9. `scripts/start-daemon.sh` (tmux) or the systemd unit;
+  10. the first `/code` (D3);
+  11. `/status`, `/usage`, `/models`, `/health`;
+  12. a security-notes pointer (SPEC §11, deny list D2c).
+- Keep the Windows dev section as `## Development (Windows/tests)`.
+- Remove the stale note "Discord and OpenCode are not implemented yet".
+
+**docs/SETUP-discord-opencode.md**
+- C4: say the names match `secrets.env.example`. The start command becomes `scripts/start-daemon.sh`.
+- C5/C6: add a "Fast path" note: after D1 and E1, `sudo scripts/wsl-setup.sh --yes` performs C5, C6 steps 1-5 and E2. The manual steps stay as reference.
+- New **D2c, OpenCode permissions**:
+  - the default deny categories;
+  - `opencode.permission.extra_bash_deny`;
+  - the defaults cannot be removed;
+  - deny is stricter than approval; Discord approval buttons (T061) are future work;
+  - a guardrail, not a boundary (bypasses; OS user is the boundary);
+  - project files must not contain `permission`.
+- D5: point to Part F.
+- E2: add "or let wsl-setup.sh do it".
+- E4: `scripts/start-daemon.sh`.
+- New **Part F, Operate**: start, stop, health-check, live-checks, bench (`.venv/bin/python scripts/bench_idle.py --seconds 1800`), the systemd unit (section 5), and the git PPA advice.
 - Troubleshooting rows:
-  - `a password is required` → sudoers not installed or wrong user/path; regenerate.
-  - `user 'brokeoc' can access <path>` → chmod per C6 / automount umask.
-  - `WSL interop is enabled` → C6 step 4.
-  - `cannot write opencode.server_directory` → C6 step 3.
-  - `does not enforce the password ... env_keep` → reinstall the generated sudoers file.
-  - `will not restart by itself ... restart the daemon` (N10) → stop whatever holds the port,
-    then restart the daemon.
-  - `mode 'sudo' needs Linux` → Windows dev: set `os_user.mode: none`.
+  - `does not deny the required operations` → P3/L12;
+  - `key 'permission' is not allowed in project config`;
+  - start-daemon refusals (secrets mode or format, already running).
 
 **SPEC.md**
-- §9: one paragraph. In production, serve and run execute as `opencode.os_user.name` via sudo,
-  with an exact env allowlist. Startup isolation self-check fails closed (exit 3).
-  `os_user.mode: none` is tests/dev only.
-- §11: rewrite R1 as "Resolved by T072 when `opencode.os_user.mode: sudo`". Add the remaining
-  residual sub-bullets:
-  - **R1a.** Agent-written code in /workspace (git hooks, scripts, package files) runs as whoever
-    executes it. Do not run git or tests there as the daemon user on unreviewed changes.
-  - **R1b (was N4).** The agent holds the gateway token and serve password. It can call
-    allowlisted free models and reconfigure or kill its own serve, but it has no keys. The
-    per-task GET /config and auth checks fail closed, and the crafted-server identity gap is
-    unchanged.
-  - **R1c.** The daemon parses agent-writable project config files. Only key names are reported.
-    A FIFO or huge file can stall or fail that check.
-  - **R1d.** WSL interop and /mnt must stay closed (self-check enforced).
-  - **R1e.** Mode `none` keeps the original exposure.
-  - **R1f.** sudo logs prompts to the system journal.
+- §5.2: add "Current implementation": deny by default, approval is T061 future, deny is stricter, the trusted-project exemption is not supported yet.
+- §11: add **R5**, the deny list as a guardrail with its bypasses.
+- §16: an example `opencode.permission.extra_bash_deny: []`.
 
 **ARCHITECTURE.md**
-- §11 diagram: mark OpenCode as running under OS user `brokeoc`, with the boundary line "no read
-  access to daemon home/secrets/proc".
-- R1 text: same as SPEC.
-- §12 failure-modes rows:
-  - isolation self-check fails → exit 3;
-  - serve fatal (port taken) → tasks fail `OPENCODE_UNAVAILABLE` telling the user to restart the
-    daemon;
-  - stop/restart kills all brokeoc processes (N1).
+- Line about `GET /config` (around line 235): add the permission check.
+- §11.1: add the `/health` and bench note.
 
-**TASKS.md**
-- T072: Status DONE, describing what is done. Acceptance: the agent cannot read the secrets file,
-  daemon home or daemon /proc environ, and cannot write system dirs.
-- T082: append "OS-user live checks". These are the only things that cannot be verified
-  offline:
-  - L1: `visudo -c` passes; `sudo -n -u brokeoc -- opencode --version` needs no password;
-    `sudo -n true` fails.
-  - L2: env_keep passes exactly the list:
-    `OPENCODE_SERVER_USERNAME=x FOO=y sudo -n -u brokeoc -- /usr/bin/head -c 4096 /proc/self/environ | tr '\0' '\n'`
-    shows the kept vars and no FOO. The daemon's serve passes the anon-401 check and the
-    gateway-only GET /config.
-  - L3 (S1/S2): during a task, `ps -o pid,ppid,sid,user,cmd -u brokeoc` shows opencode's sid ==
-    the sudo pid. After /cancel and a run timeout, no `opencode run` is left. After daemon stop,
-    `pgrep -u brokeoc` is empty (N1).
-  - L4: as brokeoc (`sudo -u brokeoc bash`, admin password), these must all be denied:
-    `cat ~<you>/.config/broke-ai-coder/secrets.env`, `cat /proc/<daemon pid>/environ`,
-    `ls ~<you>`, `ls /mnt/c`, and running any `.exe`.
-  - L5: agent-created files in /workspace are group brokeai with g+rw (default ACL). The daemon
-    user's `git status` works, and the agent can commit (safe.directory).
-  - L6: a planted entry in brokeoc's auth.json makes startup fail with the stored-credentials
-    message, and per-task the task fails `OPENCODE_UNSAFE_CONFIG`.
-  - L7 (W1): after the wsl.conf change and `wsl --shutdown`, no enabled `WSLInterop*` entry
-    remains, including with systemd on.
-  - L8: sudo journal entries contain prompts (documented).
-  - L9: OpenCode's shell tool works with SHELL=/bin/bash from passwd. OpenCode's provider
-    package download into /home/brokeoc/.cache works.
-  - L10 (S4/B8): serve's cwd is server_directory and run's cwd is the project directory.
-  - L11 (S5): the auth.json path under sudo env_reset is the default XDG path.
+**config.example.yaml**: under `opencode:` add the following, plus extend the SAFETY comment with one line about permission:
 
-**README.md Notes**: add two bullets:
-- Production (WSL) runs OpenCode as a separate Linux user through sudo
-  (`opencode.os_user`, setup guide Part C6); `--print-sudoers` and `--check-os-user` help with
-  setup.
-- On Windows/tests set `opencode.os_user.mode: none`, which is unsupported for production.
+```yaml
+  permission:
+    # Extra OpenCode bash patterns to DENY on top of the built-in list (git push, recursive rm,
+    # deploy, global installs, credential changes). The built-in list cannot be removed.
+    extra_bash_deny: []
+```
 
-## Edge cases the implementation must handle
+---
 
-- The prompt is never passed through a shell. sudo receives `--` before the absolute executable.
-  The prompt is one argv element, and a leading `-` is already space-prefixed by `build_argv`.
-- The env given to sudo never contains the daemon's HOME/XDG_*/keys/bot token. Extras outside
-  `KEEP_ENV` are dropped.
-- Every sudo invocation (launch, pkill, test, head, `--version`) uses `stdin=DEVNULL`,
-  `start_new_session=True` and the default `close_fds`. That covers launches via
-  `spawn_kwargs()` and probes via `SystemHostProbe.run`.
-- `kill_tree`, `sweep` and `auth_store_problem` never raise. pkill rc 1 (no match) is normal.
-  Timeouts are bounded (`_PROBE_TIMEOUT_S`).
-- `self_check` never sweeps, so `--check-os-user` cannot kill a running daemon's serve. `start()`
-  sweeps once after a successful check.
-- `--once` builds the launcher but never starts it (no self-check, no sweep).
-- `managed_server: false` with mode sudo: skip checks 9 and 13. Run clients still go through
-  sudo.
-- `~/` expansion uses the daemon's passwd home from the probe, never `os.path.expanduser`.
-  Database paths are `os.path.abspath`'d.
-- A missing protected path yields `test -r` rc 1, so it passes.
-- brokeoc controls its own auth.json (it could be huge, a FIFO, a symlink or invalid). The read
-  is bounded by `head -c` and the probe timeout; any anomaly means "unreadable", which fails
-  closed. The read runs as brokeoc, so a symlink to daemon files is denied.
-- `os_user.py` imports and its tests run on Windows: lazy `pwd`/`grp`, signal names as strings,
-  POSIX paths via `PurePosixPath`/string ops.
-- The N10 restart instruction comes before the fatal text, so the 300-char cap cannot cut it.
-  The detail still starts with "managed OpenCode server is down" (the format.py gate).
-- N9 runs after the existing invalid-request checks, so an invalid prompt still returns INVALID.
-  The attempt row is finished as `EXECUTOR_UNAVAILABLE` and no cooldown is recorded (the
-  existing orchestrator path).
+## 7. TASKS.md sync (verify each module exists before marking)
 
-## Out of scope (do not implement)
+Use these formats: `**Status:** DONE`, `**Status:** DONE (offline; live check in T082)`, `**Status:** PARTIAL: <note>`. Do NOT add a second line containing `OC() {`; `tests/test_opencode_sweep_proc.py:138` requires exactly one.
 
-- N4 beyond the documentation (R1b).
-- cgroups/systemd scopes.
-- hidepid.
-- Restricting `safe.directory`.
-- Symlink/FIFO hardening of the project-config check (R1c).
-- The re-arm path for fatal_error (N10 is message-only).
-- N2, N3, N5-N7, F5-F16.
+**DONE:**
+- T001, T001A, T011, T012, T013, T020, T021, T021A, T022, T023, T030, T031, T034, T035, T040, T041, T042, T043, T050, T051, T051A, T052, T053, T054, T055, T063, T070, T071, T073, T080, T081, T090, T091, T092;
+- T094 and T100 (`secrets.env.example`);
+- T101: update the text to say no `start-opencode` script is needed (the daemon manages serve); the scripts are start-daemon, stop-daemon and health-check;
+- T103.
+- Fix T071's duplicate Status line.
+
+**DONE (offline; live check in T082):** T003, T032. (T010 is PARTIAL: `/approve` and `/deny` are missing — list it under PARTIAL only.)
+
+**PARTIAL:**
+- T010: `/approve` and `/deny` are not implemented (T061).
+- T024: metrics, `/health` and the bench script exist; the 30-minute idle run and the representative workload measurement are pending live.
+- T044: refresh runs lazily before tasks, rate-limited by `provider_refresh_interval_s`; there is no background job.
+- T060: sensitive commands are DENIED by OpenCode permission rules with a fail-closed preflight; approval requests are T061.
+- T084: offline parts are tested; the ledger check after the E2E run is pending.
+- T093: controller-only `/health`; there are no live provider probes.
+- T102: system unit example; WSL boot persistence is unverified (L13).
+
+**TODO:** T002 (the user's WSL lacks opencode), T061, T082, T083.
+
+**BACKLOG:** T110-T114 (already).
+
+T082: append L12 (P1-P6), as checks:
+- serve starts;
+- the preflight passes;
+- a `/code` asking to run `git push` gets a denied tool result, and the task finishes without hanging;
+- `cd . && git push` is denied;
+- reading `/etc/hostname` is denied (external_directory) while edits inside the project work;
+- websearch is absent or denied;
+- note the `question` tool's behaviour.
+
+Also append L13 (T102 boot persistence) and add `scripts/live-checks.sh` as the automated subset of L0-L11.
+
+---
+
+## 8. Tests (offline; `.venv/Scripts/python -m pytest`, ruff check + format clean)
+
+- **`tests/test_opencode_permissions.py`**:
+  - block shape: `"*"` first and in the dumped JSON;
+  - every default is present with `deny`;
+  - extras are appended and de-duplicated;
+  - validator rejections: empty, `*`, braces, control characters, more than 200 characters;
+  - unknown key `bash_deny` rejected;
+  - `build_opencode_config` contains the block;
+  - `permission_problem` returns its key path for every rule in 1.1 (cases 1-6 and the agent cases), and an agent `{"edit": "deny"}` is OK;
+  - `check_server_config` gives UNSAFE with "permission" in the detail and no pattern text in the detail;
+  - the superset/subset cases in 1.5;
+  - `OpenCodeExecutor.check_server_config` with a config that has extras against a MockTransport serving the defaults-only body → UNSAFE.
+  - Copy the patterns from `tests/test_opencode_config_check.py` (`probe`, `mutated`).
+- **`tests/test_project_config_check.py`** (append): a project `permission` key → UNSAFE; agent permission bash `allow` → UNSAFE; agent permission `{"edit": "deny"}` → OK.
+- **`tests/test_health.py`**:
+  - `read_rss_bytes` on a fake status file, and on a missing path → None;
+  - `read_peak_rss_bytes` returns None when `sys.platform` is monkeypatched to `win32`;
+  - `ProcessSampler` with injected clock, cpu and rss: percentages, window None below 1 s;
+  - `format_health`: the label `excludes OpenCode`, `unavailable on this platform`, the FATAL line truncated, and a secret placed in `serve_fatal_error`/`os_user` is redacted via `SecretRedactor`;
+  - `run_command("health")` authorized vs `Not authorized.` (extend `FakeBackend` in `tests/test_bot_commands.py` with `health()`);
+  - `ControllerBackend.health` with fake probes;
+  - `DirectLauncher`/`SudoLauncher.status_summary` with a fake probe (copy the probe from `tests/test_opencode_os_user.py`).
+- **`tests/test_bench.py`**:
+  - `main(["--seconds","0.3","--interval","0.1","--warmup","0","--no-discord-import","--config",<example>])` returns 0 or 1, and the output contains `excludes OpenCode`;
+  - a subprocess runs `[sys.executable, "scripts/bench_idle.py", "--seconds","0.5","--interval","0.1","--warmup","0"]` with cwd=ROOT and env containing `DISCORD_BOT_TOKEN=<sentinel>`. Expect rc in (0, 1), the sentinel absent from the output, and no new `*.db` in ROOT/data from the run (check that the bench DB path is in a temp dir).
+- **`tests/test_ops.py`**:
+  - every `merge_wsl_conf` case listed in 4.4, plus idempotence and CRLF;
+  - `check` CLI exit codes (0/1/2), using a tmp file;
+  - `setup_values` for `config.example.yaml`: the keys and their order;
+  - an unsafe value (`working_directory: "/work space"`) exits 2;
+  - a ConfigError exits 2.
+- **`tests/test_scripts.py`**:
+  - the files exist: the 5 `.sh` files, `bench_idle.py` and the unit;
+  - each `.sh` has the shebang, `set -eu` in the first 15 lines, and no `\r\n`;
+  - the git index mode is `100755` for `*.sh` (skip if git is unavailable);
+  - `bash -n` with a POSIX bash found as follows, and skip if none: `shutil.which("bash")`, rejecting paths containing `system32` or `windowsapps` (the WSL launcher), or else `C:\Program Files\Git\bin\bash.exe`;
+  - `shellcheck -S warning` if it is on PATH, else skip;
+  - with that bash: `wsl-setup.sh` with no args → rc 2 and output mentions `--yes`; each script `--help` → rc 0;
+  - the forbidden tokens in `live-checks.sh` (4.6);
+  - `wsl-setup.sh` contains no `source`, no `. "$` and no `cat` of `secrets.env`;
+  - `start-daemon.sh` contains `exec "$PY" -m app`;
+  - the unit has `User=@USER@`, `RestartPreventExitStatus=2 3`, and no `NoNewPrivileges=yes` or `EnvironmentFile`;
+  - `secrets.env.example`: every non-comment line matches `^export [A-Z_][A-Z0-9_]*=$`, and the name set equals the config names (section 3).
+- Existing suites must stay green, in particular `tests/test_opencode_server.py` (`"sk-"`/`API_KEY` absent), `tests/test_discord_frontend.py` (the command set) and `tests/test_bot_format.py`.
+
+## Out of scope
+
+- Approval buttons and an approval DB (T061).
+- Live provider probes in `/health`.
+- psutil or any new dependency.
+- Running any script against the real WSL.
+- Checks of `.opencode/agent/*.md` or plugins (documented as R5).
+- Recursive ACL fixes.

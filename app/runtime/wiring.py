@@ -17,6 +17,7 @@ from app.providers.registry import build_adapters
 from app.quota.cooldown import CooldownManager
 from app.redaction import SecretRedactor
 from app.runtime.daemon import AgentController
+from app.runtime.diagnostics import RuntimeProbes
 from app.runtime.interfaces import ChatFrontend, NullFrontend, RuntimeService
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class Runtime:
     gateway: LlmGateway
     server_manager: OpenCodeServerManager | None
     launcher: OpenCodeLauncher
+    probes: RuntimeProbes
 
 
 def build_runtime(
@@ -104,6 +106,11 @@ def build_runtime(
         config, executor=executor, adapters=adapters, environ=environ, cooldowns=cooldowns
     )
     orch_holder["orchestrator"] = orchestrator
+    probes = RuntimeProbes(
+        gateway_up=gateway.is_running,
+        serve_state=(lambda: (manager.ready, manager.fatal_error)) if manager else None,
+        os_user_summary=launcher.status_summary,
+    )
     frontend: ChatFrontend
     if once:
         frontend = NullFrontend()
@@ -111,7 +118,7 @@ def build_runtime(
         # Imported lazily so --check and --once never import discord.
         from app.bot.discord_frontend import create_frontend
 
-        frontend = create_frontend(config, redactor=redactor, environ=environ)
+        frontend = create_frontend(config, redactor=redactor, environ=environ, probes=probes)
     # The launcher's self-check runs before serve starts; its stop sweeps after serve stops.
     services: list[RuntimeService] = [] if once else [gateway, launcher]
     if manager is not None:
@@ -120,7 +127,7 @@ def build_runtime(
         config, frontend=frontend, orchestrator=orchestrator, services=services
     )
     holder["controller"] = controller
-    return Runtime(controller, orchestrator, executor, adapters, gateway, manager, launcher)
+    return Runtime(controller, orchestrator, executor, adapters, gateway, manager, launcher, probes)
 
 
 async def close_runtime(rt: Runtime) -> None:

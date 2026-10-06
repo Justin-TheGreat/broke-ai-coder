@@ -6,6 +6,8 @@ The daemon launches ``opencode serve`` itself with:
 * ``OPENCODE_CONFIG_CONTENT`` carrying the whole safety config: ``enabled_providers`` limited to
   the gateway provider ``broke`` whose ``baseURL`` is the loopback gateway and whose ``apiKey`` is
   the random per-run gateway token, plus the pinned ``model`` and ``small_model``,
+* a ``permission`` block (``app/opencode/permissions.py``): sensitive bash commands,
+  ``external_directory``, ``websearch`` and ``doom_loop`` are denied (a guardrail, not a boundary),
 * a random Basic-auth password (``OPENCODE_SERVER_PASSWORD``) bound to 127.0.0.1,
 * a daemon-owned working directory (``opencode.server_directory``).
 
@@ -41,6 +43,7 @@ from app.config.models import GATEWAY_PROVIDER_ID, AppConfig
 from app.opencode.endpoint import ServerEndpoint
 from app.opencode.health import check_opencode_health
 from app.opencode.os_user import DirectLauncher, OpenCodeLauncher, strip_control
+from app.opencode.permissions import build_permission_block
 from app.opencode.process import spawn_kwargs
 from app.redaction import SecretRedactor
 from app.runtime.interfaces import StartupError
@@ -85,6 +88,7 @@ def build_opencode_config(
         },
         "model": f"{GATEWAY_PROVIDER_ID}/{first}",
         "small_model": f"{GATEWAY_PROVIDER_ID}/{small}",
+        "permission": build_permission_block(config.opencode.permission),
         "share": "disabled",
         "autoupdate": False,
     }
@@ -276,6 +280,12 @@ class OpenCodeServerManager:
             self._app,
             gateway_base_url=self._gateway.base_url,
             gateway_token=self._gateway.token,
+        )
+        logger.info(
+            "opencode permissions: %d bash patterns denied (%d from config); "
+            "external_directory, websearch, doom_loop denied",
+            len(cfg["permission"]["bash"]) - 1,
+            len(self._oc.permission.extra_bash_deny),
         )
         env = self._launcher.environment(
             os.environ if self._environ is None else self._environ,
