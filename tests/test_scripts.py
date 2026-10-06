@@ -380,14 +380,20 @@ def test_wsl_setup_phase_a_checks_everything_and_changes_nothing_before_exiting(
         "root | sudo | admin | wheel | adm | docker | lxd | disk | shadow",
         "secrets.env",
         'oc_uid" -eq 0',
-        '-L "$WORKING_DIRECTORY"',
+        'check_root_dir SERVER_DIRECTORY "$SERVER_DIRECTORY"',
+        'check_root_dir WORKING_DIRECTORY "$WORKING_DIRECTORY"',
+        'check_apart SERVER_DIRECTORY "$SERVER_DIRECTORY" WORKING_DIRECTORY',
+        '"the repository" "$REPO_DIR"',
+        '"the database directory" "$DB_DIR"',
+        '"your home" "$H"',
+        '"the OpenCode user\'s home" "$OC_HOME"',
     ):
         assert needle in phase_a, needle
     wanted = "getent groupadd useradd usermod gpasswd setfacl getfacl visudo install runuser"
     wanted += " setsid stat id mktemp cmp"
     for c in wanted.split():
         assert re.search(rf"\b{c}\b", cmd_line), c
-    assert "apt install -y acl" in phase_a
+    assert "sudo apt install acl" in phase_a
 
 
 def test_wsl_setup_actions_are_idempotent_and_backups_come_first():
@@ -407,10 +413,11 @@ def test_wsl_setup_actions_are_idempotent_and_backups_come_first():
     # sudoers: validate, skip when identical, back up before install, roll back on failure
     assert body.index("run visudo -cf") < body.index("cmp -s")
     assert body.index('run cp -p "$SUDOERS_DEST" "$BACKUP"') < body.index(
-        'run install -m 0440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_DEST"'
+        'install_sudoers "$SUDOERS_TMP"'
     )
-    rollback = body[body.index("if ! run visudo -c; then") :]
+    rollback = body[body.index('if ! install_sudoers "$SUDOERS_TMP"') :]
     assert 'run rm -f "$SUDOERS_DEST"' in rollback and "exit 1" in rollback
+    assert 'install_sudoers "$BACKUP"' in rollback
     # the working directory is never changed recursively
     for ln in body.splitlines():
         if ln.strip().startswith(("run chown", "run chmod", "run setfacl")):

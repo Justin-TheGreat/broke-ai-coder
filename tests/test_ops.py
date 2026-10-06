@@ -186,3 +186,104 @@ def test_setup_values_config_error_exits_2(tmp_path, capsys):
     bad.write_text("opencode: {unknown_key: 1}\n", encoding="utf-8")
     assert setup_main(["--config", str(bad)]) == 2
     assert capsys.readouterr().out == ""
+
+
+# ---- R-1: normalized directories, fullmatch, _under -------------------------------------
+
+
+def _fake_abspath(monkeypatch):
+    fake_os = types.SimpleNamespace(path=types.SimpleNamespace(abspath=lambda p: "/abs/" + p))
+    monkeypatch.setattr(setup_values_module, "os", fake_os)
+
+
+def _config_with(tmp_path, old, new):
+    text = EXAMPLE.read_text(encoding="utf-8")
+    assert old in text
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(text.replace(old, new), encoding="utf-8")
+    return cfg
+
+
+@pytest.mark.parametrize(
+    "key,old,bad",
+    [
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "/tmp/../home/jichen"),
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "/workspace/"),
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "/workspace/."),
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "//workspace"),
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "/workspace//sub"),
+        ("WORKING_DIRECTORY", "working_directory: /workspace", "/workspace/../etc"),
+        (
+            "SERVER_DIRECTORY",
+            "server_directory: /var/lib/broke-ai-coder/opencode-server",
+            "/var/lib/../../etc",
+        ),
+        (
+            "SERVER_DIRECTORY",
+            "server_directory: /var/lib/broke-ai-coder/opencode-server",
+            "/var/lib/broke-ai-coder/opencode-server/",
+        ),
+    ],
+)
+def test_setup_values_rejects_non_normalized_directories(
+    tmp_path, capsys, monkeypatch, key, old, bad
+):
+    _fake_abspath(monkeypatch)
+    cfg = _config_with(tmp_path, old, f"{old.split(':')[0]}: {bad}")
+    assert setup_main(["--config", str(cfg)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert key in captured.err and "normalized" in captured.err
+
+
+def test_setup_values_defaults_are_normalized(capsys, monkeypatch):
+    _fake_abspath(monkeypatch)
+    assert setup_main(["--config", str(EXAMPLE)]) == 0
+    out = dict(ln.split("=", 1) for ln in capsys.readouterr().out.splitlines())
+    assert out["WORKING_DIRECTORY"] == "/workspace"
+    assert out["SERVER_DIRECTORY"] == "/var/lib/broke-ai-coder/opencode-server"
+
+
+def test_safe_re_rejects_a_trailing_newline():
+    assert setup_values_module._SAFE_RE.fullmatch("/workspace\n") is None
+    assert setup_values_module._SAFE_RE.fullmatch("/workspace") is not None
+
+
+@pytest.mark.parametrize(
+    "path,ok",
+    [
+        ("/workspace", True),
+        ("/var/lib/broke-ai-coder/opencode-server", True),
+        ("/workspace/", False),
+        ("/workspace/.", False),
+        ("//workspace", False),
+        ("/a/../b", False),
+        ("relative", False),
+        ("/", True),
+    ],
+)
+def test_is_normalized_absolute(path, ok):
+    assert setup_values_module.is_normalized_absolute(path) is ok
+
+
+@pytest.mark.parametrize(
+    "path,home,expected",
+    [
+        ("/home/me", "/home/me", True),
+        ("/home/me/bin/opencode", "/home/me", True),
+        ("/home/me/../me/x", "/home/me", True),
+        ("/tmp/../home/me/x", "/home/me", True),
+        ("/home/other/../me", "/home/me", True),
+        ("/home//me/x", "/home/me", True),
+        ("/home/me/", "/home/me", True),
+        ("/home/me/x", "/home/me/", True),
+        ("/home/me/../other", "/home/me", False),
+        ("/home/meX", "/home/me", False),
+        ("/usr/local/bin/opencode", "/home/me", False),
+        ("/home/me/./../x", "/home/me", False),
+    ],
+)
+def test_under_normalizes_paths(path, home, expected):
+    from app.opencode.os_user import _under
+
+    assert _under(path, home) is expected

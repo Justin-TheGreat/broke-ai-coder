@@ -102,8 +102,16 @@ Ubuntu 24.04 ships Python 3.12, which meets the project's 3.12+ requirement.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y git curl sqlite3 tmux python3 python3-venv python3-pip gh
+sudo apt install -y git curl sqlite3 tmux python3 python3-venv python3-pip gh acl
 python3 --version   # expect 3.12.x
+git --version       # expect 2.45.1 or newer (live-checks.sh L0 fails otherwise)
+```
+
+`acl` provides `setfacl`/`getfacl`, which `scripts/wsl-setup.sh` needs. Ubuntu 24.04 ships git 2.43, which is too old for the agent workflow; update it now (printed here so you can copy it, nothing runs it for you):
+
+```bash
+sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install -y git
+git --version
 ```
 
 ### C3. Git identity and GitHub login (inside WSL — separate from Windows)
@@ -396,7 +404,7 @@ All scripts live in `scripts/`, run as your normal WSL user (not root) unless st
   sudo systemctl enable --now broke-ai-coder
   journalctl -u broke-ai-coder -f
   ```
-  Do not add `NoNewPrivileges=` (the daemon needs setuid sudo for the OpenCode user) or `EnvironmentFile=` (secrets are loaded by `start-daemon.sh` only). Exit codes 2 and 3 are not restarted. Systemd needs `[boot] systemd=true` in `/etc/wsl.conf`. Whether the distro stays up with only systemd services running is unverified (T082 L13); starting WSL at Windows logon through Task Scheduler is the documented fallback.
+  Do not add `NoNewPrivileges=` (the daemon needs setuid sudo for the OpenCode user) or `EnvironmentFile=` (secrets are loaded by `start-daemon.sh` only). Exit codes 2 and 3 are not restarted. Systemd needs `[boot] systemd=true` in `/etc/wsl.conf`. Whether the distro stays up with only systemd services running is unverified (T082 L13); starting WSL at Windows logon through Task Scheduler is the documented fallback. The unit keeps `Wants=network-online.target`; on some WSL installs `systemd-networkd-wait-online` never finishes and stalls boot. If WSL boots slowly or hangs, remove the `After=`/`Wants=network-online.target` lines (the daemon retries its network connections itself) or run `sudo systemctl disable systemd-networkd-wait-online` and re-check (T082 L13).
 - **git version:** the agent workflow needs git 2.45.1 or newer (L5). If `git --version` is older: `sudo add-apt-repository ppa:git-core/ppa && sudo apt update && sudo apt install -y git`.
 
 ---

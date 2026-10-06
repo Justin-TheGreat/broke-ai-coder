@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -eu
+set -o errtrace
 # One-time WSL setup for broke-ai-coder (docs/SETUP-discord-opencode.md C5, C6 steps 1-5, E2).
 # Run it yourself:  sudo scripts/wsl-setup.sh --yes
 #
@@ -26,7 +27,8 @@ Makes the changes that need root, once, so OpenCode can run as a separate Linux 
   - sets the git identity of the OpenCode user if it has no ~/.gitconfig
 
 Run it with sudo from your normal WSL user. Without --yes nothing is changed (exit 2).
-Exit codes: 0 done, 1 a sudoers install failed and was rolled back, 2 refused or usage error.
+Exit codes: 0 done, 1 a step failed after changes began (sudoers failures are rolled back; a
+re-run is safe), 2 refused or usage error (nothing was changed).
 USAGE
 }
 
@@ -88,12 +90,148 @@ problem() {
 SUDOERS_TMP=""
 WSLCONF_TMP=""
 cleanup() {
+    [ "$(id -u)" -ne 0 ] || rm -f /etc/sudoers.d/.broke-ai-coder.new
     [ -z "$SUDOERS_TMP" ] || rm -f "$SUDOERS_TMP"
     [ -z "$WSLCONF_TMP" ] || rm -f "$WSLCONF_TMP"
 }
 trap cleanup EXIT
 
+STEP="Phase A (preconditions)"
+on_err() {
+    printf '[setup] FAIL: stopped at line %s during: %s\n' "$1" "$STEP" >&2
+    if [ "${STEP#Phase A}" != "$STEP" ]; then
+        echo "[setup] nothing was changed." >&2
+    else
+        echo "[setup] some steps were applied; every step is idempotent, so re-running is safe." >&2
+    fi
+}
+trap 'on_err $LINENO' ERR
+die() {
+    printf '[setup] FAIL: %s\n' "$*" >&2
+    exit 1
+}
+
 cd "$REPO_DIR"
+
+# ---- path guards for the directories root chowns/chmods/ACLs ----------------------------------
+# The helpers below touch the filesystem; the tests replace them with stubs.
+canon_path() { realpath -m -- "$1"; }
+path_kind() { # missing | symlink | dir | other
+    if [ -L "$1" ]; then
+        echo symlink
+    elif [ ! -e "$1" ]; then
+        echo missing
+    elif [ -d "$1" ]; then
+        echo dir
+    else
+        echo other
+    fi
+}
+owner_mode() { stat -c '%U %a' -- "$1"; }
+
+# under PATH BASE: PATH is BASE or inside it (plain strings; both are already normalized)
+under() {
+    case "$1" in
+        "$2" | "$2"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Refused for opencode.working_directory and opencode.server_directory, the path itself and
+# anything inside. The script chowns, chmods and ACLs (group brokeai = the agent) these paths as
+# root, so each entry is a place where that would hand the agent root or break R1:
+#   /bin /sbin /lib /lib32 /lib64 /libx32 /usr  program and library dirs (root's secure_path, PATH)
+#   /etc /boot /root /snap                      system configuration, boot files, root's home
+#   /dev /proc /sys /run                        device, kernel and runtime pseudo-filesystems
+#   /tmp /var/tmp                               world-writable, shared with every process
+#   /home                                       every user's home: your home holds the secrets
+#                                               and the daemon, and the OpenCode user's home
+#   /mnt /media                                 Windows drives (DrvFs) and removable media
+#   /opt /srv                                   other software and service data
+# /var is refused too (logs, spool, other services' state) except below
+# /var/lib/broke-ai-coder/, the one place the script itself creates (the serve directory).
+# The defaults /workspace and /var/lib/broke-ai-coder/opencode-server pass.
+FORBIDDEN_TREES="/bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /opt /proc /root /run /sbin /snap /srv /sys /usr /tmp /var/tmp /mnt /home /media"
+OWN_VAR_TREE=/var/lib/broke-ai-coder
+
+# check_root_dir NAME PATH: every refusal goes through `problem`, nothing is changed.
+check_root_dir() {
+    local name=$1 path=$2 canon kind t anc om owner mode
+    case "$path" in
+        /*) ;;
+        *)
+            problem "$name '$path' must be an absolute path"
+            return 0
+            ;;
+    esac
+    canon=$(canon_path "$path") || canon=""
+    if [ "$canon" != "$path" ]; then
+        problem "$name '$path' is not in normalized form ('..', '.', '//', a trailing '/' or a symlinked component; realpath -m gives '$canon')"
+        return 0
+    fi
+    if [ "$path" = "/" ]; then
+        problem "$name must not be /"
+        return 0
+    fi
+    for t in $FORBIDDEN_TREES; do
+        if under "$path" "$t"; then
+            problem "$name '$path' is a system or shared directory ($t); use e.g. /workspace"
+            return 0
+        fi
+    done
+    if under "$path" /var && ! { [ "$path" != "$OWN_VAR_TREE" ] && under "$path" "$OWN_VAR_TREE"; }; then
+        problem "$name '$path' is under /var; only below $OWN_VAR_TREE/ is allowed"
+        return 0
+    fi
+    kind=$(path_kind "$path")
+    case "$kind" in
+        symlink)
+            problem "$name '$path' is a symlink"
+            return 0
+            ;;
+        dir | missing) ;;
+        *)
+            problem "$name '$path' exists and is not a directory"
+            return 0
+            ;;
+    esac
+    # every existing ancestor must be root-owned and not group/other-writable, so the agent
+    # cannot plant or swap anything on the way to the path
+    anc=$path
+    while [ "$anc" != "/" ]; do
+        anc=$(dirname "$anc")
+        [ "$(path_kind "$anc")" != "missing" ] || continue
+        om=$(owner_mode "$anc")
+        owner=${om% *}
+        mode=$(printf '%03d' "${om#* }")
+        if [ "$owner" != "root" ] || [ $((${mode: -2:1} & 2)) -ne 0 ] || [ $((${mode: -1} & 2)) -ne 0 ]; then
+            problem "$name '$path': parent $anc must be owned by root and not group/other-writable (is: $om)"
+            return 0
+        fi
+    done
+}
+
+# valid_home USER HOME: step 4 runs `chmod 700 HOME` as root, so HOME must be an absolute,
+# normalized, existing directory (not /) owned by USER.
+valid_home() {
+    local om=""
+    case "$2" in
+        /?*) ;;
+        *) return 1 ;;
+    esac
+    [ "$(path_kind "$2")" = "dir" ] || return 1
+    [ "$(canon_path "$2")" = "$2" ] || return 1
+    om=$(owner_mode "$2")
+    [ "${om%% *}" = "$1" ]
+}
+
+# check_apart NAME PATH OTHERNAME OTHER: neither path may equal or contain the other
+check_apart() {
+    [ -n "$4" ] || return 0
+    if under "$2" "$4" || under "$4" "$2"; then
+        problem "$1 '$2' must not equal, contain or lie inside $3 '$4'"
+    fi
+}
 
 # ---- Phase A: preconditions (nothing is changed until all of them hold) -------------------------
 
@@ -103,6 +241,8 @@ U_UID=""
 OS_USER_MODE=""
 OC_USER=""
 OPENCODE_BIN=""
+OC_HOME=""
+DB_DIR=""
 SERVER_DIRECTORY=""
 WORKING_DIRECTORY=""
 DATABASE_PATH=""
@@ -121,6 +261,11 @@ else
     H=$(getent passwd "$U" | cut -d: -f6)
     U_UID=$(id -u "$U")
     USER_OK=1
+    # step 4 runs `chmod 700 "$H"` as root
+    valid_home "$U" "$H" || USER_OK=0
+    if [ "$USER_OK" -eq 0 ]; then
+        problem "the passwd home of $U ('$H') must be an absolute, normalized, existing directory owned by $U and not /"
+    fi
 fi
 
 if ! grep -qi microsoft /proc/version 2>/dev/null; then
@@ -128,11 +273,11 @@ if ! grep -qi microsoft /proc/version 2>/dev/null; then
 fi
 
 CMDS_OK=1
-for c in getent groupadd useradd usermod gpasswd setfacl getfacl visudo install runuser setsid stat id mktemp cmp; do
+for c in getent groupadd useradd usermod gpasswd setfacl getfacl visudo install runuser setsid stat id mktemp cmp realpath dirname; do
     if ! command -v "$c" >/dev/null 2>&1; then
         CMDS_OK=0
         if [ "$c" = "setfacl" ] || [ "$c" = "getfacl" ]; then
-            problem "command $c is missing: apt install -y acl"
+            problem "command $c is missing: sudo apt install acl"
         else
             problem "command $c is missing"
         fi
@@ -199,18 +344,24 @@ if [ "$VALUES_OK" -eq 1 ]; then
         fi
     fi
 
+    OC_HOME="/home/$OC_USER"
+    if getent passwd "$OC_USER" >/dev/null; then
+        oc_home_pw=$(getent passwd "$OC_USER" | cut -d: -f6)
+        if [ "$oc_home_pw" != "$OC_HOME" ]; then
+            problem "user $OC_USER has home '$oc_home_pw'; this script needs it to be $OC_HOME"
+        fi
+    fi
+    check_root_dir SERVER_DIRECTORY "$SERVER_DIRECTORY"
+    check_root_dir WORKING_DIRECTORY "$WORKING_DIRECTORY"
+    check_apart SERVER_DIRECTORY "$SERVER_DIRECTORY" WORKING_DIRECTORY "$WORKING_DIRECTORY"
+    DB_DIR=$(dirname "$DATABASE_PATH")
     for pair in "SERVER_DIRECTORY=$SERVER_DIRECTORY" "WORKING_DIRECTORY=$WORKING_DIRECTORY"; do
         name=${pair%%=*}
         path=${pair#*=}
-        case "$path" in
-            /*) ;;
-            *) problem "$name '$path' must be an absolute path" ;;
-        esac
-        if [ "$USER_OK" -eq 1 ]; then
-            case "$path" in
-                "$H" | "$H"/*) problem "$name '$path' must not be under your home ($H)" ;;
-            esac
-        fi
+        check_apart "$name" "$path" "the repository" "$REPO_DIR"
+        check_apart "$name" "$path" "the database directory" "$DB_DIR"
+        [ "$USER_OK" -ne 1 ] || check_apart "$name" "$path" "your home" "$H"
+        check_apart "$name" "$path" "the OpenCode user's home" "$OC_HOME"
     done
 
     if [ "$USER_OK" -eq 1 ] && [ "$CMDS_OK" -eq 1 ]; then
@@ -237,12 +388,6 @@ if [ "$VALUES_OK" -eq 1 ]; then
                     ;;
             esac
         done
-    fi
-
-    if [ -L "$WORKING_DIRECTORY" ]; then
-        problem "working directory $WORKING_DIRECTORY is a symlink"
-    elif [ -e "$WORKING_DIRECTORY" ] && [ ! -d "$WORKING_DIRECTORY" ]; then
-        problem "working directory $WORKING_DIRECTORY exists and is not a directory"
     fi
 fi
 
@@ -277,6 +422,7 @@ in_group() { # in_group USER GROUP
     return 1
 }
 
+STEP="1-2. group brokeai and your membership"
 # 1-2. group brokeai and your membership
 if getent group brokeai >/dev/null; then
     ok "group brokeai exists"
@@ -293,10 +439,11 @@ else
 fi
 
 # 3. the OpenCode user
+STEP="3. the OpenCode user"
 if getent passwd "$OC_USER" >/dev/null; then
     ok "user $OC_USER exists"
 else
-    run useradd --create-home --home-dir "/home/$OC_USER" --shell /bin/bash --user-group "$OC_USER"
+    run useradd --create-home --home-dir "$OC_HOME" --shell /bin/bash --user-group "$OC_USER"
     changed "created user $OC_USER"
 fi
 if in_group "$OC_USER" brokeai; then
@@ -305,13 +452,15 @@ else
     run usermod -aG brokeai "$OC_USER"
     changed "added $OC_USER to group brokeai"
 fi
-run chmod 700 "/home/$OC_USER"
+run chmod 700 "$OC_HOME"
 
 # 4. your home
+STEP="4. your home"
 printf '[setup] NOTE: mode of %s was %s\n' "$H" "$(stat -c %a "$H")"
 run chmod 700 "$H"
 
 # 5. secrets directory and file (the content is never read)
+STEP="5. secrets directory and file"
 CFG_DIR="$H/.config/broke-ai-coder"
 SECRETS="$CFG_DIR/secrets.env"
 run runuser -u "$U" -- mkdir -p "$CFG_DIR"
@@ -325,6 +474,7 @@ fi
 run chmod 600 "$SECRETS"
 
 # 6. working directory (non-recursive)
+STEP="6. working directory"
 if [ ! -d "$WORKING_DIRECTORY" ]; then
     run install -d -m 2770 -o "$U" -g brokeai "$WORKING_DIRECTORY"
     changed "created $WORKING_DIRECTORY"
@@ -339,6 +489,7 @@ run setfacl -m g:brokeai:rwX "$WORKING_DIRECTORY"
 run setfacl -d -m g:brokeai:rwX "$WORKING_DIRECTORY"
 
 # 7. serve directory
+STEP="7. serve directory"
 SERVER_PARENT=$(dirname "$SERVER_DIRECTORY")
 if [ -d "$SERVER_PARENT" ]; then
     ok "$SERVER_PARENT exists"
@@ -354,6 +505,7 @@ else
 fi
 
 # 8. /etc/wsl.conf
+STEP="8. /etc/wsl.conf"
 set +e
 WSL_CHANGES=$(runuser -u "$U" -- "$PY" -m app.ops.wslconf check /etc/wsl.conf)
 WSL_RC=$?
@@ -363,6 +515,9 @@ case "$WSL_RC" in
     1)
         printf '[setup] /etc/wsl.conf needs these changes:\n%s\n' "$WSL_CHANGES"
         merged=$(runuser -u "$U" -- "$PY" -m app.ops.wslconf merge /etc/wsl.conf)
+        if [ -z "$merged" ]; then
+            die "the merged /etc/wsl.conf is empty; /etc/wsl.conf was not changed"
+        fi
         if [ -f /etc/wsl.conf ]; then
             run cp -p /etc/wsl.conf "/etc/wsl.conf.bak-broke-ai-coder-$(date +%Y%m%d%H%M%S)"
         fi
@@ -382,9 +537,22 @@ for f in /proc/sys/fs/binfmt_misc/WSLInterop*; do
 done
 
 # 9. sudoers
+STEP="9. sudoers"
 SUDOERS_DEST=/etc/sudoers.d/broke-ai-coder
+# sudo ignores file names that contain a dot, so a half-installed file here is never read.
+SUDOERS_NEW=/etc/sudoers.d/.broke-ai-coder.new
+# install_sudoers SRC: copy to the dotted name, validate it there, then rename into place.
+install_sudoers() {
+    run install -m 0440 -o root -g root "$1" "$SUDOERS_NEW" || return 1
+    if ! run visudo -cf "$SUDOERS_NEW"; then
+        rm -f "$SUDOERS_NEW"
+        return 1
+    fi
+    run mv -f "$SUDOERS_NEW" "$SUDOERS_DEST" || return 1
+}
 run visudo -cf "$SUDOERS_TMP"
-if [ -f "$SUDOERS_DEST" ] && cmp -s "$SUDOERS_TMP" "$SUDOERS_DEST"; then
+if [ -f "$SUDOERS_DEST" ] && [ ! -L "$SUDOERS_DEST" ] && cmp -s "$SUDOERS_TMP" "$SUDOERS_DEST" &&
+    [ "$(owner_mode "$SUDOERS_DEST")" = "root 440" ]; then
     ok "$SUDOERS_DEST is up to date"
 else
     BACKUP=""
@@ -392,24 +560,26 @@ else
         BACKUP="/root/broke-ai-coder.sudoers.bak-$(date +%Y%m%d%H%M%S)"
         run cp -p "$SUDOERS_DEST" "$BACKUP"
     fi
-    run install -m 0440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_DEST"
-    if ! run visudo -c; then
+    if ! install_sudoers "$SUDOERS_TMP" || ! run visudo -c; then
         if [ -n "$BACKUP" ]; then
-            run install -m 0440 -o root -g root "$BACKUP" "$SUDOERS_DEST"
+            install_sudoers "$BACKUP" || true
         else
             run rm -f "$SUDOERS_DEST"
         fi
-        printf '[setup] FAIL: visudo -c rejected the sudoers file; rolled back\n' >&2
+        printf '[setup] FAIL: the sudoers file was rejected; rolled back\n' >&2
         exit 1
     fi
     changed "installed $SUDOERS_DEST"
 fi
 
 # 10. git identity of the OpenCode user (docs C6 step 5)
-OC_GITCONFIG="/home/$OC_USER/.gitconfig"
+STEP="10. git identity of the OpenCode user"
+OC_GITCONFIG="$OC_HOME/.gitconfig"
+# Runs from / (your home is 0700) and keeps git's exit status.
 oc_git() {
     printf '[setup] RUN: git config --global %s (as %s)\n' "$*" "$OC_USER"
-    setsid -w runuser -u "$OC_USER" -- env HOME="/home/$OC_USER" git config --global "$@" </dev/null 2>&1 | cat
+    (cd / && setsid -w runuser -u "$OC_USER" -- env HOME="$OC_HOME" git config --global "$@" </dev/null) ||
+        die "git config --global $* failed for $OC_USER"
 }
 if [ -e "$OC_GITCONFIG" ]; then
     ok "$OC_GITCONFIG exists; not touched"
@@ -417,6 +587,7 @@ else
     oc_git user.name "broke-ai-coder agent"
     oc_git user.email "agent@example.invalid"
     oc_git --add safe.directory '*'
+    [ -e "$OC_GITCONFIG" ] || die "$OC_GITCONFIG does not exist after git config"
     changed "set the git identity of $OC_USER"
 fi
 

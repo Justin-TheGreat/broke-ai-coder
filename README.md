@@ -9,9 +9,9 @@ capacity is used up the task stops instead of paying.
 
 Each step links to a part of the [setup guide](docs/SETUP-discord-opencode.md).
 
-1. Create the Discord application and bot ([Part A](docs/SETUP-discord-opencode.md#part-a--discord--15-min-from-a-pc-browser)).
-2. Create the free provider API keys ([Part B](docs/SETUP-discord-opencode.md#part-b--provider-api-keys--15-min)).
-3. Install the Ubuntu packages ([C2](docs/SETUP-discord-opencode.md#c2-packages)).
+1. Create the Discord application and bot ([Part A](docs/SETUP-discord-opencode.md#part-a--discord-15-min-from-a-pc-browser)).
+2. Create the free provider API keys ([Part B](docs/SETUP-discord-opencode.md#part-b--provider-api-keys-15-min)).
+3. Install the Ubuntu packages, including `acl` (needed by `wsl-setup.sh`), and update git to 2.45.1 or newer with the git-core PPA ([C2](docs/SETUP-discord-opencode.md#c2-packages)).
 4. Install OpenCode ([D1](docs/SETUP-discord-opencode.md#d1-install)).
 5. Clone the repo, create the venv and `config.yaml` ([E1](docs/SETUP-discord-opencode.md#e1-clone-install-configure)).
 6. Run `sudo scripts/wsl-setup.sh --yes`, then `wsl --shutdown` in PowerShell and reopen Ubuntu.

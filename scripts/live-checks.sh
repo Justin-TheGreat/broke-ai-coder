@@ -184,7 +184,7 @@ if command -v git >/dev/null 2>&1; then
     if [ "$(printf '%s\n%s\n' 2.45.1 "$git_version" | sort -V | head -n 1)" = "2.45.1" ]; then
         pass "L0 git $git_version is at least 2.45.1"
     else
-        fail "L0 git $git_version is older than 2.45.1: add ppa:git-core/ppa, then apt update and upgrade git (docs Part F)"
+        fail "L0 git $git_version is older than 2.45.1: add ppa:git-core/ppa, then apt update and upgrade git (docs setup guide C2)"
     fi
 else
     fail "L0 git is not installed"
@@ -202,7 +202,7 @@ fi
 
 # ---- L1: sudo rule ------------------------------------------------------------------------------
 set +e
-sudo -n true </dev/null >/dev/null 2>&1
+sudo -n -k true </dev/null >/dev/null 2>&1
 rc=$?
 set -e
 if [ "$rc" -ne 0 ]; then

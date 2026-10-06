@@ -49,6 +49,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import posixpath
 import re
 import signal
 import subprocess
@@ -391,7 +392,9 @@ class DirectLauncher:
 
 
 def _under(path: str, home: str) -> bool:
-    """POSIX string comparison: ``path`` is ``home`` or below it."""
+    """POSIX comparison after normalizing ``..``/``.``/``//``: ``path`` is ``home`` or below it."""
+    path = posixpath.normpath(path)
+    home = posixpath.normpath(home)
     return path == home or path.startswith(home.rstrip("/") + "/")
 
 

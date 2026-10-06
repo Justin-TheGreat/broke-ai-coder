@@ -690,7 +690,7 @@ Acceptance:
 
 ## T072 — Least-privilege OS account
 
-**Status:** DONE
+**Status:** DONE (offline; live check in T082)
 **Depends on:** T002
 
 Run the service under a non-admin account whenever practical.
@@ -798,7 +798,7 @@ OS-user live checks (T072). These are the only things that cannot be verified of
   - P5. A denied call in headless `opencode run` returns a tool error to the model; there is no prompt and no hang.
   - P6. A per-agent `permission` is merged over the global one.
   - Checks: serve starts; the preflight passes; a `/code` asking to run `git push` gets a denied tool result and the task finishes without hanging; `cd . && git push` is denied; reading `/etc/hostname` is denied (external_directory) while edits inside the project work; websearch is absent or denied; note the behaviour of the `question` tool.
-- L13 (T102). Boot persistence: the distro boots only when something starts WSL; whether it stays up with only systemd services running is unverified. Document and test starting WSL at Windows logon (Task Scheduler) and that `broke-ai-coder.service` then starts the daemon.
+- L13 (T102). Boot persistence (also: `Wants=network-online.target` in the unit can stall WSL boot on `systemd-networkd-wait-online`; if boot hangs, drop that dependency or disable the wait-online unit): the distro boots only when something starts WSL; whether it stays up with only systemd services running is unverified. Document and test starting WSL at Windows logon (Task Scheduler) and that `broke-ai-coder.service` then starts the daemon.
 
 `scripts/live-checks.sh` automates the read-only subset of L0-L11 (run it as the daemon user from a shell without secrets); the MANUAL lines it prints are the parts that cannot be automated safely.
 

@@ -60,6 +60,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+case "$CONFIG" in
+    /*) ;;
+    *) CONFIG="$PWD/$CONFIG" ;; # relative to where you ran it, not to the repo
+esac
 [ "$(id -u)" -ne 0 ] || refuse "do not run the daemon as root"
 [ -x "$PY" ] || refuse "$PY is not executable (create the venv, setup guide E1)"
 [ -f "$CONFIG" ] || refuse "config file not found: $CONFIG"
